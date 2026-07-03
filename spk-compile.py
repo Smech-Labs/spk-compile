@@ -31,7 +31,7 @@ import textwrap
 
 # ── Version & constants ───────────────────────────────────────────────────────
 
-VERSION = "2.2.2"
+VERSION = "2.2.3"
 DEFAULT_TARGET = "/mnt/smechos_build_root"
 BUILD_TMP = "/tmp/smechos_build"
 
@@ -730,6 +730,117 @@ def phase_plasma_discover(target):
         env=env, build_dir=os.path.join(BUILD_TMP, "discover-build"))
     log("Plasma Discover + PackageKit + SPK backend installed.", color=GREEN)
 
+# ── Package bundling ─────────────────────────────────────────────────────────
+
+def phase_bundle_packages(target):
+    """Bundle compiled output into .tar.xz packages consumable by spk install."""
+    log_phase("bundle", "Bundle compiled output into spk-installable .tar.xz packages")
+    out = "/tmp/smechos-packages"
+    shutil.rmtree(out, ignore_errors=True)
+    ensure(out)
+
+    import hashlib
+
+    def tar_paths(pkg_name, paths, prefix=None):
+        """Create pkg_name.tar.xz from a list of (src_glob_or_dir, archive_path) tuples."""
+        out_file = os.path.join(out, f"{pkg_name}.tar.xz")
+        args = ["tar", "-cJf", out_file]
+        # Build a list of existing paths relative to target
+        includes = []
+        for rel in paths:
+            full = os.path.join(target, rel.lstrip("/"))
+            if os.path.exists(full):
+                includes.append(rel.lstrip("/"))
+            else:
+                log(f"  {pkg_name}: skipping missing path {rel}", color=YELLOW)
+        if not includes:
+            log(f"  {pkg_name}: no files found, skipping", color=YELLOW)
+            return
+        run(["tar", "-cJf", out_file, "-C", target] + includes)
+        size  = os.path.getsize(out_file) // 1_048_576
+        h     = hashlib.sha256()
+        with open(out_file, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        log(f"  {pkg_name}.tar.xz  {size} MB  sha256:{h.hexdigest()[:16]}…", color=GREEN)
+
+    tar_paths("base-system", [
+        "usr/bin/bash", "usr/bin/sh", "bin",
+        "usr/bin/coreutils", "usr/bin/grep", "usr/bin/sed", "usr/bin/gawk",
+        "usr/bin/tar", "usr/bin/gzip", "usr/bin/xz", "usr/bin/find",
+        "usr/lib/libc.so", "usr/lib/libm.so",
+        "etc/passwd", "etc/group", "etc/shells", "etc/hostname",
+        "etc/hosts", "etc/resolv.conf", "etc/fstab", "etc/os-release",
+    ])
+
+    tar_paths("kernel-modules", [
+        "boot/vmlinuz", "boot/System.map", "lib/modules",
+    ])
+
+    tar_paths("firmware", [
+        "lib/firmware",
+    ])
+
+    tar_paths("bootloader-grub", [
+        "usr/lib/grub", "usr/bin/grub-install", "usr/bin/grub-mkconfig",
+        "usr/bin/grub-mkimage", "usr/bin/grub-probe",
+        "usr/share/grub", "boot/grub",
+    ])
+
+    tar_paths("qt6", [
+        "usr/lib/libQt6Core.so.6", "usr/lib/libQt6Gui.so.6",
+        "usr/lib/libQt6Widgets.so.6", "usr/lib/libQt6Network.so.6",
+        "usr/lib/libQt6DBus.so.6", "usr/lib/libQt6Qml.so.6",
+        "usr/lib/libQt6Quick.so.6", "usr/lib/libQt6Svg.so.6",
+        "usr/lib/libQt6WaylandClient.so.6", "usr/lib/libQt6Multimedia.so.6",
+        "usr/lib/qt6", "usr/plugins", "usr/qml",
+    ])
+
+    tar_paths("mesa-graphics", [
+        "usr/lib/libGL.so.1", "usr/lib/libEGL.so.1",
+        "usr/lib/libgbm.so.1", "usr/lib/libglapi.so.0",
+        "usr/lib/libvulkan.so.1",
+        "usr/lib/dri", "usr/lib/gallium-pipe",
+        "usr/share/vulkan", "usr/share/glvnd",
+    ])
+
+    tar_paths("kde-frameworks", [
+        "usr/lib/libKF6Core.so.6", "usr/lib/libKF6Config.so.6",
+        "usr/lib/libKF6ConfigWidgets.so.6", "usr/lib/libKF6I18n.so.6",
+        "usr/lib/libKF6IconThemes.so.6", "usr/lib/libKF6KIO.so.6",
+        "usr/lib/libKF6Parts.so.6", "usr/lib/libKF6Service.so.6",
+        "usr/lib/libKF6Solid.so.6", "usr/lib/libKF6WindowSystem.so.6",
+        "usr/lib/libKF6XmlGui.so.6",
+        "usr/share/kf6", "usr/share/locale",
+    ])
+
+    tar_paths("plasma", [
+        "usr/bin/plasmashell", "usr/bin/kwin_wayland", "usr/bin/kwin_x11",
+        "usr/bin/sddm", "usr/bin/startplasma-wayland",
+        "usr/bin/krunner", "usr/bin/kscreen-doctor",
+        "usr/lib/libplasma.so.6", "usr/lib/libplasmaquick.so.6",
+        "usr/lib/plasma-desktop", "usr/lib/kwin",
+        "usr/share/plasma", "usr/share/sddm",
+        "usr/share/applications/org.kde.plasmashell.desktop",
+        "etc/sddm.conf.d",
+    ])
+
+    tar_paths("plasma-discover", [
+        "usr/bin/plasma-discover",
+        "usr/lib/plasma-discover",
+        "usr/share/applications/org.kde.discover.desktop",
+    ])
+
+    tar_paths("packagekit-spk", [
+        "usr/bin/packagekitd",
+        "usr/lib/packagekit-backend",
+        "usr/share/dbus-1/system-services/org.freedesktop.PackageKit.service",
+        "etc/PackageKit",
+    ])
+
+    log(f"All packages written to {out}", color=GREEN)
+    log("Upload these to the GitHub Release and set RELEASE_BASE_URL in spk.", color=YELLOW)
+
 # ── Plasma Live phases ────────────────────────────────────────────────────────
 
 def phase_bootstrap_userland_glibc(target):
@@ -1277,6 +1388,7 @@ SMECHOS_PHASES = [
     ("kernel",           phase_kernel,              "Compile Linux 6.12.16"),
     ("patch-metadata",   phase_patch_metadata,      "Patch metadata for SmechOS branding"),
     ("discover",         phase_plasma_discover,     "Compile Plasma Discover + PackageKit"),
+    ("bundle",           phase_bundle_packages,     "Bundle output into spk-installable .tar.xz packages"),
 ]
 
 SMECHVISOR_PHASES = [
@@ -1308,6 +1420,7 @@ SMECHOS_PLASMA_LIVE_PHASES = [
     ("calamares",       phase_calamares,                 "Build Calamares graphical installer"),
     ("chrome",          phase_google_chrome,             "Install Google Chrome stable"),
     ("live-initramfs",  phase_live_initramfs,            "Build busybox live initramfs"),
+    ("bundle",          phase_bundle_packages,           "Bundle output into spk-installable .tar.xz packages"),
 ]
 
 PROFILES = {
