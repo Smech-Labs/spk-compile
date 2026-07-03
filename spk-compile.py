@@ -31,7 +31,7 @@ import textwrap
 
 # ── Version & constants ───────────────────────────────────────────────────────
 
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 DEFAULT_TARGET = "/mnt/smechos_build_root"
 BUILD_TMP = "/tmp/smechos_build"
 
@@ -40,8 +40,8 @@ LINUX_VER      = "6.12.16"
 GRUB_VER       = "2.12"
 MUSL_VER       = "1.2.5"
 QT6_VER        = "6.8.2"
-PLASMA_VER     = "6.3.4"
-KF6_VER        = "6.10.0"
+PLASMA_VER     = "6.7.2"
+KF6_VER        = "6.27.0"
 MESA_VER       = "24.3.4"
 OPENRC_VER     = "0.54"
 APPSTREAM_VER  = "1.0.3"
@@ -56,7 +56,7 @@ GRUB_URL     = f"https://ftp.gnu.org/gnu/grub/grub-{GRUB_VER}.tar.xz"
 MUSL_URL     = f"https://musl.libc.org/releases/musl-{MUSL_VER}.tar.gz"
 QT6_BASE_URL = f"https://download.qt.io/official_releases/qt/6.8/{QT6_VER}/submodules"
 PLASMA_URL   = f"https://download.kde.org/stable/plasma/{PLASMA_VER}"
-KF6_URL      = f"https://download.kde.org/stable/frameworks/6.10"
+KF6_URL      = f"https://download.kde.org/stable/frameworks/6.27"
 MESA_URL     = f"https://mesa.freedesktop.org/archive/mesa-{MESA_VER}.tar.xz"
 OPENRC_URL   = f"https://github.com/OpenRC/openrc/archive/refs/tags/{OPENRC_VER}.tar.gz"
 
@@ -833,8 +833,8 @@ def phase_calamares(target):
         env=env, build_dir=os.path.join(BUILD_TMP, "yaml-cpp-build"))
 
     # extra-cmake-modules (ECM) — needed by kpmcore + calamares
-    ecm_ver = "6.10.0"
-    ecm_url = f"https://download.kde.org/stable/frameworks/6.10/extra-cmake-modules-{ecm_ver}.tar.xz"
+    ecm_ver = KF6_VER
+    ecm_url = f"https://download.kde.org/stable/frameworks/6.27/extra-cmake-modules-{ecm_ver}.tar.xz"
     tarball = os.path.join(src, f"extra-cmake-modules-{ecm_ver}.tar.xz")
     download(ecm_url, tarball)
     bd = os.path.join(BUILD_TMP, "ecm")
