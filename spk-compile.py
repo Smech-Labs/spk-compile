@@ -31,7 +31,7 @@ import textwrap
 
 # ── Version & constants ───────────────────────────────────────────────────────
 
-VERSION = "2.2.6"
+VERSION = "2.2.7"
 DEFAULT_TARGET = "/mnt/smechos_build_root"
 BUILD_TMP = "/tmp/smechos_build"
 
@@ -988,11 +988,6 @@ def phase_systemd(target):
             "-Ddns-over-tls=false",
             "-Ddefault-dnssec=no",
             "-Dfallback-hostname=smechos",
-            "-Dsplit-bin=false",
-            "-Dsysvinit-path=",
-            "-Dsysvrcnd-path=",
-            "-Drootlibdir=/usr/lib",
-            "-Drootprefix=/usr",
             "-Dmode=release",
         ],
         env=env, build_dir=os.path.join(BUILD_TMP, "systemd-build"))
