@@ -31,7 +31,7 @@ import textwrap
 
 # ── Version & constants ───────────────────────────────────────────────────────
 
-VERSION = "2.2.5"
+VERSION = "2.2.6"
 DEFAULT_TARGET = "/mnt/smechos_build_root"
 BUILD_TMP = "/tmp/smechos_build"
 
@@ -969,13 +969,11 @@ def phase_systemd(target):
     extract(tarball, bd)
     meson_install(bd, prefix,
         extra_args=[
-            f"-Dcmake_prefix_path={prefix}",
-            f"-Dpkg_config_path={prefix}/lib/pkgconfig:{prefix}/share/pkgconfig",
             "-Dpam=disabled",
             "-Daudit=disabled",
             "-Dselinux=disabled",
-            "-Dcryptsetup=disabled",
             "-Dlibcryptsetup=disabled",
+            "-Dlibcryptsetup-plugins=disabled",
             "-Dgcrypt=disabled",
             "-Dp11kit=disabled",
             "-Dapparmor=disabled",
