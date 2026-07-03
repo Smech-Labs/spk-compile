@@ -31,7 +31,7 @@ import textwrap
 
 # ── Version & constants ───────────────────────────────────────────────────────
 
-VERSION = "2.2.4"
+VERSION = "2.2.5"
 DEFAULT_TARGET = "/mnt/smechos_build_root"
 BUILD_TMP = "/tmp/smechos_build"
 
@@ -884,35 +884,121 @@ def phase_bootstrap_userland_glibc(target):
         run(["make", "install"], cwd=bd, env=env, sudo=(os.geteuid() != 0))
         log(f"{name} {ver} installed.", color=GREEN)
 
-def phase_systemd(target):
-    """Install systemd {SYSTEMD_VER} by extracting Debian packages into the target."""
-    log_phase("systemd", f"Install systemd {SYSTEMD_VER} from Debian packages")
-    src = sources(target)
-    ensure(target)
-    deb_base = "https://ftp.debian.org/debian/pool/main/s/systemd"
-    pkgs = [
-        f"libsystemd0_{SYSTEMD_VER}-1_amd64.deb",
-        f"libudev1_{SYSTEMD_VER}-1_amd64.deb",
-        f"udev_{SYSTEMD_VER}-1_amd64.deb",
-        f"systemd_{SYSTEMD_VER}-1_amd64.deb",
-        f"systemd-sysv_{SYSTEMD_VER}-1_amd64.deb",
-    ]
-    for deb_name in pkgs:
-        url = f"{deb_base}/{deb_name}"
-        deb = os.path.join(src, deb_name)
-        download(url, deb)
-        log(f"Extracting {deb_name}...")
-        _extract_deb(deb, target)
-        log(f"{deb_name} extracted.", color=GREEN)
+def _resolve_systemd_version():
+    """Resolve latest systemd release from GitHub."""
+    import re
+    log("Resolving latest systemd version from GitHub...")
+    try:
+        with urllib.request.urlopen(
+                "https://api.github.com/repos/systemd/systemd/releases/latest",
+                timeout=15) as r:
+            data = r.read().decode()
+        ver = re.search(r'"tag_name"\s*:\s*"v([0-9.]+)"', data)
+        if ver:
+            log(f"systemd {ver.group(1)}", color=GREEN)
+            return ver.group(1)
+    except Exception:
+        pass
+    log("Could not resolve systemd version, using fallback 261.1", color=YELLOW)
+    return "261.1"
 
-    # Enable NetworkManager if present
-    wants = os.path.join(target, "etc", "systemd", "system", "multi-user.target.wants")
-    ensure(wants)
-    nm_service = os.path.join(target, "lib", "systemd", "system", "NetworkManager.service")
-    nm_link    = os.path.join(wants, "NetworkManager.service")
-    if os.path.exists(nm_service) and not os.path.lexists(nm_link):
-        os.symlink(nm_service, nm_link)
-    log("systemd installed.", color=GREEN)
+def phase_systemd(target):
+    """Compile systemd from source (with libcap + util-linux deps)."""
+    systemd_ver = _resolve_systemd_version()
+    log_phase("systemd", f"Compile systemd {systemd_ver} from source")
+    src    = sources(target)
+    env    = build_env_glibc(target)
+    prefix = f"{target}/usr"
+
+    # ── gperf (needed for systemd hash table generation) ──────────────────────
+    gperf_ver = "3.1"
+    gperf_url = f"https://ftp.gnu.org/gnu/gperf/gperf-{gperf_ver}.tar.gz"
+    tarball   = os.path.join(src, f"gperf-{gperf_ver}.tar.gz")
+    download(gperf_url, tarball)
+    bd = os.path.join(BUILD_TMP, "gperf")
+    shutil.rmtree(bd, ignore_errors=True)
+    extract(tarball, bd)
+    run(["./configure", f"--prefix={prefix}"], cwd=bd, env=env)
+    run(["make", "-j", nproc()], cwd=bd, env=env)
+    run(["make", "install"], cwd=bd, env=env, sudo=(os.geteuid() != 0))
+    log("gperf installed.", color=GREEN)
+
+    # ── libcap (POSIX capabilities library) ───────────────────────────────────
+    libcap_ver = "2.73"
+    libcap_url = (f"https://mirrors.edge.kernel.org/pub/linux/libs/security/"
+                  f"linux-privs/libcap2/libcap-{libcap_ver}.tar.xz")
+    tarball = os.path.join(src, f"libcap-{libcap_ver}.tar.xz")
+    download(libcap_url, tarball)
+    bd = os.path.join(BUILD_TMP, "libcap")
+    shutil.rmtree(bd, ignore_errors=True)
+    extract(tarball, bd)
+    cap_env = dict(env)
+    cap_env["prefix"] = prefix
+    run(["make", "-j", nproc(), f"prefix={prefix}", "lib=lib",
+         "GOLANG=no", "PYTHON=no"], cwd=bd, env=cap_env)
+    run(["make", "install", f"prefix={prefix}", "lib=lib",
+         "GOLANG=no", "PYTHON=no"], cwd=bd, env=cap_env,
+        sudo=(os.geteuid() != 0))
+    log("libcap installed.", color=GREEN)
+
+    # ── util-linux (provides libmount + libblkid required by systemd) ─────────
+    ul_ver = "2.40.4"
+    ul_url = (f"https://mirrors.edge.kernel.org/pub/linux/utils/util-linux/"
+              f"v2.40/util-linux-{ul_ver}.tar.xz")
+    tarball = os.path.join(src, f"util-linux-{ul_ver}.tar.xz")
+    download(ul_url, tarball)
+    bd = os.path.join(BUILD_TMP, "util-linux")
+    shutil.rmtree(bd, ignore_errors=True)
+    extract(tarball, bd)
+    run(["./configure", f"--prefix={prefix}",
+         "--disable-all-programs",
+         "--enable-libmount", "--enable-libblkid",
+         "--enable-libuuid",
+         "--without-python", "--disable-nls"], cwd=bd, env=env)
+    run(["make", "-j", nproc()], cwd=bd, env=env)
+    run(["make", "install"], cwd=bd, env=env, sudo=(os.geteuid() != 0))
+    log("util-linux (libmount + libblkid) installed.", color=GREEN)
+
+    # ── systemd ───────────────────────────────────────────────────────────────
+    sd_url  = (f"https://github.com/systemd/systemd/archive/refs/tags/"
+               f"v{systemd_ver}.tar.gz")
+    tarball = os.path.join(src, f"systemd-{systemd_ver}.tar.gz")
+    download(sd_url, tarball)
+    bd = os.path.join(BUILD_TMP, "systemd")
+    shutil.rmtree(bd, ignore_errors=True)
+    extract(tarball, bd)
+    meson_install(bd, prefix,
+        extra_args=[
+            f"-Dcmake_prefix_path={prefix}",
+            f"-Dpkg_config_path={prefix}/lib/pkgconfig:{prefix}/share/pkgconfig",
+            "-Dpam=disabled",
+            "-Daudit=disabled",
+            "-Dselinux=disabled",
+            "-Dcryptsetup=disabled",
+            "-Dlibcryptsetup=disabled",
+            "-Dgcrypt=disabled",
+            "-Dp11kit=disabled",
+            "-Dapparmor=disabled",
+            "-Dmicrohttpd=disabled",
+            "-Dlibcurl=disabled",
+            "-Dlibidn2=disabled",
+            "-Dlibidn=disabled",
+            "-Dqrencode=disabled",
+            "-Dpolkit=disabled",
+            "-Delfutils=disabled",
+            "-Dkmod=disabled",
+            "-Ddns-over-tls=false",
+            "-Ddefault-dnssec=no",
+            "-Dfallback-hostname=smechos",
+            "-Dsplit-bin=false",
+            "-Dsysvinit-path=",
+            "-Dsysvrcnd-path=",
+            "-Drootlibdir=/usr/lib",
+            "-Drootprefix=/usr",
+            "-Dmode=release",
+        ],
+        env=env, build_dir=os.path.join(BUILD_TMP, "systemd-build"))
+    log(f"systemd {systemd_ver} installed.", color=GREEN)
 
 def phase_systemd_configure(target):
     """Configure systemd units for KDE Plasma desktop (graphical target, SDDM)."""
