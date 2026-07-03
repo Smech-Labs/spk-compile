@@ -31,7 +31,7 @@ import textwrap
 
 # ── Version & constants ───────────────────────────────────────────────────────
 
-VERSION = "2.2.8"
+VERSION = "2.2.9"
 DEFAULT_TARGET = "/mnt/smechos_build_root"
 BUILD_TMP = "/tmp/smechos_build"
 
@@ -471,7 +471,8 @@ def phase_grub(target):
              "--disable-werror",
              "--disable-nls"],
             cwd=bd, env=env)
-        run(["make", "-j", nproc()], cwd=bd, env=env)
+        # GRUB 2.x has a parallel-make race on extra_deps.lst — must be -j1
+        run(["make", "-j1"], cwd=bd, env=env)
         run(["make", "install"], cwd=bd, env=env, sudo=(os.geteuid() != 0))
     log(f"GRUB {GRUB_VER} installed.", color=GREEN)
 
