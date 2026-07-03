@@ -7,14 +7,16 @@ All build phases are implemented inline -- no external scripts required.
 SmechDeploy (the old script collection) is retired; this file IS the build system.
 
 Usage:
-    python3 spk-compile.py smechos                    # full SmechOS build
-    python3 spk-compile.py smechvisor                 # full SmechVisor build
-    python3 spk-compile.py smechos  --phase kde       # single phase
+    python3 spk-compile.py smechos                         # full SmechOS build (musl/OpenRC)
+    python3 spk-compile.py smechvisor                      # full SmechVisor build
+    python3 spk-compile.py smechos-plasma-live             # full SmechOS live build (glibc/systemd)
+    python3 spk-compile.py smechos  --phase kde            # single phase
     python3 spk-compile.py smechvisor --phase kernel
-    python3 spk-compile.py smechos  --iso install     # build install ISO
+    python3 spk-compile.py smechos  --iso install          # build install ISO
     python3 spk-compile.py smechvisor --iso install
-    python3 spk-compile.py smechvisor --iso shim      # build deploy shim ISO
-    python3 spk-compile.py --list smechos             # list phases
+    python3 spk-compile.py smechvisor --iso shim           # build deploy shim ISO
+    python3 spk-compile.py smechos-plasma-live --iso live  # build KDE Plasma live ISO
+    python3 spk-compile.py --list smechos                  # list phases
     python3 spk-compile.py --version
 """
 
@@ -29,7 +31,7 @@ import textwrap
 
 # ── Version & constants ───────────────────────────────────────────────────────
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 DEFAULT_TARGET = "/mnt/smechos_build_root"
 BUILD_TMP = "/tmp/smechos_build"
 
@@ -44,6 +46,9 @@ MESA_VER       = "24.3.4"
 OPENRC_VER     = "0.54"
 APPSTREAM_VER  = "1.0.3"
 PACKAGEKIT_VER = "1.3.0"
+SYSTEMD_VER    = "256.7"
+CALAMARES_VER  = "3.3.10"
+BUSYBOX_VER    = "1.36.1"
 
 # Download URLs
 LINUX_URL    = f"https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-{LINUX_VER}.tar.xz"
@@ -133,6 +138,38 @@ def build_env(target):
     e["CC"]  = "musl-gcc"
     e["CXX"] = "musl-g++"
     return e
+
+def build_env_glibc(target):
+    """Like build_env() but uses system glibc/gcc instead of musl-gcc."""
+    e = dict(os.environ)
+    e["SMECH_TARGET"] = target
+    e.pop("TARGET", None)
+    e.pop("CC",  None)
+    e.pop("CXX", None)
+    prefix = f"{target}/usr"
+    e["PATH"] = f"{prefix}/bin:{e.get('PATH', '/usr/local/bin:/usr/bin:/bin')}"
+    e["PKG_CONFIG_PATH"] = (
+        f"{prefix}/lib/pkgconfig:{prefix}/share/pkgconfig:"
+        "/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig:/usr/lib/pkgconfig"
+    )
+    e["CFLAGS"]   = f"-I{prefix}/include"
+    e["CXXFLAGS"] = f"-I{prefix}/include"
+    e["LDFLAGS"]  = f"-L{prefix}/lib"
+    e["LD_LIBRARY_PATH"] = f"{prefix}/lib"
+    return e
+
+def _extract_deb(deb_path, dest):
+    """Extract a .deb file's data.tar into dest."""
+    work = deb_path + ".extract"
+    shutil.rmtree(work, ignore_errors=True)
+    ensure(work)
+    run(["ar", "x", os.path.abspath(deb_path)], cwd=work)
+    for ext in ("data.tar.xz", "data.tar.zst", "data.tar.gz", "data.tar"):
+        data_tar = os.path.join(work, ext)
+        if os.path.exists(data_tar):
+            run(["tar", "-xf", data_tar, "-C", dest])
+            break
+    shutil.rmtree(work, ignore_errors=True)
 
 def cmake_install(src_dir, prefix, extra_args=None, env=None, build_dir=None):
     bd = build_dir or os.path.join(src_dir, "build")
@@ -656,6 +693,350 @@ def phase_plasma_discover(target):
         env=env, build_dir=os.path.join(BUILD_TMP, "discover-build"))
     log("Plasma Discover + PackageKit + SPK backend installed.", color=GREEN)
 
+# ── Plasma Live phases ────────────────────────────────────────────────────────
+
+def phase_bootstrap_userland_glibc(target):
+    """Bootstrap GNU userland against host glibc (used by the plasma-live profile)."""
+    log_phase("userland-glibc", "Bootstrap GNU userland against host glibc")
+    src  = sources(target)
+    env  = build_env_glibc(target)
+    pfix = f"{target}/usr"
+    pkgs = [
+        ("bash",      "5.2.37",
+         "https://ftp.gnu.org/gnu/bash/bash-5.2.37.tar.gz",
+         ["--without-bash-malloc", "--disable-nls"]),
+        ("coreutils", "9.5",
+         "https://ftp.gnu.org/gnu/coreutils/coreutils-9.5.tar.xz", ["--disable-nls"]),
+        ("grep",      "3.11",
+         "https://ftp.gnu.org/gnu/grep/grep-3.11.tar.xz", []),
+        ("sed",       "4.9",
+         "https://ftp.gnu.org/gnu/sed/sed-4.9.tar.xz", []),
+        ("gawk",      "5.3.1",
+         "https://ftp.gnu.org/gnu/gawk/gawk-5.3.1.tar.xz", []),
+        ("findutils", "4.10.0",
+         "https://ftp.gnu.org/gnu/findutils/findutils-4.10.0.tar.xz", []),
+        ("tar",       "1.35",
+         "https://ftp.gnu.org/gnu/tar/tar-1.35.tar.xz", []),
+        ("gzip",      "1.13",
+         "https://ftp.gnu.org/gnu/gzip/gzip-1.13.tar.xz", []),
+        ("xz",        "5.6.3",
+         "https://github.com/tukaani-project/xz/releases/download/v5.6.3/xz-5.6.3.tar.xz",
+         ["--disable-xzdec", "--disable-lzmadec"]),
+    ]
+    for name, ver, url, flags in pkgs:
+        tarball = os.path.join(src, os.path.basename(url))
+        download(url, tarball)
+        bd = os.path.join(BUILD_TMP, name)
+        shutil.rmtree(bd, ignore_errors=True)
+        extract(tarball, bd)
+        run(["./configure", f"--prefix={pfix}"] + flags, cwd=bd, env=env)
+        run(["make", "-j", nproc()], cwd=bd, env=env)
+        run(["make", "install"], cwd=bd, env=env, sudo=(os.geteuid() != 0))
+        log(f"{name} {ver} installed.", color=GREEN)
+
+def phase_systemd(target):
+    """Install systemd {SYSTEMD_VER} by extracting Debian packages into the target."""
+    log_phase("systemd", f"Install systemd {SYSTEMD_VER} from Debian packages")
+    src = sources(target)
+    ensure(target)
+    deb_base = "https://ftp.debian.org/debian/pool/main/s/systemd"
+    pkgs = [
+        f"libsystemd0_{SYSTEMD_VER}-1_amd64.deb",
+        f"libudev1_{SYSTEMD_VER}-1_amd64.deb",
+        f"udev_{SYSTEMD_VER}-1_amd64.deb",
+        f"systemd_{SYSTEMD_VER}-1_amd64.deb",
+        f"systemd-sysv_{SYSTEMD_VER}-1_amd64.deb",
+    ]
+    for deb_name in pkgs:
+        url = f"{deb_base}/{deb_name}"
+        deb = os.path.join(src, deb_name)
+        download(url, deb)
+        log(f"Extracting {deb_name}...")
+        _extract_deb(deb, target)
+        log(f"{deb_name} extracted.", color=GREEN)
+
+    # Enable NetworkManager if present
+    wants = os.path.join(target, "etc", "systemd", "system", "multi-user.target.wants")
+    ensure(wants)
+    nm_service = os.path.join(target, "lib", "systemd", "system", "NetworkManager.service")
+    nm_link    = os.path.join(wants, "NetworkManager.service")
+    if os.path.exists(nm_service) and not os.path.lexists(nm_link):
+        os.symlink(nm_service, nm_link)
+    log("systemd installed.", color=GREEN)
+
+def phase_systemd_configure(target):
+    """Configure systemd units for KDE Plasma desktop (graphical target, SDDM)."""
+    log_phase("systemd-config", "Configure systemd for KDE Plasma desktop")
+    ensure(os.path.join(target, "etc", "systemd", "system"))
+
+    # default.target → graphical.target
+    default_link = os.path.join(target, "etc", "systemd", "system", "default.target")
+    graphical    = "/lib/systemd/system/graphical.target"
+    if not os.path.lexists(default_link):
+        os.symlink(graphical, default_link)
+
+    # Enable SDDM
+    gfx_wants = os.path.join(target, "etc", "systemd", "system", "graphical.target.wants")
+    ensure(gfx_wants)
+    sddm_bin = os.path.join(target, "usr", "bin", "sddm")
+    if os.path.exists(sddm_bin):
+        sddm_unit = os.path.join(target, "etc", "systemd", "system", "sddm.service")
+        with open(sddm_unit, "w") as f:
+            f.write(textwrap.dedent("""\
+                [Unit]
+                Description=Simple Desktop Display Manager
+                After=systemd-user-sessions.service
+
+                [Service]
+                ExecStart=/usr/bin/sddm
+                Restart=always
+
+                [Install]
+                Alias=display-manager.service
+            """))
+        sddm_link = os.path.join(gfx_wants, "sddm.service")
+        if not os.path.lexists(sddm_link):
+            os.symlink(sddm_unit, sddm_link)
+
+    # machine-id placeholder
+    mid = os.path.join(target, "etc", "machine-id")
+    if not os.path.exists(mid):
+        with open(mid, "w") as f:
+            f.write("uninitialized\n")
+
+    # hostname
+    hn = os.path.join(target, "etc", "hostname")
+    if not os.path.exists(hn):
+        with open(hn, "w") as f:
+            f.write("smechos\n")
+
+    log("systemd desktop config applied.", color=GREEN)
+
+def phase_calamares(target):
+    """Build Calamares graphical installer and its deps (yaml-cpp, kpmcore)."""
+    log_phase("calamares", f"Build Calamares {CALAMARES_VER} graphical installer")
+    src    = sources(target)
+    env    = build_env_glibc(target)
+    prefix = f"{target}/usr"
+
+    # yaml-cpp 0.8.0
+    yaml_ver = "0.8.0"
+    yaml_url = f"https://github.com/jbeder/yaml-cpp/archive/refs/tags/{yaml_ver}.tar.gz"
+    tarball  = os.path.join(src, f"yaml-cpp-{yaml_ver}.tar.gz")
+    download(yaml_url, tarball)
+    bd = os.path.join(BUILD_TMP, "yaml-cpp")
+    shutil.rmtree(bd, ignore_errors=True)
+    extract(tarball, bd)
+    cmake_install(bd, prefix,
+        extra_args=["-DYAML_BUILD_SHARED_LIBS=ON", "-DYAML_CPP_BUILD_TESTS=OFF",
+                    f"-DCMAKE_PREFIX_PATH={prefix}"],
+        env=env, build_dir=os.path.join(BUILD_TMP, "yaml-cpp-build"))
+
+    # extra-cmake-modules (ECM) — needed by kpmcore + calamares
+    ecm_ver = "6.10.0"
+    ecm_url = f"https://download.kde.org/stable/frameworks/6.10/extra-cmake-modules-{ecm_ver}.tar.xz"
+    tarball = os.path.join(src, f"extra-cmake-modules-{ecm_ver}.tar.xz")
+    download(ecm_url, tarball)
+    bd = os.path.join(BUILD_TMP, "ecm")
+    shutil.rmtree(bd, ignore_errors=True)
+    extract(tarball, bd)
+    cmake_install(bd, prefix,
+        extra_args=[f"-DCMAKE_PREFIX_PATH={prefix}", "-DBUILD_TESTING=OFF"],
+        env=env, build_dir=os.path.join(BUILD_TMP, "ecm-build"))
+
+    # kpmcore 24.08.3 (KDE Partition Manager library)
+    kpm_ver = "24.08.3"
+    kpm_url = (f"https://download.kde.org/stable/release-service/{kpm_ver}"
+               f"/src/kpmcore-{kpm_ver}.tar.xz")
+    tarball = os.path.join(src, f"kpmcore-{kpm_ver}.tar.xz")
+    download(kpm_url, tarball)
+    bd = os.path.join(BUILD_TMP, "kpmcore")
+    shutil.rmtree(bd, ignore_errors=True)
+    extract(tarball, bd)
+    cmake_install(bd, prefix,
+        extra_args=[f"-DCMAKE_PREFIX_PATH={prefix}", "-DBUILD_TESTING=OFF"],
+        env=env, build_dir=os.path.join(BUILD_TMP, "kpmcore-build"))
+
+    # Calamares
+    cal_url = (f"https://github.com/calamares/calamares/releases/download"
+               f"/v{CALAMARES_VER}/calamares-{CALAMARES_VER}.tar.gz")
+    tarball = os.path.join(src, f"calamares-{CALAMARES_VER}.tar.gz")
+    download(cal_url, tarball)
+    bd = os.path.join(BUILD_TMP, "calamares")
+    shutil.rmtree(bd, ignore_errors=True)
+    extract(tarball, bd)
+    cmake_install(bd, prefix,
+        extra_args=[f"-DCMAKE_PREFIX_PATH={prefix}",
+                    "-DWITH_PYTHON=ON", "-DWITH_QT6=ON",
+                    "-DBUILD_TESTING=OFF", "-DINSTALL_CONFIG=ON"],
+        env=env, build_dir=os.path.join(BUILD_TMP, "calamares-build"))
+
+    # Calamares settings.conf
+    cal_etc = os.path.join(target, "etc", "calamares")
+    ensure(cal_etc)
+    with open(os.path.join(cal_etc, "settings.conf"), "w") as f:
+        f.write(textwrap.dedent("""\
+            modules-search: [ local, /usr/lib/calamares/modules ]
+            sequence:
+              - show:
+                - welcome
+                - locale
+                - keyboard
+                - partition
+                - users
+                - summary
+              - exec:
+                - partition
+                - mount
+                - unpackfs
+                - machineid
+                - fstab
+                - locale
+                - keyboard
+                - localecfg
+                - users
+                - networkcfg
+                - grubcfg
+                - bootloader
+                - umount
+              - show:
+                - finished
+            branding: smechos
+            prompt-install: true
+            dont-chroot: false
+        """))
+
+    # SmechOS branding for Calamares
+    brand_dir = os.path.join(target, "usr", "share", "calamares", "branding", "smechos")
+    ensure(brand_dir)
+    with open(os.path.join(brand_dir, "branding.desc"), "w") as f:
+        f.write(textwrap.dedent("""\
+            componentName: smechos
+            strings:
+              productName: SmechOS
+              shortProductName: SmechOS
+              version: "1.0"
+              shortVersion: "1.0"
+              versionedName: SmechOS 1.0
+              bootloaderEntryName: SmechOS
+              productUrl: https://os.smech.xyz
+              supportUrl: https://github.com/Smech-Labs
+              knownIssuesUrl: https://github.com/Smech-Labs/smechos-site/issues
+              releaseNotesUrl: https://os.smech.xyz
+            images:
+              productLogo: smechos.png
+              productIcon: smechos.png
+              productWelcome: show.png
+            slideshow: show.qml
+            style:
+              sidebarBackground: "#1e1e2e"
+              sidebarText: "#cdd6f4"
+              sidebarTextHighlight: "#89b4fa"
+        """))
+    log("Calamares installed.", color=GREEN)
+
+def phase_google_chrome(target):
+    """Download and extract the Google Chrome stable .deb into target."""
+    log_phase("chrome", "Install Google Chrome stable")
+    src = sources(target)
+    url = "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
+    deb = os.path.join(src, "google-chrome-stable_current_amd64.deb")
+    download(url, deb)
+    log("Extracting Chrome .deb...")
+    _extract_deb(deb, target)
+    # Strip Debian-specific cron/apt artifacts that don't apply on SmechOS
+    for unwanted in [
+        os.path.join(target, "etc", "cron.daily", "google-chrome"),
+        os.path.join(target, "etc", "apt", "sources.list.d", "google-chrome.list"),
+    ]:
+        if os.path.exists(unwanted):
+            os.remove(unwanted)
+    log("Google Chrome installed.", color=GREEN)
+
+def phase_live_initramfs(target):
+    """Build a static busybox initramfs for live boot (squashfs + overlayfs)."""
+    log_phase("live-initramfs", f"Build busybox {BUSYBOX_VER} live initramfs")
+    src = sources(target)
+
+    # Busybox static
+    bb_url  = f"https://busybox.net/downloads/busybox-{BUSYBOX_VER}.tar.bz2"
+    tarball = os.path.join(src, f"busybox-{BUSYBOX_VER}.tar.bz2")
+    download(bb_url, tarball)
+    bd = os.path.join(BUILD_TMP, "busybox")
+    shutil.rmtree(bd, ignore_errors=True)
+    extract(tarball, bd)
+    env = dict(os.environ)
+    env.pop("CC",     None)
+    env.pop("LDFLAGS",None)
+    run(["make", "defconfig"], cwd=bd, env=env)
+    with open(os.path.join(bd, ".config"), "a") as f:
+        f.write("\nCONFIG_STATIC=y\n")
+    run(["make", "-j", nproc()], cwd=bd, env=env)
+
+    # Assemble initramfs tree
+    init_tree = os.path.join(BUILD_TMP, "live-initramfs")
+    shutil.rmtree(init_tree, ignore_errors=True)
+    for d in ["bin", "dev", "proc", "sys",
+              "mnt/cdrom", "mnt/squashfs", "mnt/overlay", "mnt/rootfs"]:
+        ensure(os.path.join(init_tree, d))
+
+    shutil.copy2(os.path.join(bd, "busybox"), os.path.join(init_tree, "bin", "busybox"))
+    os.chmod(os.path.join(init_tree, "bin", "busybox"), 0o755)
+    for applet in ["sh", "mount", "mkdir", "ln", "switch_root", "mdev"]:
+        link = os.path.join(init_tree, "bin", applet)
+        if not os.path.lexists(link):
+            os.symlink("busybox", link)
+
+    # Live init script
+    init_script = os.path.join(init_tree, "init")
+    with open(init_script, "w") as f:
+        f.write(textwrap.dedent("""\
+            #!/bin/sh
+            mount -t proc  proc  /proc
+            mount -t sysfs sysfs /sys
+            mount -t devtmpfs devtmpfs /dev 2>/dev/null || mdev -s
+
+            # Find and mount ISO (CD-ROM or USB)
+            for dev in /dev/sr0 /dev/sda /dev/sdb /dev/sdc; do
+                mount -t iso9660 -o ro "$dev" /mnt/cdrom 2>/dev/null && break
+            done
+
+            # Mount squashfs read-only base
+            mount -t squashfs -o ro /mnt/cdrom/live/filesystem.squashfs /mnt/squashfs
+
+            # overlayfs: tmpfs on top for a writable live session
+            mount -t tmpfs tmpfs /mnt/overlay
+            mkdir -p /mnt/overlay/upper /mnt/overlay/work
+            mount -t overlay overlay \
+                -o lowerdir=/mnt/squashfs,upperdir=/mnt/overlay/upper,workdir=/mnt/overlay/work \
+                /mnt/rootfs
+
+            # Move mounts into new root
+            mkdir -p /mnt/rootfs/dev /mnt/rootfs/proc /mnt/rootfs/sys
+            mount --move /dev  /mnt/rootfs/dev
+            mount --move /proc /mnt/rootfs/proc
+            mount --move /sys  /mnt/rootfs/sys
+
+            exec switch_root /mnt/rootfs /sbin/init
+        """))
+    os.chmod(init_script, 0o755)
+
+    # Pack initramfs: find | cpio | gzip
+    initrd_path = os.path.join(target, "boot", "live-initrd.img")
+    ensure(os.path.dirname(initrd_path))
+    log("Packing live initramfs...")
+    find_proc = subprocess.Popen(
+        ["find", ".", "-print0"], cwd=init_tree, stdout=subprocess.PIPE)
+    cpio_proc = subprocess.Popen(
+        ["cpio", "--null", "--create", "--format=newc"],
+        cwd=init_tree, stdin=find_proc.stdout, stdout=subprocess.PIPE)
+    find_proc.stdout.close()
+    with open(initrd_path, "wb") as out_f:
+        gzip_proc = subprocess.Popen(["gzip", "-9"], stdin=cpio_proc.stdout, stdout=out_f)
+    cpio_proc.stdout.close()
+    gzip_proc.wait(); find_proc.wait(); cpio_proc.wait()
+    log(f"Live initramfs: {initrd_path}", color=GREEN)
+
 # ── SmechVisor phases ─────────────────────────────────────────────────────────
 
 def phase_install_smechvisord(target):
@@ -793,6 +1174,54 @@ def phase_iso_shim(target):
         ],
         "SMECHVISOR_SHIM")
 
+def phase_iso_live_smechos(target):
+    """Build a SmechOS KDE Plasma live ISO (squashfs + overlayfs + Calamares)."""
+    log_phase("iso-live", "Build SmechOS KDE Plasma live ISO")
+    squashfs_path = "/tmp/smechos-filesystem.squashfs"
+    iso_path      = "/tmp/smechos-plasma-live.iso"
+    work          = os.path.join(BUILD_TMP, "iso-live")
+    shutil.rmtree(work, ignore_errors=True)
+
+    live_dir = os.path.join(work, "live")
+    ensure(live_dir)
+
+    # Squashfs the target root (exclude /boot — kernel lives separately in the ISO)
+    log("Creating squashfs of root filesystem (this takes a while)...")
+    mksquashfs = shutil.which("mksquashfs")
+    if not mksquashfs:
+        err("mksquashfs not found. Install squashfs-tools.")
+    run([mksquashfs, target, squashfs_path,
+         "-comp", "xz", "-Xdict-size", "100%",
+         "-e", os.path.join(target, "boot"),
+         "-noappend"])
+    shutil.copy2(squashfs_path, os.path.join(live_dir, "filesystem.squashfs"))
+
+    grub_cfg = textwrap.dedent("""\
+        set timeout=10
+        set default=0
+
+        menuentry "SmechOS KDE Plasma (Live)" {
+            linux  /boot/vmlinuz boot=live quiet splash loglevel=3
+            initrd /boot/live-initrd.img
+        }
+        menuentry "SmechOS KDE Plasma (Live, nomodeset)" {
+            linux  /boot/vmlinuz boot=live nomodeset quiet loglevel=3
+            initrd /boot/live-initrd.img
+        }
+        menuentry "Install SmechOS (Calamares)" {
+            linux  /boot/vmlinuz boot=live calamares=1 quiet loglevel=3
+            initrd /boot/live-initrd.img
+        }
+    """)
+
+    _grub_mkrescue(iso_path, work, grub_cfg,
+        [
+            (os.path.join(target, "boot", "vmlinuz"),       "boot/vmlinuz"),
+            (os.path.join(target, "boot", "live-initrd.img"), "boot/live-initrd.img"),
+        ],
+        "SMECHOS_LIVE")
+    log(f"SmechOS Plasma Live ISO ready: {iso_path}", color=GREEN)
+
 # ── Build profiles ────────────────────────────────────────────────────────────
 
 SMECHOS_PHASES = [
@@ -824,15 +1253,37 @@ SMECHVISOR_PHASES = [
     ("smechvisord", phase_install_smechvisord,  "Install smechvisord + OpenRC service"),
 ]
 
+SMECHOS_PLASMA_LIVE_PHASES = [
+    ("userland-glibc",  phase_bootstrap_userland_glibc, "Bootstrap GNU userland against host glibc"),
+    ("etc",             phase_write_etc,                 "Write /etc skeleton"),
+    ("systemd",         phase_systemd,                   "Install systemd from Debian packages"),
+    ("systemd-config",  phase_systemd_configure,         "Configure systemd for KDE Plasma desktop"),
+    ("grub",            phase_grub,                      "Compile GRUB 2.12 EFI + BIOS"),
+    ("qt-deps",         phase_qt_deps,                   "Compile Qt6 modules"),
+    ("mesa",            phase_mesa,                      "Compile Mesa stack"),
+    ("kde",             phase_kde,                       "Compile KDE Frameworks + Plasma"),
+    ("plasma-configure",phase_plasma_configure,          "Configure Plasma/SDDM session"),
+    ("kwin-deps",       phase_kwin_deps,                 "Copy KWin dependencies"),
+    ("qt6uitools",      phase_qt6uitools,                "Ensure Qt6UITools present"),
+    ("kernel",          phase_kernel,                    "Compile Linux 6.12.16"),
+    ("patch-metadata",  phase_patch_metadata,            "Patch metadata for SmechOS branding"),
+    ("discover",        phase_plasma_discover,           "Compile Plasma Discover + PackageKit"),
+    ("calamares",       phase_calamares,                 "Build Calamares graphical installer"),
+    ("chrome",          phase_google_chrome,             "Install Google Chrome stable"),
+    ("live-initramfs",  phase_live_initramfs,            "Build busybox live initramfs"),
+]
+
 PROFILES = {
-    "smechos":    SMECHOS_PHASES,
-    "smechvisor": SMECHVISOR_PHASES,
+    "smechos":            SMECHOS_PHASES,
+    "smechvisor":         SMECHVISOR_PHASES,
+    "smechos-plasma-live": SMECHOS_PLASMA_LIVE_PHASES,
 }
 
 ISO_BUILDERS = {
-    ("smechos",    "install"): phase_iso_install_smechos,
-    ("smechvisor", "install"): phase_iso_install_smechvisor,
-    ("smechvisor", "shim"):    phase_iso_shim,
+    ("smechos",             "install"): phase_iso_install_smechos,
+    ("smechvisor",          "install"): phase_iso_install_smechvisor,
+    ("smechvisor",          "shim"):    phase_iso_shim,
+    ("smechos-plasma-live", "live"):    phase_iso_live_smechos,
 }
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -883,9 +1334,11 @@ def main():
             Examples:
               python3 spk-compile.py smechos
               python3 spk-compile.py smechvisor
+              python3 spk-compile.py smechos-plasma-live
               python3 spk-compile.py smechos --phase kde
               python3 spk-compile.py smechos --iso install
               python3 spk-compile.py smechvisor --iso shim
+              python3 spk-compile.py smechos-plasma-live --iso live
               python3 spk-compile.py --list smechos
         """))
 
@@ -893,7 +1346,7 @@ def main():
     parser.add_argument("--target", default=DEFAULT_TARGET,
                         help=f"Target root (default: {DEFAULT_TARGET})")
     parser.add_argument("--phase", metavar="PHASE")
-    parser.add_argument("--iso",   metavar="TYPE", choices=["install", "shim"])
+    parser.add_argument("--iso",   metavar="TYPE", choices=["install", "shim", "live"])
     parser.add_argument("--list",  metavar="PROFILE", choices=list(PROFILES),
                         dest="list_profile")
     parser.add_argument("--version", action="store_true")
