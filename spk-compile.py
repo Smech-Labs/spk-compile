@@ -31,7 +31,7 @@ import textwrap
 
 # ── Version & constants ───────────────────────────────────────────────────────
 
-VERSION = "2.2.7"
+VERSION = "2.2.8"
 DEFAULT_TARGET = "/mnt/smechos_build_root"
 BUILD_TMP = "/tmp/smechos_build"
 
@@ -985,6 +985,8 @@ def phase_systemd(target):
             "-Dpolkit=disabled",
             "-Delfutils=disabled",
             "-Dkmod=disabled",
+            "-Dukify=disabled",
+            "-Dbootloader=disabled",
             "-Ddns-over-tls=false",
             "-Ddefault-dnssec=no",
             "-Dfallback-hostname=smechos",
