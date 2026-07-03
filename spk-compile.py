@@ -31,7 +31,7 @@ import textwrap
 
 # ── Version & constants ───────────────────────────────────────────────────────
 
-VERSION = "2.2.9"
+VERSION = "2.2.10"
 DEFAULT_TARGET = "/mnt/smechos_build_root"
 BUILD_TMP = "/tmp/smechos_build"
 
@@ -464,6 +464,9 @@ def phase_grub(target):
         bd = os.path.join(BUILD_TMP, f"grub-{platform}")
         shutil.rmtree(bd, ignore_errors=True)
         extract(tarball, bd)
+        # GRUB 2.12 bug: extra_deps.lst is a required prerequisite but is
+        # neither generated nor shipped in the tarball — create it empty.
+        open(os.path.join(bd, "grub-core", "extra_deps.lst"), "w").close()
         run(["./configure",
              f"--prefix={prefix}",
              f"--with-platform={platform}",
@@ -471,8 +474,7 @@ def phase_grub(target):
              "--disable-werror",
              "--disable-nls"],
             cwd=bd, env=env)
-        # GRUB 2.x has a parallel-make race on extra_deps.lst — must be -j1
-        run(["make", "-j1"], cwd=bd, env=env)
+        run(["make", "-j", nproc()], cwd=bd, env=env)
         run(["make", "install"], cwd=bd, env=env, sudo=(os.geteuid() != 0))
     log(f"GRUB {GRUB_VER} installed.", color=GREEN)
 
