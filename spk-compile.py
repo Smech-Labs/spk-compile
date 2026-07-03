@@ -31,7 +31,7 @@ import textwrap
 
 # ── Version & constants ───────────────────────────────────────────────────────
 
-VERSION = "2.2.1"
+VERSION = "2.2.2"
 DEFAULT_TARGET = "/mnt/smechos_build_root"
 BUILD_TMP = "/tmp/smechos_build"
 
@@ -50,15 +50,16 @@ SYSTEMD_VER    = "256.7"
 CALAMARES_VER  = "3.3.10"
 BUSYBOX_VER    = "1.36.1"
 
-# Download URLs
+# Download URLs (KDE URLs are resolved dynamically at build time — see _resolve_kde_versions)
 LINUX_URL    = f"https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-{LINUX_VER}.tar.xz"
 GRUB_URL     = f"https://ftp.gnu.org/gnu/grub/grub-{GRUB_VER}.tar.xz"
 MUSL_URL     = f"https://musl.libc.org/releases/musl-{MUSL_VER}.tar.gz"
 QT6_BASE_URL = f"https://download.qt.io/official_releases/qt/6.8/{QT6_VER}/submodules"
-PLASMA_URL   = f"https://download.kde.org/stable/plasma/{PLASMA_VER}"
-KF6_URL      = f"https://download.kde.org/stable/frameworks/6.27"
 MESA_URL     = f"https://mesa.freedesktop.org/archive/mesa-{MESA_VER}.tar.xz"
 OPENRC_URL   = f"https://github.com/OpenRC/openrc/archive/refs/tags/{OPENRC_VER}.tar.gz"
+# Plasma + KF6 URLs are set by _resolve_kde_versions() before each build
+PLASMA_URL   = f"https://download.kde.org/stable/plasma/{PLASMA_VER}"
+KF6_URL      = f"https://download.kde.org/stable/frameworks/6.27"
 
 # ANSI
 R       = "\x1b[0m"
@@ -82,6 +83,42 @@ def log_phase(name, desc):
 def err(msg):
     print(f"{RED}{BOLD}[ERROR]{R} {msg}", file=sys.stderr, flush=True)
     sys.exit(1)
+
+def _resolve_kde_versions():
+    """Query download.kde.org and return (plasma_ver, kf6_minor, kf6_ver).
+    Always resolves to the highest published stable release so builds never
+    pin stale EoL versions."""
+    import re
+    log("Resolving latest stable KDE Plasma + Frameworks from download.kde.org...")
+
+    def _fetch(url):
+        try:
+            with urllib.request.urlopen(url, timeout=20) as r:
+                return r.read().decode()
+        except Exception as e:
+            err(f"Could not reach {url}: {e}")
+
+    # Plasma: directory listing gives x.y.z/ entries
+    plasma_vers = re.findall(r'href="([0-9]+\.[0-9]+\.[0-9]+)/"',
+                             _fetch("https://download.kde.org/stable/plasma/"))
+    if not plasma_vers:
+        err("Could not detect latest Plasma version from download.kde.org/stable/plasma/")
+    plasma_ver = sorted(plasma_vers, key=lambda v: [int(x) for x in v.split(".")])[-1]
+
+    # KF6 minor: directory listing gives x.y/ entries
+    kf6_minors = re.findall(r'href="([0-9]+\.[0-9]+)/"',
+                            _fetch("https://download.kde.org/stable/frameworks/"))
+    if not kf6_minors:
+        err("Could not detect latest KF6 version from download.kde.org/stable/frameworks/")
+    kf6_minor = sorted(kf6_minors, key=lambda v: [int(x) for x in v.split(".")])[-1]
+
+    # KF6 full version: parse from a known filename inside the minor directory
+    kf6_listing = _fetch(f"https://download.kde.org/stable/frameworks/{kf6_minor}/")
+    full = re.findall(rf'extra-cmake-modules-([0-9]+\.[0-9]+\.[0-9]+)\.tar', kf6_listing)
+    kf6_ver = full[0] if full else f"{kf6_minor}.0"
+
+    log(f"KDE Plasma {plasma_ver}  |  KDE Frameworks {kf6_ver}", color=GREEN)
+    return plasma_ver, kf6_minor, kf6_ver
 
 def nproc():
     return str(os.cpu_count() or 4)
@@ -1296,6 +1333,14 @@ def cmd_list(profile):
     print()
 
 def cmd_build(profile, target, only_phase=None):
+    global PLASMA_VER, KF6_VER, PLASMA_URL, KF6_URL
+    # Always resolve KDE versions from the mirror so the build never uses EoL releases
+    _plasma_ver, _kf6_minor, _kf6_ver = _resolve_kde_versions()
+    PLASMA_VER = _plasma_ver
+    KF6_VER    = _kf6_ver
+    PLASMA_URL = f"https://download.kde.org/stable/plasma/{PLASMA_VER}"
+    KF6_URL    = f"https://download.kde.org/stable/frameworks/{_kf6_minor}"
+
     phases = PROFILES[profile]
     ensure(BUILD_TMP)
     if only_phase:
@@ -1308,6 +1353,7 @@ def cmd_build(profile, target, only_phase=None):
     start = time.time()
     print(f"\n{MAGENTA}{BOLD}{'='*64}{R}")
     print(f"{MAGENTA}{BOLD}  spk-compile v{VERSION}  |  {profile}  |  target: {target}{R}")
+    print(f"{MAGENTA}{BOLD}  KDE Plasma {PLASMA_VER}  |  KF6 {KF6_VER}{R}")
     print(f"{MAGENTA}{BOLD}{'='*64}{R}\n")
 
     for name, fn, desc in phases:
