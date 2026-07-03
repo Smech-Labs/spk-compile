@@ -31,7 +31,7 @@ import textwrap
 
 # ── Version & constants ───────────────────────────────────────────────────────
 
-VERSION = "2.2.3"
+VERSION = "2.2.4"
 DEFAULT_TARGET = "/mnt/smechos_build_root"
 BUILD_TMP = "/tmp/smechos_build"
 
@@ -174,6 +174,7 @@ def build_env(target):
     e["LD_LIBRARY_PATH"] = f"{prefix}/lib:{prefix}/lib/x86_64-linux-musl"
     e["CC"]  = "musl-gcc"
     e["CXX"] = "musl-g++"
+    e["FORCE_UNSAFE_CONFIGURE"] = "1"
     return e
 
 def build_env_glibc(target):
@@ -193,6 +194,7 @@ def build_env_glibc(target):
     e["CXXFLAGS"] = f"-I{prefix}/include"
     e["LDFLAGS"]  = f"-L{prefix}/lib"
     e["LD_LIBRARY_PATH"] = f"{prefix}/lib"
+    e["FORCE_UNSAFE_CONFIGURE"] = "1"
     return e
 
 def _extract_deb(deb_path, dest):
