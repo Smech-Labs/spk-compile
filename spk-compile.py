@@ -31,9 +31,10 @@ import textwrap
 
 # ── Version & constants ───────────────────────────────────────────────────────
 
-VERSION = "2.2.10"
+VERSION = "2.2.11"
 DEFAULT_TARGET = "/mnt/smechos_build_root"
 BUILD_TMP = "/tmp/smechos_build"
+STAMP_DIR  = os.path.join(BUILD_TMP, ".stamps")
 
 # Source versions
 LINUX_VER      = "6.12.16"
@@ -156,6 +157,18 @@ def sources(target):
     ensure(d)
     return d
 
+def _stamp_path(profile, name):
+    return os.path.join(STAMP_DIR, f"{profile}-{name}.done")
+
+def _phase_done(profile, name):
+    return os.path.exists(_stamp_path(profile, name))
+
+def _mark_done(profile, name):
+    ensure(STAMP_DIR)
+    with open(_stamp_path(profile, name), "w") as f:
+        import datetime
+        f.write(datetime.datetime.utcnow().isoformat())
+
 def build_env(target):
     e = dict(os.environ)
     e["SMECH_TARGET"] = target
@@ -213,13 +226,18 @@ def _extract_deb(deb_path, dest):
 def cmake_install(src_dir, prefix, extra_args=None, env=None, build_dir=None):
     bd = build_dir or os.path.join(src_dir, "build")
     ensure(bd)
-    run(["cmake", src_dir,
+    # Always resolve cmake/ninja from the host system PATH, never from the
+    # build root — a partially-installed cmake there can't find its own modules.
+    _host = "/usr/local/bin:/usr/bin:/bin"
+    cmake_bin = shutil.which("cmake", path=_host) or "cmake"
+    ninja_bin = shutil.which("ninja", path=_host) or "ninja"
+    run([cmake_bin, src_dir,
          "-G", "Ninja",
          f"-DCMAKE_INSTALL_PREFIX={prefix}",
          "-DCMAKE_BUILD_TYPE=Release",
          ] + (extra_args or []), cwd=bd, env=env)
-    run(["ninja", "-j", nproc()], cwd=bd, env=env)
-    run(["ninja", "install"], cwd=bd, env=env, sudo=(os.geteuid() != 0))
+    run([ninja_bin, "-j", nproc()], cwd=bd, env=env)
+    run([ninja_bin, "install"], cwd=bd, env=env, sudo=(os.geteuid() != 0))
 
 def meson_install(src_dir, prefix, extra_args=None, env=None, build_dir=None):
     bd = build_dir or os.path.join(src_dir, "build")
@@ -1556,8 +1574,12 @@ def cmd_build(profile, target, only_phase=None):
     print(f"{MAGENTA}{BOLD}{'='*64}{R}\n")
 
     for name, fn, desc in phases:
+        if not only_phase and _phase_done(profile, name):
+            log(f"'{name}' already built — skipping (delete {STAMP_DIR}/{profile}-{name}.done to rebuild)", color=YELLOW)
+            continue
         t0 = time.time()
         fn(target)
+        _mark_done(profile, name)
         log(f"'{name}' done in {time.time()-t0:.1f}s", color=GREEN)
 
     log(f"BUILD COMPLETE: {profile} in {time.time()-start:.0f}s", color=GREEN)
