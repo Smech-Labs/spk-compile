@@ -25,6 +25,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxcb-sync-dev libxcb-xfixes0-dev libxcb-shape0-dev \
     libxcb-randr0-dev libxcb-render-util0-dev \
     libxcb-xinerama0-dev libxcb-xkb-dev \
+    libxcb-composite0-dev libxcb-damage0-dev libxcb-dpms0-dev \
+    libxcb-ewmh-dev libxcb-util-dev libxcb-cursor-dev \
     # Qt6 — Wayland
     libwayland-dev wayland-protocols libwayland-egl-backend-dev \
     libxkbcommon-dev libxkbcommon-x11-dev \
