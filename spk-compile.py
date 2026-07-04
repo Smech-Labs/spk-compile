@@ -31,7 +31,7 @@ import textwrap
 
 # ── Version & constants ───────────────────────────────────────────────────────
 
-VERSION = "2.2.14"
+VERSION = "2.2.15"
 DEFAULT_TARGET = "/mnt/smechos_build_root"
 BUILD_TMP  = "/tmp/smechos_build"
 STAMP_DIR  = "/mnt/spk-compile-sources/.stamps"  # persistent across reboots
@@ -755,11 +755,12 @@ def phase_plasma_discover(target):
     extract(tarball, bd)
     cmake_install(bd, prefix,
         extra_args=["-DWITH_KCM=OFF", "-DWITH_SNAP=OFF",
-                    "-DWITH_FLATPAK=OFF", "-DWITH_FWUPD=OFF",
+                    "-DWITH_FLATPAK=ON", "-DWITH_FWUPD=ON",
                     "-DWITH_PACKAGEKIT=ON",
+                    "-DCMAKE_INSTALL_LIBDIR=lib",
                     f"-DCMAKE_PREFIX_PATH={prefix}"],
         env=env, build_dir=os.path.join(BUILD_TMP, "discover-build"))
-    log("Plasma Discover + PackageKit + SPK backend installed.", color=GREEN)
+    log("Plasma Discover + PackageKit + Flatpak + fwupd installed.", color=GREEN)
 
 # ── Package bundling ─────────────────────────────────────────────────────────
 
