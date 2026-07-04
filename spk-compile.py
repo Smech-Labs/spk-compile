@@ -32,7 +32,7 @@ import textwrap
 
 # ── Version & constants ───────────────────────────────────────────────────────
 
-VERSION = "2.2.26"
+VERSION = "2.2.27"
 DEFAULT_TARGET = "/mnt/smechos_build_root"
 BUILD_TMP  = "/tmp/smechos_build"
 STAMP_DIR  = "/mnt/spk-compile-sources/.stamps"  # persistent across reboots
@@ -541,6 +541,7 @@ def phase_qt_deps(target):
         download(url, tarball)
         bd = os.path.join(BUILD_TMP, f"qt6-{name}")
         shutil.rmtree(bd, ignore_errors=True)
+        shutil.rmtree(os.path.join(BUILD_TMP, f"qt6-{name}-build"), ignore_errors=True)
         extract(tarball, bd)
         cmake_install(bd, prefix,
             extra_args=[f"-DCMAKE_PREFIX_PATH={prefix}",
