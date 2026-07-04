@@ -31,7 +31,7 @@ import textwrap
 
 # ── Version & constants ───────────────────────────────────────────────────────
 
-VERSION = "2.2.15"
+VERSION = "2.2.17"
 DEFAULT_TARGET = "/mnt/smechos_build_root"
 BUILD_TMP  = "/tmp/smechos_build"
 STAMP_DIR  = "/mnt/spk-compile-sources/.stamps"  # persistent across reboots
@@ -547,8 +547,8 @@ def phase_mesa(target):
     extract(tarball, bd)
     meson_install(bd, f"{target}/usr",
         extra_args=[
-            "-Dgallium-drivers=radeonsi,nouveau,swrast",
-            "-Dvulkan-drivers=amd,nouveau",
+            "-Dgallium-drivers=radeonsi,nouveau,iris,crocus,swrast",
+            "-Dvulkan-drivers=amd,intel",
             "-Dglx=dri", "-Degl=enabled", "-Dgbm=enabled",
             "-Dopengl=true", "-Dgles1=enabled", "-Dgles2=enabled",
             "-Dshared-glapi=enabled",
