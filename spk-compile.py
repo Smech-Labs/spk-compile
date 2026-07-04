@@ -31,10 +31,10 @@ import textwrap
 
 # ── Version & constants ───────────────────────────────────────────────────────
 
-VERSION = "2.2.12"
+VERSION = "2.2.13"
 DEFAULT_TARGET = "/mnt/smechos_build_root"
-BUILD_TMP = "/tmp/smechos_build"
-STAMP_DIR  = os.path.join(BUILD_TMP, ".stamps")
+BUILD_TMP  = "/tmp/smechos_build"
+STAMP_DIR  = "/mnt/spk-compile-sources/.stamps"  # persistent across reboots
 
 # Source versions
 LINUX_VER      = "6.12.16"
