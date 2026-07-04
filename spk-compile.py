@@ -31,7 +31,7 @@ import textwrap
 
 # ── Version & constants ───────────────────────────────────────────────────────
 
-VERSION = "2.2.11"
+VERSION = "2.2.12"
 DEFAULT_TARGET = "/mnt/smechos_build_root"
 BUILD_TMP = "/tmp/smechos_build"
 STAMP_DIR  = os.path.join(BUILD_TMP, ".stamps")
@@ -167,7 +167,7 @@ def _mark_done(profile, name):
     ensure(STAMP_DIR)
     with open(_stamp_path(profile, name), "w") as f:
         import datetime
-        f.write(datetime.datetime.utcnow().isoformat())
+        f.write(datetime.datetime.now(datetime.timezone.utc).isoformat())
 
 def build_env(target):
     e = dict(os.environ)
@@ -209,6 +209,13 @@ def build_env_glibc(target):
     e["LD_LIBRARY_PATH"] = f"{prefix}/lib"
     e["FORCE_UNSAFE_CONFIGURE"] = "1"
     return e
+
+# Set to True by cmd_build when the active profile uses glibc instead of musl.
+_USE_GLIBC = False
+
+def active_env(target):
+    """Return the right build environment for the currently running profile."""
+    return build_env_glibc(target) if _USE_GLIBC else build_env(target)
 
 def _extract_deb(deb_path, dest):
     """Extract a .deb file's data.tar into dest."""
@@ -499,7 +506,7 @@ def phase_grub(target):
 def phase_qt_deps(target):
     log_phase("qt-deps", f"Compile Qt6 {QT6_VER} modules")
     src = sources(target)
-    env = build_env(target)
+    env = active_env(target)
     prefix = f"{target}/usr"
 
     modules = [
@@ -547,7 +554,7 @@ def phase_mesa(target):
             "-Dplatforms=x11,wayland",
             "-Dglvnd=disabled", "-Db_lto=false",
         ],
-        env=build_env(target),
+        env=active_env(target),
         build_dir=os.path.join(BUILD_TMP, "mesa-build"))
     log(f"Mesa {MESA_VER} installed.", color=GREEN)
 
@@ -568,7 +575,7 @@ def _kde_pkg(name, version, base_url, target, env):
 
 def phase_kde(target):
     log_phase("kde", f"Compile KDE Frameworks {KF6_VER} + Plasma {PLASMA_VER}")
-    env = build_env(target)
+    env = active_env(target)
 
     kf6 = [
         "extra-cmake-modules", "kconfig", "kguiaddons", "ki18n",
@@ -693,7 +700,7 @@ def phase_patch_metadata(target):
 def phase_plasma_discover(target):
     log_phase("discover", "Compile Plasma Discover + PackageKit + SPK backend")
     src    = sources(target)
-    env    = build_env(target)
+    env    = active_env(target)
     prefix = f"{target}/usr"
 
     # AppStream
@@ -1550,13 +1557,15 @@ def cmd_list(profile):
     print()
 
 def cmd_build(profile, target, only_phase=None):
-    global PLASMA_VER, KF6_VER, PLASMA_URL, KF6_URL
+    global PLASMA_VER, KF6_VER, PLASMA_URL, KF6_URL, _USE_GLIBC
     # Always resolve KDE versions from the mirror so the build never uses EoL releases
     _plasma_ver, _kf6_minor, _kf6_ver = _resolve_kde_versions()
     PLASMA_VER = _plasma_ver
     KF6_VER    = _kf6_ver
     PLASMA_URL = f"https://download.kde.org/stable/plasma/{PLASMA_VER}"
     KF6_URL    = f"https://download.kde.org/stable/frameworks/{_kf6_minor}"
+    # smechos-plasma-live uses glibc/gcc; other profiles use musl
+    _USE_GLIBC = (profile == "smechos-plasma-live")
 
     phases = PROFILES[profile]
     ensure(BUILD_TMP)
