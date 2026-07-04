@@ -31,7 +31,7 @@ import textwrap
 
 # ── Version & constants ───────────────────────────────────────────────────────
 
-VERSION = "2.2.18"
+VERSION = "2.2.19"
 DEFAULT_TARGET = "/mnt/smechos_build_root"
 BUILD_TMP  = "/tmp/smechos_build"
 STAMP_DIR  = "/mnt/spk-compile-sources/.stamps"  # persistent across reboots
@@ -537,7 +537,7 @@ def phase_qt_deps(target):
             build_dir=os.path.join(BUILD_TMP, f"qt6-{name}-build"))
         log(f"Qt6/{name} done.", color=GREEN)
 
-CMAKE_BOOTSTRAP_VER = "3.32.6"
+CMAKE_BOOTSTRAP_VER = "3.31.6"
 CMAKE_BOOTSTRAP_URL = f"https://github.com/Kitware/CMake/releases/download/v{CMAKE_BOOTSTRAP_VER}/cmake-{CMAKE_BOOTSTRAP_VER}-linux-x86_64.tar.gz"
 
 def phase_cmake_bootstrap(target):
