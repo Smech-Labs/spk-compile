@@ -21,6 +21,7 @@ Usage:
 """
 
 import argparse
+import glob
 import os
 import sys
 import subprocess
@@ -31,7 +32,7 @@ import textwrap
 
 # ── Version & constants ───────────────────────────────────────────────────────
 
-VERSION = "2.2.23"
+VERSION = "2.2.24"
 DEFAULT_TARGET = "/mnt/smechos_build_root"
 BUILD_TMP  = "/tmp/smechos_build"
 STAMP_DIR  = "/mnt/spk-compile-sources/.stamps"  # persistent across reboots
@@ -509,6 +510,18 @@ def phase_qt_deps(target):
     src = sources(target)
     env = active_env(target)
     prefix = f"{target}/usr"
+
+    # Wipe old Qt installation so build tools don't load stale sonames
+    for pattern in [f"{prefix}/lib/libQt6*.so*",
+                    f"{prefix}/lib/libQt6*.a",
+                    f"{prefix}/lib/libQt6*.prl"]:
+        for f in glob.glob(pattern):
+            try: os.remove(f)
+            except OSError: pass
+    for d in glob.glob(f"{prefix}/lib/cmake/Qt6*"):
+        shutil.rmtree(d, ignore_errors=True)
+    for d in glob.glob(f"{prefix}/include/Qt*"):
+        shutil.rmtree(d, ignore_errors=True)
 
     modules = [
         ("qtbase",        ["-DFEATURE_sql=OFF", "-DFEATURE_testlib=OFF"]),
