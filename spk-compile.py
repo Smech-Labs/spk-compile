@@ -31,7 +31,7 @@ import textwrap
 
 # ── Version & constants ───────────────────────────────────────────────────────
 
-VERSION = "2.2.17"
+VERSION = "2.2.18"
 DEFAULT_TARGET = "/mnt/smechos_build_root"
 BUILD_TMP  = "/tmp/smechos_build"
 STAMP_DIR  = "/mnt/spk-compile-sources/.stamps"  # persistent across reboots
@@ -536,6 +536,31 @@ def phase_qt_deps(target):
             env=env,
             build_dir=os.path.join(BUILD_TMP, f"qt6-{name}-build"))
         log(f"Qt6/{name} done.", color=GREEN)
+
+CMAKE_BOOTSTRAP_VER = "3.32.6"
+CMAKE_BOOTSTRAP_URL = f"https://github.com/Kitware/CMake/releases/download/v{CMAKE_BOOTSTRAP_VER}/cmake-{CMAKE_BOOTSTRAP_VER}-linux-x86_64.tar.gz"
+
+def phase_cmake_bootstrap(target):
+    log_phase("cmake-bootstrap", f"Bootstrap CMake {CMAKE_BOOTSTRAP_VER} (KDE requires 3.29+)")
+    src     = sources(target)
+    tarball = os.path.join(src, f"cmake-{CMAKE_BOOTSTRAP_VER}-linux-x86_64.tar.gz")
+    download(CMAKE_BOOTSTRAP_URL, tarball)
+    extract_dir = os.path.join(BUILD_TMP, "cmake-bootstrap")
+    shutil.rmtree(extract_dir, ignore_errors=True)
+    ensure(extract_dir)
+    run(["tar", "--strip-components", "1", "-xf", tarball, "-C", extract_dir])
+    # Install cmake/cpack/ctest to /usr/local/bin so cmake_install() picks them up first
+    for binary in ("cmake", "cpack", "ctest", "cmake-gui"):
+        src_bin = os.path.join(extract_dir, "bin", binary)
+        dst_bin = os.path.join("/usr/local/bin", binary)
+        if os.path.exists(src_bin):
+            run(["cp", "-f", src_bin, dst_bin], sudo=(os.geteuid() != 0))
+    # Modules directory must be alongside the binary
+    modules_dst = f"/usr/local/share/cmake-{CMAKE_BOOTSTRAP_VER[:4]}"
+    run(["cp", "-r", os.path.join(extract_dir, "share", f"cmake-{CMAKE_BOOTSTRAP_VER[:4]}"),
+         modules_dst], sudo=(os.geteuid() != 0))
+    result = subprocess.run(["/usr/local/bin/cmake", "--version"], capture_output=True, text=True)
+    log(f"cmake bootstrap: {result.stdout.strip().splitlines()[0]}", color=GREEN)
 
 def phase_mesa(target):
     log_phase("mesa", f"Compile Mesa {MESA_VER}")
@@ -1494,6 +1519,7 @@ SMECHOS_PHASES = [
     ("grub",             phase_grub,                "Compile GRUB 2.12 EFI + BIOS"),
     ("qt-deps",          phase_qt_deps,             "Compile Qt6 modules"),
     ("mesa",             phase_mesa,                "Compile Mesa stack"),
+    ("cmake-bootstrap",  phase_cmake_bootstrap,     f"Bootstrap CMake {CMAKE_BOOTSTRAP_VER}"),
     ("kde",              phase_kde,                 "Compile KDE Frameworks + Plasma"),
     ("plasma-configure", phase_plasma_configure,    "Configure Plasma/SDDM session"),
     ("kwin-deps",        phase_kwin_deps,           "Copy KWin dependencies"),
@@ -1523,6 +1549,7 @@ SMECHOS_PLASMA_LIVE_PHASES = [
     ("grub",            phase_grub,                      "Compile GRUB 2.12 EFI + BIOS"),
     ("qt-deps",         phase_qt_deps,                   "Compile Qt6 modules"),
     ("mesa",            phase_mesa,                      "Compile Mesa stack"),
+    ("cmake-bootstrap", phase_cmake_bootstrap,           f"Bootstrap CMake {CMAKE_BOOTSTRAP_VER}"),
     ("kde",             phase_kde,                       "Compile KDE Frameworks + Plasma"),
     ("plasma-configure",phase_plasma_configure,          "Configure Plasma/SDDM session"),
     ("kwin-deps",       phase_kwin_deps,                 "Copy KWin dependencies"),
