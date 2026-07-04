@@ -32,7 +32,7 @@ import textwrap
 
 # ── Version & constants ───────────────────────────────────────────────────────
 
-VERSION = "2.2.28"
+VERSION = "2.2.29"
 DEFAULT_TARGET = "/mnt/smechos_build_root"
 BUILD_TMP  = "/tmp/smechos_build"
 STAMP_DIR  = "/mnt/spk-compile-sources/.stamps"  # persistent across reboots
@@ -524,8 +524,7 @@ def phase_qt_deps(target):
         shutil.rmtree(d, ignore_errors=True)
 
     modules = [
-        ("qtbase",        ["-DFEATURE_sql=OFF", "-DFEATURE_testlib=OFF",
-                           "-DFEATURE_xcb=ON", "-DFEATURE_xcb_xlib=ON"]),
+        ("qtbase",        ["-DFEATURE_sql=OFF", "-DFEATURE_testlib=OFF"]),
         ("qtshadertools", []),
         ("qtdeclarative", []),
         ("qtsvg",         []),
