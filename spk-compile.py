@@ -31,7 +31,7 @@ import textwrap
 
 # ── Version & constants ───────────────────────────────────────────────────────
 
-VERSION = "2.2.19"
+VERSION = "2.2.20"
 DEFAULT_TARGET = "/mnt/smechos_build_root"
 BUILD_TMP  = "/tmp/smechos_build"
 STAMP_DIR  = "/mnt/spk-compile-sources/.stamps"  # persistent across reboots
@@ -40,7 +40,7 @@ STAMP_DIR  = "/mnt/spk-compile-sources/.stamps"  # persistent across reboots
 LINUX_VER      = "6.12.16"
 GRUB_VER       = "2.12"
 MUSL_VER       = "1.2.5"
-QT6_VER        = "6.8.2"
+QT6_VER        = "6.9.0"
 PLASMA_VER     = "6.7.2"
 KF6_VER        = "6.27.0"
 MESA_VER       = "24.3.4"
