@@ -31,7 +31,7 @@ import textwrap
 
 # ── Version & constants ───────────────────────────────────────────────────────
 
-VERSION = "2.2.21"
+VERSION = "2.2.22"
 DEFAULT_TARGET = "/mnt/smechos_build_root"
 BUILD_TMP  = "/tmp/smechos_build"
 STAMP_DIR  = "/mnt/spk-compile-sources/.stamps"  # persistent across reboots
@@ -55,7 +55,8 @@ BUSYBOX_VER    = "1.36.1"
 LINUX_URL    = f"https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-{LINUX_VER}.tar.xz"
 GRUB_URL     = f"https://ftp.gnu.org/gnu/grub/grub-{GRUB_VER}.tar.xz"
 MUSL_URL     = f"https://musl.libc.org/releases/musl-{MUSL_VER}.tar.gz"
-QT6_BASE_URL = f"https://download.qt.io/official_releases/qt/6.8/{QT6_VER}/submodules"
+QT6_MINOR    = ".".join(QT6_VER.split(".")[:2])
+QT6_BASE_URL = f"https://download.qt.io/official_releases/qt/{QT6_MINOR}/{QT6_VER}/submodules"
 MESA_URL     = f"https://mesa.freedesktop.org/archive/mesa-{MESA_VER}.tar.xz"
 OPENRC_URL   = f"https://github.com/OpenRC/openrc/archive/refs/tags/{OPENRC_VER}.tar.gz"
 # Plasma + KF6 URLs are set by _resolve_kde_versions() before each build
