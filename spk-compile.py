@@ -32,7 +32,7 @@ import textwrap
 
 # ── Version & constants ───────────────────────────────────────────────────────
 
-VERSION = "2.2.24"
+VERSION = "2.2.25"
 DEFAULT_TARGET = "/mnt/smechos_build_root"
 BUILD_TMP  = "/tmp/smechos_build"
 STAMP_DIR  = "/mnt/spk-compile-sources/.stamps"  # persistent across reboots
@@ -531,7 +531,6 @@ def phase_qt_deps(target):
         ("qtwayland",     []),
         ("qtmultimedia",  []),
         ("qt5compat",     []),
-        ("qttranslations",[]),
     ]
     for name, extra in modules:
         fname   = f"{name}-everywhere-src-{QT6_VER}.tar.xz"
