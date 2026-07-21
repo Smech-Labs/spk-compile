@@ -27,6 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxcb-xinerama0-dev libxcb-xkb-dev \
     libxcb-composite0-dev libxcb-damage0-dev libxcb-dpms0-dev \
     libxcb-ewmh-dev libxcb-util-dev libxcb-cursor-dev \
+    libxcb-res0-dev libxcb-xinput-dev libxcb-xtest0-dev \
     # Qt6 — Wayland
     libwayland-dev wayland-protocols libwayland-egl-backend-dev \
     libxkbcommon-dev libxkbcommon-x11-dev \
@@ -48,6 +49,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     llvm-dev libllvm18 libelf-dev libexpat1-dev \
     python3-mako libclang-dev \
     # KDE Frameworks
+    libhunspell-dev libsecret-1-dev \
     libboost-dev libboost-all-dev \
     libxml2-dev libxslt1-dev \
     libsasl2-dev libattr1-dev \
@@ -59,6 +61,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libboost-python-dev \
     yaml-cpp-dev \
     # Discover / PackageKit
+    libpipewire-0.3-dev libspa-0.2-dev \
     libflatpak-dev libfwupd-dev \
     libappstream-dev \
     libpolkit-gobject-1-dev \

@@ -20,6 +20,14 @@ Usage:
     python3 spk-compile.py --version
 """
 
+# Before running, mount a disk image at /mnt/smechos_build_root:
+#
+#   dd if=/dev/zero of=smechos_build.img bs=1G count=80
+#   mkfs.ext4 smechos_build.img
+#   sudo mount -o loop smechos_build.img /mnt/smechos_build_root
+#
+# The image needs ~60-80 GB free. This keeps the build root off your host filesystem.
+
 import argparse
 import glob
 import os
@@ -32,7 +40,7 @@ import textwrap
 
 # ── Version & constants ───────────────────────────────────────────────────────
 
-VERSION = "2.2.29"
+VERSION = "2.2.39"
 DEFAULT_TARGET = "/mnt/smechos_build_root"
 BUILD_TMP  = "/tmp/smechos_build"
 STAMP_DIR  = "/mnt/spk-compile-sources/.stamps"  # persistent across reboots
@@ -41,16 +49,21 @@ STAMP_DIR  = "/mnt/spk-compile-sources/.stamps"  # persistent across reboots
 LINUX_VER      = "6.12.16"
 GRUB_VER       = "2.12"
 MUSL_VER       = "1.2.5"
-QT6_VER        = "6.9.3"
+QT6_VER        = "6.10.3"
 PLASMA_VER     = "6.7.2"
 KF6_VER        = "6.27.0"
 MESA_VER       = "24.3.4"
 OPENRC_VER     = "0.54"
-APPSTREAM_VER  = "1.0.3"
-PACKAGEKIT_VER = "1.3.0"
+APPSTREAM_VER     = "1.0.4"
+PACKAGEKIT_VER    = "1.3.0"
+PACKAGEKITQT_VER  = "1.1.4"
 SYSTEMD_VER    = "256.7"
 CALAMARES_VER  = "3.3.10"
 BUSYBOX_VER    = "1.36.1"
+WAYLAND_PROTO_VER = "1.48"
+WAYLAND_VER       = "1.24.0"
+LIBINPUT_VER      = "1.28.0"
+LIBEIS_VER        = "1.4.0"
 
 # Download URLs (KDE URLs are resolved dynamically at build time — see _resolve_kde_versions)
 LINUX_URL    = f"https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-{LINUX_VER}.tar.xz"
@@ -59,6 +72,10 @@ MUSL_URL     = f"https://musl.libc.org/releases/musl-{MUSL_VER}.tar.gz"
 QT6_MINOR    = ".".join(QT6_VER.split(".")[:2])
 QT6_BASE_URL = f"https://download.qt.io/official_releases/qt/{QT6_MINOR}/{QT6_VER}/submodules"
 MESA_URL     = f"https://mesa.freedesktop.org/archive/mesa-{MESA_VER}.tar.xz"
+WAYLAND_PROTO_URL = f"https://gitlab.freedesktop.org/wayland/wayland-protocols/-/archive/{WAYLAND_PROTO_VER}/wayland-protocols-{WAYLAND_PROTO_VER}.tar.gz"
+WAYLAND_URL       = f"https://gitlab.freedesktop.org/wayland/wayland/-/archive/{WAYLAND_VER}/wayland-{WAYLAND_VER}.tar.gz"
+LIBINPUT_URL      = f"https://gitlab.freedesktop.org/libinput/libinput/-/archive/{LIBINPUT_VER}/libinput-{LIBINPUT_VER}.tar.gz"
+LIBEIS_URL        = f"https://gitlab.freedesktop.org/libeis/libeis/-/releases/{LIBEIS_VER}/downloads/libeis-{LIBEIS_VER}.tar.xz"
 OPENRC_URL   = f"https://github.com/OpenRC/openrc/archive/refs/tags/{OPENRC_VER}.tar.gz"
 # Plasma + KF6 URLs are set by _resolve_kde_versions() before each build
 PLASMA_URL   = f"https://download.kde.org/stable/plasma/{PLASMA_VER}"
@@ -197,18 +214,19 @@ def build_env_glibc(target):
     e = dict(os.environ)
     e["SMECH_TARGET"] = target
     e.pop("TARGET", None)
-    e.pop("CC",  None)
-    e.pop("CXX", None)
+    # Use GCC 14 — required for std::ranges::to (C++23) in libkscreen and other Plasma 6 packages
+    e["CC"]  = "gcc-14"
+    e["CXX"] = "g++-14"
     prefix = f"{target}/usr"
     e["PATH"] = f"{prefix}/bin:{e.get('PATH', '/usr/local/bin:/usr/bin:/bin')}"
     e["PKG_CONFIG_PATH"] = (
-        f"{prefix}/lib/pkgconfig:{prefix}/share/pkgconfig:"
+        f"{prefix}/lib/x86_64-linux-gnu/pkgconfig:{prefix}/lib/pkgconfig:{prefix}/share/pkgconfig:"
         "/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig:/usr/lib/pkgconfig"
     )
     e["CFLAGS"]   = f"-I{prefix}/include"
     e["CXXFLAGS"] = f"-I{prefix}/include"
-    e["LDFLAGS"]  = f"-L{prefix}/lib"
-    e["LD_LIBRARY_PATH"] = f"{prefix}/lib"
+    e["LDFLAGS"]  = f"-L{prefix}/lib/x86_64-linux-gnu -L{prefix}/lib"
+    e["LD_LIBRARY_PATH"] = f"{prefix}/lib/x86_64-linux-gnu:{prefix}/lib"
     e["FORCE_UNSAFE_CONFIGURE"] = "1"
     return e
 
@@ -240,13 +258,27 @@ def cmake_install(src_dir, prefix, extra_args=None, env=None, build_dir=None):
     _host = "/usr/local/bin:/usr/bin:/bin"
     cmake_bin = shutil.which("cmake", path=_host) or "cmake"
     ninja_bin = shutil.which("ninja", path=_host) or "ninja"
+    # Ensure build-time tools (generated executables like katehighlightingindexer,
+    # kcmdesktopfilegenerator, etc.) find our Qt/KF6 libs at build time.
+    # These tools have no RUNPATH so LD_LIBRARY_PATH must be set in the env.
+    build_env = dict(env) if env else dict(os.environ)
+    prefix_lib = f"{prefix}/lib"
+    prefix_arch_lib = f"{prefix}/lib/x86_64-linux-gnu"
+    # LD_LIBRARY_PATH: runtime loader path for build-time tools (no RUNPATH)
+    existing_ldp = build_env.get("LD_LIBRARY_PATH", "")
+    if prefix_lib not in existing_ldp:
+        build_env["LD_LIBRARY_PATH"] = f"{prefix_lib}:{existing_ldp}" if existing_ldp else prefix_lib
+    # LIBRARY_PATH: linker search path so arch-specific libs (libsystemd etc.) are found
+    existing_lp = build_env.get("LIBRARY_PATH", "")
+    if prefix_arch_lib not in existing_lp:
+        build_env["LIBRARY_PATH"] = f"{prefix_arch_lib}:{existing_lp}" if existing_lp else prefix_arch_lib
     run([cmake_bin, src_dir,
          "-G", "Ninja",
          f"-DCMAKE_INSTALL_PREFIX={prefix}",
          "-DCMAKE_BUILD_TYPE=Release",
-         ] + (extra_args or []), cwd=bd, env=env)
-    run([ninja_bin, "-j", nproc()], cwd=bd, env=env)
-    run([ninja_bin, "install"], cwd=bd, env=env, sudo=(os.geteuid() != 0))
+         ] + (extra_args or []), cwd=bd, env=build_env)
+    run([ninja_bin, "-j", nproc(), "-k", "0"], cwd=bd, env=build_env, check=False)
+    run([cmake_bin, "--install", bd], env=build_env, sudo=(os.geteuid() != 0))
 
 def meson_install(src_dir, prefix, extra_args=None, env=None, build_dir=None):
     bd = build_dir or os.path.join(src_dir, "build")
@@ -524,7 +556,7 @@ def phase_qt_deps(target):
         shutil.rmtree(d, ignore_errors=True)
 
     modules = [
-        ("qtbase",        ["-DFEATURE_sql=OFF", "-DFEATURE_testlib=OFF"]),
+        ("qtbase",        ["-DFEATURE_testlib=OFF"]),
         ("qtshadertools", []),
         ("qtdeclarative", []),
         ("qtsvg",         []),
@@ -532,7 +564,9 @@ def phase_qt_deps(target):
                            "-DFEATURE_pixeltool=OFF", "-DFEATURE_qdoc=OFF"]),
         ("qtwayland",     []),
         ("qtmultimedia",  []),
-        ("qt5compat",     []),
+        ("qt5compat",        []),
+        ("qtspeech",         ["-DQT_FEATURE_speechd=OFF", "-DQT_FEATURE_flite=OFF"]),
+        ("qtpositioning",    ["-DFEATURE_gypsy=OFF", "-DFEATURE_geoclue2=OFF"]),
     ]
     for name, extra in modules:
         fname   = f"{name}-everywhere-src-{QT6_VER}.tar.xz"
@@ -552,6 +586,17 @@ def phase_qt_deps(target):
             env=env,
             build_dir=os.path.join(BUILD_TMP, f"qt6-{name}-build"))
         log(f"Qt6/{name} done.", color=GREEN)
+
+    # KF6 tools embed RUNPATH pointing to the arch-specific lib dir (e.g.
+    # lib/x86_64-linux-gnu) but Qt is installed to lib/ directly.  Symlink
+    # all Qt shared libs into the arch dir so dynamic linker finds them.
+    arch_libdir = f"{prefix}/lib/x86_64-linux-gnu"
+    ensure(arch_libdir)
+    for sopath in glob.glob(f"{prefix}/lib/libQt6*.so*"):
+        dest = os.path.join(arch_libdir, os.path.basename(sopath))
+        if not os.path.lexists(dest):
+            os.symlink(sopath, dest)
+    log("Qt6 arch-dir symlinks created.", color=GREEN)
 
 CMAKE_BOOTSTRAP_VER = "3.31.6"
 CMAKE_BOOTSTRAP_URL = f"https://github.com/Kitware/CMake/releases/download/v{CMAKE_BOOTSTRAP_VER}/cmake-{CMAKE_BOOTSTRAP_VER}-linux-x86_64.tar.gz"
@@ -600,44 +645,524 @@ def phase_mesa(target):
         build_dir=os.path.join(BUILD_TMP, "mesa-build"))
     log(f"Mesa {MESA_VER} installed.", color=GREEN)
 
-def _kde_pkg(name, version, base_url, target, env):
+def _patch_kwin_vulkan(bd):
+    """Patch kwin Vulkan files for GCC 14 C++23: ResultValue<T> structured bindings not supported.
+    Also patches std::erase_if + std::ranges::any_of which fails due to std::ref wrapping in GCC 14.
+    VULKAN_HPP_NO_EXCEPTIONS without VULKAN_HPP_EXPECTED → ResultValue<T> with .result/.value fields.
+    """
+    patches = {
+        "src/core/renderdevice.cpp": [
+            # erase_if + ranges::any_of: GCC 14 std::ref wrapping rejects implicit conversions
+            (
+                'std::erase_if(missingExtensions, [&extensionProps](std::string_view required) {\n            return std::ranges::any_of(extensionProps, [required](const auto &ext) {\n                return required == ext.extensionName;\n            });\n        });',
+                'missingExtensions.erase(\n            std::remove_if(missingExtensions.begin(), missingExtensions.end(),\n                [&extensionProps](const char *required) {\n                    const std::string_view sv{required};\n                    for (const auto &ext : extensionProps) {\n                        if (sv == std::string_view{ext.extensionName.data()}) return true;\n                    }\n                    return false;\n                }),\n            missingExtensions.end());',
+            ),
+            # createInstance: structured binding → ResultValue .result/.value
+            (
+                'auto [result, instance] = context.createInstance(instanceInfo);\n    if (result != vk::Result::eSuccess && !validationLayers.empty()) {\n        // try again without the validation layer\n        validationLayers.clear();\n        instanceInfo.setPEnabledLayerNames(validationLayers);\n        auto [result, instance] = context.createInstance(instanceInfo);\n        if (result == vk::Result::eSuccess) {\n            qCWarning(KWIN_CORE, "Vulkan validation layer is not installed");\n            return std::move(instance);\n        }\n    }\n    return std::move(instance);',
+                'auto instanceRV = context.createInstance(instanceInfo);\n    if (instanceRV.result != vk::Result::eSuccess && !validationLayers.empty()) {\n        validationLayers.clear();\n        instanceInfo.setPEnabledLayerNames(validationLayers);\n        auto instanceRV2 = context.createInstance(instanceInfo);\n        if (instanceRV2.result == vk::Result::eSuccess) {\n            qCWarning(KWIN_CORE, "Vulkan validation layer is not installed");\n            return std::move(instanceRV2.value);\n        }\n    }\n    if (instanceRV.result != vk::Result::eSuccess) return vk::raii::Instance{VK_NULL_HANDLE};\n    return std::move(instanceRV.value);',
+            ),
+            # enumeratePhysicalDevices structured binding
+            (
+                'const auto [enumerateResult, physicalDevices] = instance.enumeratePhysicalDevices();\n    if (enumerateResult != vk::Result::eSuccess) {\n        qCWarning(KWIN_VULKAN) << "querying vulkan devices failed:" << vk::to_string(enumerateResult);\n        return nullptr;\n    }',
+                'auto enumerateRV = instance.enumeratePhysicalDevices();\n    if (enumerateRV.result != vk::Result::eSuccess) {\n        qCWarning(KWIN_VULKAN) << "querying vulkan devices failed:" << vk::to_string(enumerateRV.result);\n        return nullptr;\n    }\n    auto physicalDevices = std::move(enumerateRV.value);',
+            ),
+            # enumerateDeviceExtensionProperties structured binding
+            (
+                'const auto [extensionPropResult, extensionProps] = physicalDevice.enumerateDeviceExtensionProperties();\n        if (extensionPropResult != vk::Result::eSuccess) {\n            continue;\n        }',
+                'auto extensionPropsRV = physicalDevice.enumerateDeviceExtensionProperties();\n        if (extensionPropsRV.result != vk::Result::eSuccess) {\n            continue;\n        }\n        const auto &extensionProps = extensionPropsRV.value;',
+            ),
+            # createDevice structured binding
+            (
+                'auto [result, logicalDevice] = physicalDevice.createDevice(deviceInfo);\n        if (result != vk::Result::eSuccess) {\n            qCWarning(KWIN_VULKAN, "vkCreateDevice for %s failed: %s", deviceName, vk::to_string(vk::Result(result)).c_str());\n            continue;\n        }\n\n        auto ret = std::make_unique<VulkanDevice>(\n            physicalDevice,\n            std::move(logicalDevice),',
+                'auto createDeviceRV = physicalDevice.createDevice(deviceInfo);\n        if (createDeviceRV.result != vk::Result::eSuccess) {\n            qCWarning(KWIN_VULKAN, "vkCreateDevice for %s failed: %s", deviceName, vk::to_string(createDeviceRV.result).c_str());\n            continue;\n        }\n\n        auto ret = std::make_unique<VulkanDevice>(\n            physicalDevice,\n            std::move(createDeviceRV.value),',
+            ),
+        ],
+        "src/vulkan/vulkan_device.cpp": [
+            # createCommandPool
+            (
+                'auto [result, cmdPool] = m_logical.createCommandPool(vk::CommandPoolCreateInfo{\n        vk::CommandPoolCreateFlagBits::eResetCommandBuffer,\n        m_queueFamilyIndex,\n    });\n    if (result != vk::Result::eSuccess) {\n        qCCritical(KWIN_VULKAN) << "creating a command pool failed:" << vk::to_string(result);\n        return;\n    }\n    m_commandPool = std::move(cmdPool);',
+                'auto cmdPoolRV = m_logical.createCommandPool(vk::CommandPoolCreateInfo{\n        vk::CommandPoolCreateFlagBits::eResetCommandBuffer,\n        m_queueFamilyIndex,\n    });\n    if (cmdPoolRV.result != vk::Result::eSuccess) {\n        qCCritical(KWIN_VULKAN) << "creating a command pool failed:" << vk::to_string(cmdPoolRV.result);\n        return;\n    }\n    m_commandPool = std::move(cmdPoolRV.value);',
+            ),
+            # createImage (importDmabuf)
+            (
+                'auto [imageResult, image] = m_logical.createImage(imageInfo);\n    if (imageResult != vk::Result::eSuccess) {\n        qCWarning(KWIN_VULKAN) << "creating vulkan image failed!" << vk::to_string(imageResult);\n        return nullptr;\n    }',
+                'auto imageRV = m_logical.createImage(imageInfo);\n    if (imageRV.result != vk::Result::eSuccess) {\n        qCWarning(KWIN_VULKAN) << "creating vulkan image failed!" << vk::to_string(imageRV.result);\n        return nullptr;\n    }\n    auto image = std::move(imageRV.value);',
+            ),
+            # getMemoryFdPropertiesKHR
+            (
+                'const auto [memoryFdResult, memoryFdProperties] = m_logical.getMemoryFdPropertiesKHR(vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT, duplicatedFds[i].get());\n        if (memoryFdResult != vk::Result::eSuccess) {\n            qCWarning(KWIN_VULKAN) << "failed to get memory fd properties!" << vk::to_string(memoryFdResult);\n            return nullptr;\n        }',
+                'auto memFdRV = m_logical.getMemoryFdPropertiesKHR(vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT, duplicatedFds[i].get());\n        if (memFdRV.result != vk::Result::eSuccess) {\n            qCWarning(KWIN_VULKAN) << "failed to get memory fd properties!" << vk::to_string(memFdRV.result);\n            return nullptr;\n        }\n        const auto &memoryFdProperties = memFdRV.value;',
+            ),
+            # allocateMemory (dmabuf)
+            (
+                'auto [allocateResult, memory] = m_logical.allocateMemory(memoryInfo);\n        if (allocateResult != vk::Result::eSuccess) {\n            qCWarning(KWIN_VULKAN, "\'Allocating\' memory for dmabuf failed: %s", vk::to_string(allocateResult).c_str());\n            return nullptr;\n        }\n\n        bindInfos[i] = vk::BindImageMemoryInfo{image, memory, 0};',
+                'auto allocRV = m_logical.allocateMemory(memoryInfo);\n        if (allocRV.result != vk::Result::eSuccess) {\n            qCWarning(KWIN_VULKAN, "\'Allocating\' memory for dmabuf failed: %s", vk::to_string(allocRV.result).c_str());\n            return nullptr;\n        }\n        auto memory = std::move(allocRV.value);\n\n        bindInfos[i] = vk::BindImageMemoryInfo{image, memory, 0};',
+            ),
+            # allocateCommandBuffers
+            (
+                'auto [result, buffers] = m_logical.allocateCommandBuffers(vk::CommandBufferAllocateInfo{\n        m_commandPool,\n        vk::CommandBufferLevel::ePrimary,\n        1,\n    });\n    if (result != vk::Result::eSuccess) {\n        qCWarning(KWIN_VULKAN) << "Failed to create a command buffer" << vk::to_string(result);\n        return nullptr;\n    }\n    return std::move(buffers.front());',
+                'auto allocCmdRV = m_logical.allocateCommandBuffers(vk::CommandBufferAllocateInfo{\n        m_commandPool,\n        vk::CommandBufferLevel::ePrimary,\n        1,\n    });\n    if (allocCmdRV.result != vk::Result::eSuccess) {\n        qCWarning(KWIN_VULKAN) << "Failed to create a command buffer" << vk::to_string(allocCmdRV.result);\n        return nullptr;\n    }\n    return std::move(allocCmdRV.value.front());',
+            ),
+            # createSemaphore + importSemaphoreFdKHR (result reused after binding)
+            (
+                'vk::SemaphoreCreateInfo semaphoreInfo{};\n    auto [result, semaphore] = m_logical.createSemaphore(semaphoreInfo);\n    if (result != vk::Result::eSuccess) {\n        return std::nullopt;\n    }\n    vk::ImportSemaphoreFdInfoKHR importInfo{\n        semaphore,\n        vk::SemaphoreImportFlagBits::eTemporary,\n        vk::ExternalSemaphoreHandleTypeFlagBits::eSyncFd,\n        syncFd.get(),\n    };\n    result = m_logical.importSemaphoreFdKHR(importInfo);\n    if (result != vk::Result::eSuccess) {\n        return std::nullopt;\n    }',
+                'vk::SemaphoreCreateInfo semaphoreInfo{};\n    auto semRV = m_logical.createSemaphore(semaphoreInfo);\n    if (semRV.result != vk::Result::eSuccess) {\n        return std::nullopt;\n    }\n    auto semaphore = std::move(semRV.value);\n    vk::ImportSemaphoreFdInfoKHR importInfo{\n        semaphore,\n        vk::SemaphoreImportFlagBits::eTemporary,\n        vk::ExternalSemaphoreHandleTypeFlagBits::eSyncFd,\n        syncFd.get(),\n    };\n    vk::Result importResult = m_logical.importSemaphoreFdKHR(importInfo);\n    if (importResult != vk::Result::eSuccess) {\n        return std::nullopt;\n    }',
+            ),
+            # createFence
+            (
+                'auto [fenceResult, fence] = m_logical.createFence(vk::FenceCreateInfo{\n        vk::FenceCreateFlags{},\n        &exportInfo,\n    });\n    if (fenceResult != vk::Result::eSuccess) {\n        return std::nullopt;\n    }',
+                'auto fenceRV = m_logical.createFence(vk::FenceCreateInfo{\n        vk::FenceCreateFlags{},\n        &exportInfo,\n    });\n    if (fenceRV.result != vk::Result::eSuccess) {\n        return std::nullopt;\n    }\n    auto fence = std::move(fenceRV.value);',
+            ),
+            # getFenceFdKHR
+            (
+                'const auto [fdResult, fd] = m_logical.getFenceFdKHR(vk::FenceGetFdInfoKHR{\n        fence,\n        vk::ExternalFenceHandleTypeFlagBits::eSyncFd,\n    });\n    if (fdResult != vk::Result::eSuccess) {\n        return std::nullopt;\n    }\n    FileDescriptor ret{fd};',
+                'auto fdRV = m_logical.getFenceFdKHR(vk::FenceGetFdInfoKHR{\n        fence,\n        vk::ExternalFenceHandleTypeFlagBits::eSyncFd,\n    });\n    if (fdRV.result != vk::Result::eSuccess) {\n        return std::nullopt;\n    }\n    FileDescriptor ret{fdRV.value};',
+            ),
+            # allocateMemory image overload
+            (
+                '    if (const auto typeIndex = findMemoryType(requirements.memoryRequirements.memoryTypeBits, memoryProperties)) {\n        auto [result, ret] = m_logical.allocateMemory(vk::MemoryAllocateInfo{\n            requirements.memoryRequirements.size,\n            *typeIndex,\n        });\n        if (result == vk::Result::eSuccess) {\n            return std::move(ret);\n        } else {\n            qCWarning(KWIN_VULKAN) << "Allocating memory for an image failed:" << vk::to_string(result);\n            return nullptr;\n        }\n    } else {\n        qCWarning(KWIN_VULKAN) << "could not find a suitable memory index for an image";\n        return nullptr;\n    }\n}\n\nvk::raii::DeviceMemory VulkanDevice::allocateMemory(const vk::BufferCreateInfo &bufferInfo, vk::MemoryPropertyFlags memoryProperties)\n{\n    const auto requirements = m_logical.getBufferMemoryRequirements(vk::DeviceBufferMemoryRequirements{\n        &bufferInfo,\n    });\n    if (const auto typeIndex = findMemoryType(requirements.memoryRequirements.memoryTypeBits, memoryProperties)) {\n        auto [result, ret] = m_logical.allocateMemory(vk::MemoryAllocateInfo{\n            requirements.memoryRequirements.size,\n            *typeIndex,\n        });\n        if (result == vk::Result::eSuccess) {\n            return std::move(ret);\n        } else {\n            qCWarning(KWIN_VULKAN) << "Allocating memory for a buffer failed:" << vk::to_string(result);\n            return nullptr;\n        }\n    } else {\n        qCWarning(KWIN_VULKAN) << "could not find a suitable memory index for a buffer";\n        return nullptr;\n    }\n}',
+                '    if (const auto typeIndex = findMemoryType(requirements.memoryRequirements.memoryTypeBits, memoryProperties)) {\n        auto allocRV = m_logical.allocateMemory(vk::MemoryAllocateInfo{\n            requirements.memoryRequirements.size,\n            *typeIndex,\n        });\n        if (allocRV.result == vk::Result::eSuccess) {\n            return std::move(allocRV.value);\n        } else {\n            qCWarning(KWIN_VULKAN) << "Allocating memory for an image failed:" << vk::to_string(allocRV.result);\n            return nullptr;\n        }\n    } else {\n        qCWarning(KWIN_VULKAN) << "could not find a suitable memory index for an image";\n        return nullptr;\n    }\n}\n\nvk::raii::DeviceMemory VulkanDevice::allocateMemory(const vk::BufferCreateInfo &bufferInfo, vk::MemoryPropertyFlags memoryProperties)\n{\n    const auto requirements = m_logical.getBufferMemoryRequirements(vk::DeviceBufferMemoryRequirements{\n        &bufferInfo,\n    });\n    if (const auto typeIndex = findMemoryType(requirements.memoryRequirements.memoryTypeBits, memoryProperties)) {\n        auto allocRV = m_logical.allocateMemory(vk::MemoryAllocateInfo{\n            requirements.memoryRequirements.size,\n            *typeIndex,\n        });\n        if (allocRV.result == vk::Result::eSuccess) {\n            return std::move(allocRV.value);\n        } else {\n            qCWarning(KWIN_VULKAN) << "Allocating memory for a buffer failed:" << vk::to_string(allocRV.result);\n            return nullptr;\n        }\n    } else {\n        qCWarning(KWIN_VULKAN) << "could not find a suitable memory index for a buffer";\n        return nullptr;\n    }\n}',
+            ),
+        ],
+        "src/vulkan/vulkan_texture.cpp": [
+            # createBuffer (download)
+            (
+                'auto [bufResult, stagingBuffer] = m_device->logicalDevice().createBuffer(bufferInfo);\n    if (bufResult != vk::Result::eSuccess) {\n        return {};\n    }\n    stagingBuffer.bindMemory(stagingMemory, 0);\n\n    auto commandBuffer = m_device->createCommandBuffer();\n    commandBuffer.begin(vk::CommandBufferBeginInfo{vk::CommandBufferUsageFlagBits::eOneTimeSubmit});\n    vk::BufferImageCopy2 copyRegion{',
+                'auto stagingBufRV = m_device->logicalDevice().createBuffer(bufferInfo);\n    if (stagingBufRV.result != vk::Result::eSuccess) {\n        return {};\n    }\n    auto stagingBuffer = std::move(stagingBufRV.value);\n    stagingBuffer.bindMemory(stagingMemory, 0);\n\n    auto commandBuffer = m_device->createCommandBuffer();\n    commandBuffer.begin(vk::CommandBufferBeginInfo{vk::CommandBufferUsageFlagBits::eOneTimeSubmit});\n    vk::BufferImageCopy2 copyRegion{',
+            ),
+            # mapMemory (download)
+            (
+                '// use mapMemory/unmapMemory (Vulkan 1.0) instead of mapMemory2/unmapMemory2 (Vulkan 1.4)\n    // for compatibility with lavapipe and other drivers that don\'t support 1.4\n    auto [mapResult, dataPtr] = stagingMemory.mapMemory(0, bufferSize);\n    if (mapResult != vk::Result::eSuccess) {\n        return {};\n    }\n\n    std::memcpy(result.bits(), dataPtr, bufferSize);',
+                '// use mapMemory/unmapMemory (Vulkan 1.0) instead of mapMemory2/unmapMemory2 (Vulkan 1.4)\n    // for compatibility with lavapipe and other drivers that don\'t support 1.4\n    auto mapRV = stagingMemory.mapMemory(0, bufferSize);\n    if (mapRV.result != vk::Result::eSuccess) {\n        return {};\n    }\n    void *dataPtr = mapRV.value;\n\n    std::memcpy(result.bits(), dataPtr, bufferSize);',
+            ),
+            # createBuffer + mapMemory (update)
+            (
+                'auto [result, stagingBuffer] = m_device->logicalDevice().createBuffer(bufferInfo);\n    if (result != vk::Result::eSuccess) {\n        return false;\n    }\n    stagingBuffer.bindMemory(stagingMemory, 0);\n    auto [mapResult, dataPtr] = stagingMemory.mapMemory(0, vk::DeviceSize(img.sizeInBytes()));\n    if (mapResult != vk::Result::eSuccess) {\n        return false;\n    }',
+                'auto updateBufRV = m_device->logicalDevice().createBuffer(bufferInfo);\n    if (updateBufRV.result != vk::Result::eSuccess) {\n        return false;\n    }\n    auto stagingBuffer = std::move(updateBufRV.value);\n    stagingBuffer.bindMemory(stagingMemory, 0);\n    auto updateMapRV = stagingMemory.mapMemory(0, vk::DeviceSize(img.sizeInBytes()));\n    if (updateMapRV.result != vk::Result::eSuccess) {\n        return false;\n    }\n    void *dataPtr = updateMapRV.value;',
+            ),
+            # createImage (allocate)
+            (
+                'auto [result, image] = device->logicalDevice().createImage(info);\n    if (result != vk::Result::eSuccess) {\n        qCWarning(KWIN_VULKAN) << "creating image failed!" << vk::to_string(result);\n        return nullptr;\n    }\n    image.bindMemory(memory, 0);',
+                'auto imageRV = device->logicalDevice().createImage(info);\n    if (imageRV.result != vk::Result::eSuccess) {\n        qCWarning(KWIN_VULKAN) << "creating image failed!" << vk::to_string(imageRV.result);\n        return nullptr;\n    }\n    auto image = std::move(imageRV.value);\n    image.bindMemory(memory, 0);',
+            ),
+        ],
+        "src/vulkan/vulkan_render_time_query.cpp": [
+            # getResults structured binding
+            (
+                'auto [result, timestamps] = m_pool.getResults<uint64_t>(0, 2, 2 * sizeof(uint64_t), sizeof(uint64_t), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);\n        if (result != vk::Result::eSuccess) {\n            reset();\n            return std::nullopt;\n        }',
+                'auto tsRV = m_pool.getResults<uint64_t>(0, 2, 2 * sizeof(uint64_t), sizeof(uint64_t), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);\n        if (tsRV.result != vk::Result::eSuccess) {\n            reset();\n            return std::nullopt;\n        }\n        const auto &timestamps = tsRV.value;',
+            ),
+            # createQueryPool
+            (
+                'auto [result, query] = device->logicalDevice().createQueryPool(vk::QueryPoolCreateInfo{\n        vk::QueryPoolCreateFlags{},\n        vk::QueryType::eTimestamp,\n        2,\n    });\n    if (result != vk::Result::eSuccess) {\n        return nullptr;\n    }\n    buffer.resetQueryPool(query, 0, 2);\n    buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, query, 0);\n    return std::make_unique<VulkanRenderTimeQuery>(device, std::move(query));',
+                'auto queryRV = device->logicalDevice().createQueryPool(vk::QueryPoolCreateInfo{\n        vk::QueryPoolCreateFlags{},\n        vk::QueryType::eTimestamp,\n        2,\n    });\n    if (queryRV.result != vk::Result::eSuccess) {\n        return nullptr;\n    }\n    auto query = std::move(queryRV.value);\n    buffer.resetQueryPool(query, 0, 2);\n    buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, query, 0);\n    return std::make_unique<VulkanRenderTimeQuery>(device, std::move(query));',
+            ),
+        ],
+        # PipeWire 1.2+ SyncTimeline API not in PipeWire 1.0.5
+        "src/plugins/screencast/screencastbuffer.cpp": [
+            (
+                '    const void *syncTimelineMeta = spa_buffer_find_meta_data(pwBuffer->buffer, SPA_META_SyncTimeline, sizeof(spa_meta_sync_timeline));',
+                '#if PW_CHECK_VERSION(1,2,0)\n    const void *syncTimelineMeta = spa_buffer_find_meta_data(pwBuffer->buffer, SPA_META_SyncTimeline, sizeof(spa_meta_sync_timeline));\n#else\n    const void *syncTimelineMeta = nullptr;\n#endif',
+            ),
+            (
+                '    std::unique_ptr<SyncTimeline> synctimeline;\n    if (syncTimelineMeta) {\n        synctimeline = std::make_unique<SyncTimeline>(backend->drmDevice()->fileDescriptor());\n        const FileDescriptor &syncobjfd = synctimeline->fileDescriptor();\n        if (!syncobjfd.isValid()) {\n            buffer->drop();\n            return nullptr;\n        }\n\n        // Signal the first timeline point, so the very first recording can proceed.\n        synctimeline->signal(0);\n\n        spa_data &acquireData = spaData[attrs->planeCount];\n        acquireData.type = SPA_DATA_SyncObj;\n        acquireData.flags = SPA_DATA_FLAG_READABLE;\n        acquireData.fd = syncobjfd.get();\n\n        spa_data &releaseData = spaData[attrs->planeCount + 1];\n        releaseData.type = SPA_DATA_SyncObj;\n        releaseData.flags = SPA_DATA_FLAG_READABLE;\n        releaseData.fd = syncobjfd.get();\n    }',
+                '    std::unique_ptr<SyncTimeline> synctimeline;\n#if PW_CHECK_VERSION(1,2,0)\n    if (syncTimelineMeta) {\n        synctimeline = std::make_unique<SyncTimeline>(backend->drmDevice()->fileDescriptor());\n        const FileDescriptor &syncobjfd = synctimeline->fileDescriptor();\n        if (!syncobjfd.isValid()) {\n            buffer->drop();\n            return nullptr;\n        }\n\n        // Signal the first timeline point, so the very first recording can proceed.\n        synctimeline->signal(0);\n\n        spa_data &acquireData = spaData[attrs->planeCount];\n        acquireData.type = SPA_DATA_SyncObj;\n        acquireData.flags = SPA_DATA_FLAG_READABLE;\n        acquireData.fd = syncobjfd.get();\n\n        spa_data &releaseData = spaData[attrs->planeCount + 1];\n        releaseData.type = SPA_DATA_SyncObj;\n        releaseData.flags = SPA_DATA_FLAG_READABLE;\n        releaseData.fd = syncobjfd.get();\n    }\n#endif',
+            ),
+        ],
+        "src/plugins/screencast/screencaststream.cpp": [
+            # Buffer params explicit sync block
+            (
+                '    // Buffer parameters for explicit sync. It requires two extra blocks to hold acquire and\n    // release syncobjs.\n    if (m_dmabufParams && m_dmabufParams->supportsSyncObj) {\n        spa_pod_builder_push_object(&pod_builder.b, &f, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers);\n        spa_pod_builder_add(&pod_builder.b,\n                            SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(3, 2, 4),\n                            SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(buffertypes),\n                            SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(m_dmabufParams->planeCount + 2), 0);\n        spa_pod_builder_prop(&pod_builder.b, SPA_PARAM_BUFFERS_metaType, SPA_POD_PROP_FLAG_MANDATORY);\n        spa_pod_builder_int(&pod_builder.b, 1 << SPA_META_SyncTimeline);\n        params.append((spa_pod *)spa_pod_builder_pop(&pod_builder.b, &f));\n    }',
+                '    // Buffer parameters for explicit sync. It requires two extra blocks to hold acquire and\n    // release syncobjs.\n#if PW_CHECK_VERSION(1,2,0)\n    if (m_dmabufParams && m_dmabufParams->supportsSyncObj) {\n        spa_pod_builder_push_object(&pod_builder.b, &f, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers);\n        spa_pod_builder_add(&pod_builder.b,\n                            SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(3, 2, 4),\n                            SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(buffertypes),\n                            SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(m_dmabufParams->planeCount + 2), 0);\n        spa_pod_builder_prop(&pod_builder.b, SPA_PARAM_BUFFERS_metaType, SPA_POD_PROP_FLAG_MANDATORY);\n        spa_pod_builder_int(&pod_builder.b, 1 << SPA_META_SyncTimeline);\n        params.append((spa_pod *)spa_pod_builder_pop(&pod_builder.b, &f));\n    }\n#endif',
+            ),
+            # Meta params SyncTimeline block
+            (
+                '    if (m_dmabufParams && m_dmabufParams->supportsSyncObj) {\n        params.append(\n            (spa_pod *)spa_pod_builder_add_object(&pod_builder.b,\n                                                  SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,\n                                                  SPA_PARAM_META_type, SPA_POD_Id(SPA_META_SyncTimeline),\n                                                  SPA_PARAM_META_size, SPA_POD_Int(sizeof(struct spa_meta_sync_timeline))));\n    }',
+                '#if PW_CHECK_VERSION(1,2,0)\n    if (m_dmabufParams && m_dmabufParams->supportsSyncObj) {\n        params.append(\n            (spa_pod *)spa_pod_builder_add_object(&pod_builder.b,\n                                                  SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,\n                                                  SPA_PARAM_META_type, SPA_POD_Id(SPA_META_SyncTimeline),\n                                                  SPA_PARAM_META_size, SPA_POD_Int(sizeof(struct spa_meta_sync_timeline))));\n    }\n#endif',
+            ),
+            # dequeueBuffer synctimeline block
+            (
+                '        auto dmabuf = static_cast<DmaBufScreenCastBuffer *>(pwBuffer->user_data);\n        if (dmabuf && dmabuf->synctimeline) {\n            spa_meta_sync_timeline *synctmeta =\n                static_cast<spa_meta_sync_timeline *>(spa_buffer_find_meta_data(spaBuffer,\n                                                                                SPA_META_SyncTimeline,\n                                                                                sizeof(spa_meta_sync_timeline)));\n            return dmabuf->synctimeline->isMaterialized(synctmeta->release_point);\n        }',
+                '#if PW_CHECK_VERSION(1,2,0)\n        auto dmabuf = static_cast<DmaBufScreenCastBuffer *>(pwBuffer->user_data);\n        if (dmabuf && dmabuf->synctimeline) {\n            spa_meta_sync_timeline *synctmeta =\n                static_cast<spa_meta_sync_timeline *>(spa_buffer_find_meta_data(spaBuffer,\n                                                                                SPA_META_SyncTimeline,\n                                                                                sizeof(spa_meta_sync_timeline)));\n            return dmabuf->synctimeline->isMaterialized(synctmeta->release_point);\n        }\n#endif',
+            ),
+            # render path: synctmeta declaration + dmabuf synctimeline block
+            (
+                '    spa_meta_sync_timeline *synctmeta = nullptr;\n\n    Region damage;\n    if (effectiveContents & Content::Video) {\n        if (auto memfd = dynamic_cast<MemFdScreenCastBuffer *>(buffer)) {\n            damage = m_source->render(memfd->view.image(), m_damageJournal.accumulate(memfd->m_age, Region::infinite()));\n            bumpBufferAge(memfd);\n        } else if (auto dmabuf = dynamic_cast<DmaBufScreenCastBuffer *>(buffer)) {\n            if (dmabuf->synctimeline) {\n                synctmeta = static_cast<spa_meta_sync_timeline *>(spa_buffer_find_meta_data(spa_buffer,\n                                                                                            SPA_META_SyncTimeline,\n                                                                                            sizeof(spa_meta_sync_timeline)));\n                FileDescriptor syncFileFd = dmabuf->synctimeline->exportSyncFile(synctmeta->release_point);\n                EGLNativeFence fence = EGLNativeFence::importFence(backend->eglDisplayObject(), std::move(syncFileFd));\n                if (fence.waitSync() != EGL_TRUE) {\n                    qCWarning(KWIN_SCREENCAST) << objectName() << "Failed to wait on a fence, recording may be corrupted";\n                }\n            }',
+                '#if PW_CHECK_VERSION(1,2,0)\n    spa_meta_sync_timeline *synctmeta = nullptr;\n#endif\n\n    Region damage;\n    if (effectiveContents & Content::Video) {\n        if (auto memfd = dynamic_cast<MemFdScreenCastBuffer *>(buffer)) {\n            damage = m_source->render(memfd->view.image(), m_damageJournal.accumulate(memfd->m_age, Region::infinite()));\n            bumpBufferAge(memfd);\n        } else if (auto dmabuf = dynamic_cast<DmaBufScreenCastBuffer *>(buffer)) {\n#if PW_CHECK_VERSION(1,2,0)\n            if (dmabuf->synctimeline) {\n                synctmeta = static_cast<spa_meta_sync_timeline *>(spa_buffer_find_meta_data(spa_buffer,\n                                                                                            SPA_META_SyncTimeline,\n                                                                                            sizeof(spa_meta_sync_timeline)));\n                FileDescriptor syncFileFd = dmabuf->synctimeline->exportSyncFile(synctmeta->release_point);\n                EGLNativeFence fence = EGLNativeFence::importFence(backend->eglDisplayObject(), std::move(syncFileFd));\n                if (fence.waitSync() != EGL_TRUE) {\n                    qCWarning(KWIN_SCREENCAST) << objectName() << "Failed to wait on a fence, recording may be corrupted";\n                }\n            }\n#endif',
+            ),
+            # DmaBuf sync path if(synctmeta) block
+            (
+                '    if (spa_data[0].type == SPA_DATA_DmaBuf) {\n        if (synctmeta) {\n            EGLNativeFence fence(backend->eglDisplayObject());\n\n            synctmeta->acquire_point = synctmeta->release_point + 1;\n            synctmeta->release_point = synctmeta->acquire_point + 1;\n\n            auto dmabuf = static_cast<DmaBufScreenCastBuffer *>(buffer);\n            dmabuf->synctimeline->moveInto(synctmeta->acquire_point, fence.takeFileDescriptor());\n        } else {\n            // Implicit sync is broken on Nvidia and with llvmpipe\n            if (context->glPlatform()->isNvidia() || context->isSoftwareRenderer()) {\n                glFinish();\n            } else {\n                glFlush();\n            }\n        }\n    }',
+                '    if (spa_data[0].type == SPA_DATA_DmaBuf) {\n#if PW_CHECK_VERSION(1,2,0)\n        if (synctmeta) {\n            EGLNativeFence fence(backend->eglDisplayObject());\n\n            synctmeta->acquire_point = synctmeta->release_point + 1;\n            synctmeta->release_point = synctmeta->acquire_point + 1;\n\n            auto dmabuf = static_cast<DmaBufScreenCastBuffer *>(buffer);\n            dmabuf->synctimeline->moveInto(synctmeta->acquire_point, fence.takeFileDescriptor());\n        } else {\n#endif\n            // Implicit sync is broken on Nvidia and with llvmpipe\n            if (context->glPlatform()->isNvidia() || context->isSoftwareRenderer()) {\n                glFinish();\n            } else {\n                glFlush();\n            }\n#if PW_CHECK_VERSION(1,2,0)\n        }\n#endif\n    }',
+            ),
+        ],
+    }
+    # Fix PipeWire 1.0.5 system header: spa/pod/dynamic.h mixes positional and designated
+    # initializers which is illegal in C++23 (GCC 14 -std=gnu++23 rejects it)
+    _fix_spa_dynamic_header()
+    # Fix systemd _sd-common.h: __STDC_VERSION__ used without defined() guard,
+    # rejected by GCC 14 -Werror=undef when included from C++ code
+    _fix_sd_common_header()
+    for rel_path, subs in patches.items():
+        fpath = os.path.join(bd, rel_path)
+        if not os.path.exists(fpath):
+            continue
+        with open(fpath) as f:
+            txt = f.read()
+        for old, new in subs:
+            if old in txt:
+                txt = txt.replace(old, new)
+        with open(fpath, "w") as f:
+            f.write(txt)
+
+def _fix_sd_common_header():
+    """Fix systemd _sd-common.h: __STDC_VERSION__ used without defined() guard,
+    rejected by GCC 14 -Werror=undef when included from C++ translation units."""
+    hdr = "/mnt/smechos_build_root/usr/include/systemd/_sd-common.h"
+    if not os.path.exists(hdr):
+        return
+    with open(hdr) as f:
+        txt = f.read()
+    old = "#  if __STDC_VERSION__ >= 199901L && !defined(__cplusplus)"
+    new = "#  if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 199901L && !defined(__cplusplus)"
+    if old in txt:
+        with open(hdr, "w") as f:
+            f.write(txt.replace(old, new))
+
+def _fix_spa_dynamic_header():
+    """Fix PipeWire 1.0.5 spa/pod/dynamic.h: mixed positional/designated initializer
+    rejected by GCC 14 with -std=gnu++23. Idempotent (only patches if not already patched)."""
+    hdr = "/usr/include/spa-0.2/spa/pod/dynamic.h"
+    if not os.path.exists(hdr):
+        return
+    with open(hdr) as f:
+        txt = f.read()
+    old = '\t\tSPA_VERSION_POD_BUILDER_CALLBACKS,\n\t\t.overflow = spa_pod_dynamic_builder_overflow'
+    new = '\t\t.version = SPA_VERSION_POD_BUILDER_CALLBACKS,\n\t\t.overflow = spa_pod_dynamic_builder_overflow'
+    if old in txt:
+        with open(hdr, "w") as f:
+            f.write(txt.replace(old, new))
+
+def _patch_syntax_highlighting(bd):
+    """Fix fish.xml: variable-length lookbehind rejected by PCRE2 at index validation time."""
+    fpath = os.path.join(bd, "data/syntax/fish.xml")
+    if not os.path.exists(fpath):
+        return
+    with open(fpath) as f:
+        txt = f.read()
+    old = '        <RegExpr String="(?&lt;=^|/[\'&quot;]?)&amp;simple_command;&amp;is_end_of_simple_cmd;" lookAhead="1" context="CommandPartCommand"/>'
+    new = '        <RegExpr String="&amp;simple_command;&amp;is_end_of_simple_cmd;" lookAhead="1" context="CommandPartCommand"/>'
+    if old in txt:
+        with open(fpath, "w") as f:
+            f.write(txt.replace(old, new))
+
+def _patch_plasma_workspace(bd):
+    """Patch plasma-workspace CMakeLists.txt: Qt6Location/Positioning not built, make optional."""
+    cmake = os.path.join(bd, "CMakeLists.txt")
+    if not os.path.exists(cmake):
+        return
+    with open(cmake) as f:
+        txt = f.read()
+    old = 'find_package(Qt6 ${QT_MIN_VERSION} CONFIG REQUIRED COMPONENTS\n                    Concurrent DBus Location Network Positioning Quick QuickWidgets\n                    ShaderTools Sql Svg Widgets)'
+    new = 'find_package(Qt6 ${QT_MIN_VERSION} CONFIG REQUIRED COMPONENTS\n                    Concurrent DBus Network Quick QuickWidgets\n                    ShaderTools Sql Svg Widgets)\nfind_package(Qt6 ${QT_MIN_VERSION} CONFIG OPTIONAL_COMPONENTS Location Positioning)'
+    if old in txt:
+        with open(cmake, "w") as f:
+            f.write(txt.replace(old, new))
+
+def _kde_pkg(name, version, base_url, target, env, profile="smechos-plasma-live"):
+    stamp = f"kde-pkg-{name}"
+    if _phase_done(profile, stamp):
+        log(f"kde/{name} already built — skipping", color=YELLOW)
+        return
     src     = sources(target)
     fname   = f"{name}-{version}.tar.xz"
     tarball = os.path.join(src, fname)
     download(f"{base_url}/{fname}", tarball)
-    bd = os.path.join(BUILD_TMP, f"kde-{name}")
-    shutil.rmtree(bd, ignore_errors=True)
+    bd      = os.path.join(BUILD_TMP, f"kde-{name}")
+    bd_build = os.path.join(BUILD_TMP, f"kde-{name}-build")
+    shutil.rmtree(bd,       ignore_errors=True)
+    shutil.rmtree(bd_build, ignore_errors=True)
     extract(tarball, bd)
+    # GCC 14 + Vulkan-HPP NO_EXCEPTIONS patches: std::expected structured bindings not supported
+    if name == "kwin":
+        _patch_kwin_vulkan(bd)
+    if name == "plasma-workspace":
+        _patch_plasma_workspace(bd)
+    if name == "syntax-highlighting":
+        _patch_syntax_highlighting(bd)
+    # Per-package extra cmake args for packages with optional/missing system deps
+    pkg_extra = {
+        "prison":            ["-DWITH_ZXING=OFF"],
+        "plasma-workspace":  ["-DWITH_X11=OFF"],
+        "breeze":            ["-DBUILD_QT5=OFF"],
+        "plasma-integration":["-DBUILD_QT5=OFF"],      # Qt5 not installed; Qt6-only build
+        "plasma-desktop":    ["-DWITH_KACCOUNTS=OFF",
+                              "-DBUILD_KCMS_JOYSTICK=OFF",
+                              "-DBUILD_KCM_MOUSE_X11=OFF",
+                              "-DBUILD_KCM_TOUCHPAD_X11=OFF",
+                              "-DBUILD_KCM_KEYBOARD_X11=OFF"],
+    }
     cmake_install(bd, f"{target}/usr",
         extra_args=[f"-DCMAKE_PREFIX_PATH={target}/usr",
-                    "-DBUILD_TESTING=OFF", "-DBUILD_QCH=OFF"],
+                    "-DBUILD_TESTING=OFF", "-DBUILD_QCH=OFF",
+                    "-DBUILD_PYTHON_BINDINGS=OFF"] + pkg_extra.get(name, []),
         env=env,
-        build_dir=os.path.join(BUILD_TMP, f"kde-{name}-build"))
+        build_dir=bd_build)
+    _mark_done(profile, stamp)
     log(f"{name} {version} done.", color=GREEN)
+
+def phase_wayland(target):
+    log_phase("wayland", f"Build wayland {WAYLAND_VER}")
+    src     = sources(target)
+    tarball = os.path.join(src, f"wayland-{WAYLAND_VER}.tar.gz")
+    download(WAYLAND_URL, tarball)
+    bd = os.path.join(BUILD_TMP, "wayland")
+    shutil.rmtree(bd, ignore_errors=True)
+    extract(tarball, bd)
+    # gitlab archive nests under wayland-<ver>/
+    inner = os.path.join(bd, f"wayland-{WAYLAND_VER}")
+    srcdir = inner if os.path.isdir(inner) else bd
+    builddir = os.path.join(bd, "build")
+    env = os.environ.copy()
+    env["PKG_CONFIG_PATH"] = "/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig"
+    run(["meson", "setup", builddir, srcdir,
+         f"--prefix={target}/usr",
+         "--buildtype=release",
+         "-Ddocumentation=false",
+         "-Dtests=false"], env=env)
+    run(["ninja", "-C", builddir], env=env)
+    run(["ninja", "-C", builddir, "install"], env=env)
+    result = subprocess.run(["wayland-scanner", "--version"], capture_output=True, text=True)
+    log(f"wayland-scanner: {result.stderr.strip() or result.stdout.strip()}", color=GREEN)
+
+def phase_wayland_protocols(target):
+    log_phase("wayland-protocols", f"Build wayland-protocols {WAYLAND_PROTO_VER}")
+    src     = sources(target)
+    tarball = os.path.join(src, f"wayland-protocols-{WAYLAND_PROTO_VER}.tar.gz")
+    download(WAYLAND_PROTO_URL, tarball)
+    bd = os.path.join(BUILD_TMP, "wayland-protocols")
+    shutil.rmtree(bd, ignore_errors=True)
+    extract(tarball, bd)
+    inner = os.path.join(bd, f"wayland-protocols-{WAYLAND_PROTO_VER}")
+    srcdir = inner if os.path.isdir(inner) else bd
+    builddir = os.path.join(bd, "build")
+    env = active_env(target)
+    extra = f"{target}/usr/lib/x86_64-linux-gnu/pkgconfig:{target}/usr/lib/pkgconfig:{target}/usr/share/pkgconfig"
+    env["PKG_CONFIG_PATH"] = extra + ":" + env.get("PKG_CONFIG_PATH", "")
+    run(["meson", "setup", builddir, srcdir,
+         f"--prefix={target}/usr",
+         "--buildtype=release"], env=env)
+    run(["ninja", "-C", builddir], env=env)
+    run(["ninja", "-C", builddir, "install"], env=env)
+    log(f"wayland-protocols {WAYLAND_PROTO_VER} installed", color=GREEN)
+
+def phase_libinput(target):
+    log_phase("libinput", f"Build libinput {LIBINPUT_VER}")
+    src     = sources(target)
+    tarball = os.path.join(src, f"libinput-{LIBINPUT_VER}.tar.gz")
+    download(LIBINPUT_URL, tarball)
+    bd = os.path.join(BUILD_TMP, "libinput")
+    shutil.rmtree(bd, ignore_errors=True)
+    extract(tarball, bd)
+    inner = os.path.join(bd, f"libinput-{LIBINPUT_VER}")
+    srcdir = inner if os.path.isdir(inner) else bd
+    builddir = os.path.join(bd, "build")
+    env = active_env(target)
+    run(["meson", "setup", builddir, srcdir,
+         f"--prefix={target}/usr",
+         "--buildtype=release",
+         "-Ddocumentation=false",
+         "-Dtests=false",
+         "-Dlibwacom=false",
+         "-Ddebug-gui=false"], env=env)
+    run(["ninja", "-C", builddir], env=env)
+    run(["ninja", "-C", builddir, "install"], env=env)
+    log(f"libinput {LIBINPUT_VER} installed", color=GREEN)
+
+def phase_libeis(target):
+    log_phase("libeis", f"Build libeis {LIBEIS_VER} (remote input emulation for kwin)")
+    src     = sources(target)
+    tarball = os.path.join(src, f"libeis-{LIBEIS_VER}.tar.xz")
+    download(LIBEIS_URL, tarball)
+    bd = os.path.join(BUILD_TMP, "libeis")
+    shutil.rmtree(bd, ignore_errors=True)
+    extract(tarball, bd)
+    inner = os.path.join(bd, f"libeis-{LIBEIS_VER}")
+    srcdir = inner if os.path.isdir(inner) else bd
+    builddir = os.path.join(bd, "build")
+    env = active_env(target)
+    run(["meson", "setup", builddir, srcdir,
+         f"--prefix={target}/usr",
+         "--buildtype=release",
+         "-Dtests=disabled",
+         "-Ddocumentation=disabled"], env=env)
+    run(["ninja", "-C", builddir], env=env)
+    run(["ninja", "-C", builddir, "install"], env=env)
+    log(f"libeis {LIBEIS_VER} installed", color=GREEN)
+    log(f"wayland-protocols {WAYLAND_PROTO_VER} installed to {target}/usr", color=GREEN)
+
+def _symlink_arch_libs(target):
+    """Create top-level lib/ symlinks for all arch-specific shared libs (.so and .so.*).
+    The linker gets -L lib/ but DT_NEEDED entries reference SONAMEs like libKF6Service.so.6
+    which live in lib/x86_64-linux-gnu/. Without these symlinks the linker can't resolve
+    transitive deps and --no-undefined fails."""
+    arch_dir = os.path.join(target, "usr/lib/x86_64-linux-gnu")
+    top_dir  = os.path.join(target, "usr/lib")
+    if not os.path.isdir(arch_dir):
+        return
+    for fname in os.listdir(arch_dir):
+        if ".so" in fname and fname.startswith("lib"):
+            dest = os.path.join(top_dir, fname)
+            if not os.path.lexists(dest):
+                os.symlink(os.path.join("x86_64-linux-gnu", fname), dest)
+
+def _build_xkbregistry(target, profile="smechos-plasma-live"):
+    """Rebuild libxkbcommon 1.6.0 with xkbregistry enabled (not in Ubuntu packages)."""
+    stamp = "xkbcommon-with-registry"
+    if _phase_done(profile, stamp):
+        log("xkbcommon/xkbregistry already built — skipping", color=YELLOW)
+        return
+    src = sources(target)
+    ver = "1.6.0"
+    fname = f"libxkbcommon-{ver}.tar.xz"
+    tarball = os.path.join(src, fname)
+    download(f"https://xkbcommon.org/download/{fname}", tarball)
+    bd = os.path.join(BUILD_TMP, "xkbcommon")
+    shutil.rmtree(bd, ignore_errors=True)
+    extract(tarball, bd)
+    prefix = os.path.join(target, "usr")
+    meson_install(bd, prefix, extra_args=[
+        "-Denable-docs=false",
+        "-Denable-xkbregistry=true",
+        "-Denable-x11=true",
+        "-Denable-wayland=true",
+    ])
+    _mark_done(profile, stamp)
+    log(f"xkbcommon {ver} (with xkbregistry) done.", color=GREEN)
 
 def phase_kde(target):
     log_phase("kde", f"Compile KDE Frameworks {KF6_VER} + Plasma {PLASMA_VER}")
+    _symlink_arch_libs(target)
+    _build_xkbregistry(target)
+    # Purge stale KF6/KDE cmake configs installed by Ubuntu packages into the
+    # build root's multiarch cmake path — they carry wrong versions (e.g. 6.6.0)
+    # that cmake prefers over our freshly built 6.27.0 ones.
+    _profile = "smechos-plasma-live"
+    if not _phase_done(_profile, "kde-cmake-purge"):
+        multiarch_cmake = os.path.join(target, "usr/lib/x86_64-linux-gnu/cmake")
+        if os.path.isdir(multiarch_cmake):
+            for entry in os.listdir(multiarch_cmake):
+                if any(entry.startswith(p) for p in ("KF6", "KDE", "KDecoration", "Plasma", "KWin")):
+                    shutil.rmtree(os.path.join(multiarch_cmake, entry), ignore_errors=True)
+            log("Purged stale KF6/KDE cmake configs from multiarch path", color=YELLOW)
+        _mark_done(_profile, "kde-cmake-purge")
     env = active_env(target)
 
     kf6 = [
-        "extra-cmake-modules", "kconfig", "kguiaddons", "ki18n",
-        "kitemviews", "sonnet", "kwidgetsaddons", "kcompletion",
-        "kdbusaddons", "karchive", "kcoreaddons", "kjobwidgets",
-        "kcrash", "kfilemetadata", "kglobalaccel", "kxmlgui",
-        "kbookmarks", "kio", "knotifications", "kparts",
-        "ktextwidgets", "kwindowsystem", "solid", "kdeclarative",
-        "kiconthemes", "knewstuff", "kpackage", "kservice",
-        "kwallet", "plasma-framework",
+        # Tier 0 — no KF6 deps
+        "extra-cmake-modules",
+        "karchive", "kcodecs", "kcoreaddons", "kdbusaddons",
+        "kguiaddons", "ki18n", "kitemmodels", "kitemviews",
+        "kunitconversion",      # required by plasma5support
+        "kwidgetsaddons", "kwindowsystem",
+        # Tier 1 — depend on Tier 0
+        "kconfig", "kdoctools",   # kdoctools: docbook/man page generator; required by plasma-desktop
+        # Tier 2 — depend on kconfig
+        "kcolorscheme", "kauth",
+        # Tier 3 — depend on kauth/kcolorscheme
+        "kconfigwidgets",
+        # Tier 4 — knotifications must precede kjobwidgets
+        "kcompletion", "kglobalaccel", "kcrash", "knotifications",
+        "kjobwidgets", "sonnet", "kpackage", "kservice",
+        # Tier 5 — breeze-icons required by kiconthemes
+        "breeze-icons", "kiconthemes", "kxmlgui", "solid",
+        # Tier 6
+        "kbookmarks", "kio", "kfilemetadata",
+        # Tier 7
+        "ktextwidgets", "knotifyconfig", "kparts", "kwallet",
+        # Tier 8 — kirigami must precede ksvg (KirigamiPlatform dep)
+        "kirigami", "kdeclarative", "ksvg",
+        "kstatusnotifieritem", "kidletime",
+        "qqc2-desktop-style",  # QQC2 desktop style; required by plasma-desktop
+        # Tier 9 — kcmutils required by kwin/plasma; kholidays required by knighttime; attica required by knewstuff
+        "kcmutils", "kholidays", "attica", "knewstuff", "krunner",
+        # Tier 10 — required by plasma-workspace / plasma-nm
+        "prison",              # KF6Prison: barcode/QR generator (required by plasma-workspace)
+        "syntax-highlighting",  # KF6SyntaxHighlighting: required by ktexteditor
+        "ktexteditor",         # KF6TextEditor: text editor component (required by plasma-workspace)
+        "kded",                # KF6KDED: KDE daemon infrastructure (required by plasma-workspace)
+        "networkmanager-qt",   # KF6NetworkManagerQt: REQUIRED by plasma-workspace on Linux
+        "modemmanager-qt",     # KF6ModemManagerQt: required by plasma-nm for mobile broadband
+        "kquickcharts",        # KF6QuickCharts: required by plasma-pa (volume applet charts)
+        "purpose",             # KF6Purpose: sharing/intent framework (required by Discover)
     ]
     for mod in kf6:
         _kde_pkg(mod, KF6_VER, KF6_URL, target, env)
 
     plasma = [
-        "kwin", "plasma-workspace", "plasma-desktop",
+        # plasma-activities must precede libplasma
+        "plasma-activities", "plasma-activities-stats",
+        # libplasma (was plasma-framework in KF5) ships with Plasma release
+        "libplasma",
+        # kdecoration provides KDecoration3; kwayland requires wayland >= 1.24 (now built)
+        # libkscreen provides KF6Screen required by kscreenlocker; must come first
+        # knighttime and kscreenlocker are required by kwin
+        "kdecoration", "kwayland", "libkscreen",
+        # layer-shell-qt must be built from 6.7.2 source before kscreenlocker:
+        # system package 6.6.5 is ABI-incompatible with Qt 6.10.3 private API
+        "layer-shell-qt",
+        "knighttime", "kscreenlocker",
+        "libksysguard",        # KSysGuard libs: required by ksystemstats and optional in plasma-workspace
+        "kwin", "plasma-workspace", "plasma5support", "plasma-desktop",
         "plasma-nm", "plasma-pa", "powerdevil", "breeze",
         "systemsettings", "plasma-integration", "kdeplasma-addons",
-        "ksystemstats", "kscreen", "libkscreen",
+        "ksystemstats", "kscreen",
     ]
+    # kirigami-addons has its own release schedule; tarballs sit flat in the dir
+    _kde_pkg("kirigami-addons", "1.12.1",
+             "https://download.kde.org/stable/kirigami-addons",
+             target, env)
+
+    # pulseaudio-qt — required by plasma-pa; own versioning, not part of KF6/Plasma tarballs
+    _paq_stamp = "pulseaudio-qt-1.8.1"
+    if not _phase_done("smechos-plasma-live", _paq_stamp):
+        _paq_ver = "1.8.1"
+        _paq_tb  = os.path.join(sources(target), f"pulseaudio-qt-{_paq_ver}.tar.xz")
+        download(f"https://download.kde.org/stable/pulseaudio-qt/pulseaudio-qt-{_paq_ver}.tar.xz", _paq_tb)
+        _paq_bd  = os.path.join(BUILD_TMP, "pulseaudio-qt")
+        shutil.rmtree(_paq_bd, ignore_errors=True)
+        extract(_paq_tb, _paq_bd)
+        cmake_install(_paq_bd, f"{target}/usr",
+            extra_args=[f"-DCMAKE_PREFIX_PATH={target}/usr",
+                        "-DBUILD_TESTING=OFF"],
+            env=env)
+        _mark_done("smechos-plasma-live", _paq_stamp)
+        log(f"pulseaudio-qt {_paq_ver} done.", color=GREEN)
+    else:
+        log("pulseaudio-qt already built — skipping", color=YELLOW)
+
+    # qtkeychain 0.16.0 — required by plasma-nm for secure credential storage
+    _qtkeychain_stamp = "qtkeychain-0.16.0"
+    if not _phase_done("smechos-plasma-live", _qtkeychain_stamp):
+        _qk_ver = "0.16.0"
+        _qk_url = f"https://github.com/frankosterfeld/qtkeychain/archive/refs/tags/{_qk_ver}.tar.gz"
+        _qk_tb  = os.path.join(sources(target), f"qtkeychain-{_qk_ver}.tar.gz")
+        download(_qk_url, _qk_tb)
+        _qk_bd  = os.path.join(BUILD_TMP, "qtkeychain")
+        shutil.rmtree(_qk_bd, ignore_errors=True)
+        extract(_qk_tb, _qk_bd)
+        cmake_install(_qk_bd, f"{target}/usr",
+            extra_args=[f"-DCMAKE_PREFIX_PATH={target}/usr",
+                        "-DBUILD_TESTING=OFF",
+                        "-DBUILD_WITH_QT6=ON",
+                        "-DLIBSECRET_SUPPORT=OFF"],  # avoid libsecret dep
+            env=env)
+        _mark_done("smechos-plasma-live", _qtkeychain_stamp)
+        log(f"qtkeychain {_qk_ver} done.", color=GREEN)
+    else:
+        log("qtkeychain already built — skipping", color=YELLOW)
+
     for mod in plasma:
         _kde_pkg(mod, PLASMA_VER, PLASMA_URL, target, env)
 
@@ -746,16 +1271,26 @@ def phase_plasma_discover(target):
     prefix = f"{target}/usr"
 
     # AppStream
-    url     = f"https://github.com/ximion/appstream/releases/download/v{APPSTREAM_VER}/appstream-{APPSTREAM_VER}.tar.gz"
-    tarball = os.path.join(src, f"appstream-{APPSTREAM_VER}.tar.gz")
+    url     = f"https://www.freedesktop.org/software/appstream/releases/AppStream-{APPSTREAM_VER}.tar.xz"
+    tarball = os.path.join(src, f"AppStream-{APPSTREAM_VER}.tar.xz")
     download(url, tarball)
     bd = os.path.join(BUILD_TMP, "appstream")
     shutil.rmtree(bd, ignore_errors=True)
     extract(tarball, bd)
-    cmake_install(bd, prefix,
-        extra_args=["-DAPX_INSTALL_DOCS=OFF", "-DAPX_INSTALL_TESTS=OFF",
-                    f"-DCMAKE_PREFIX_PATH={prefix}"],
-        env=env, build_dir=os.path.join(BUILD_TMP, "appstream-build"))
+    # Tarball has leading ./ so strip-components 1 leaves AppStream-VER/ as subdir
+    bd_src = os.path.join(bd, f"AppStream-{APPSTREAM_VER}")
+    # Remove Qt test subdir — QtTest is not in our build root and the tests aren't needed
+    qt_tests_dir = os.path.join(bd_src, "qt", "tests")
+    if os.path.isdir(qt_tests_dir):
+        qt_meson = os.path.join(bd_src, "qt", "meson.build")
+        with open(qt_meson) as f: content = f.read()
+        content = content.replace("subdir('tests/')", "# subdir('tests/')  # disabled: no QtTest")
+        content = content.replace("subdir('tests')", "# subdir('tests')  # disabled: no QtTest")
+        with open(qt_meson, "w") as f: f.write(content)
+    meson_install(bd_src, prefix,
+        extra_args=["-Ddocs=false", "-Dapidocs=false",
+                    "-Dcompose=false", "-Dqt=true"],
+        env=env)
 
     # PackageKit
     url     = f"https://www.freedesktop.org/software/PackageKit/releases/PackageKit-{PACKAGEKIT_VER}.tar.xz"
@@ -764,10 +1299,25 @@ def phase_plasma_discover(target):
     bd = os.path.join(BUILD_TMP, "packagekit")
     shutil.rmtree(bd, ignore_errors=True)
     extract(tarball, bd)
-    cmake_install(bd, prefix,
-        extra_args=["-DPK_BUILD_APTCC=OFF", "-DPK_BUILD_TESTS=OFF",
-                    f"-DCMAKE_PREFIX_PATH={prefix}"],
-        env=env, build_dir=os.path.join(BUILD_TMP, "packagekit-build"))
+    meson_install(bd, prefix,
+        extra_args=["-Ddaemon_tests=false", "-Dlocal_checkout=false",
+                    "-Dgstreamer_plugin=false", "-Dgtk_module=false"],
+        env=env)
+
+    # packagekit-qt (Qt6 bindings for PackageKit — required by Discover)
+    _pf = "smechos-plasma-live"
+    pkqt_stamp = f"packagekitqt-{PACKAGEKITQT_VER}"
+    if not _phase_done(_pf, pkqt_stamp):
+        pkqt_url     = f"https://github.com/PackageKit/packagekit-qt/archive/refs/tags/v{PACKAGEKITQT_VER}.tar.gz"
+        pkqt_tarball = os.path.join(src, f"packagekit-qt-{PACKAGEKITQT_VER}.tar.gz")
+        download(pkqt_url, pkqt_tarball)
+        pkqt_bd = os.path.join(BUILD_TMP, "packagekit-qt")
+        shutil.rmtree(pkqt_bd, ignore_errors=True)
+        extract(pkqt_tarball, pkqt_bd)
+        cmake_install(pkqt_bd, prefix,
+            extra_args=[f"-DCMAKE_PREFIX_PATH={prefix}"],
+            env=env)
+        _mark_done(_pf, pkqt_stamp)
 
     # SPK PackageKit script backend
     backend_dir = os.path.join(target, "usr", "lib", "packagekit-backend")
@@ -799,6 +1349,7 @@ def phase_plasma_discover(target):
                     "-DWITH_FLATPAK=ON", "-DWITH_FWUPD=ON",
                     "-DWITH_PACKAGEKIT=ON",
                     "-DCMAKE_INSTALL_LIBDIR=lib",
+                    "-DBUILD_TESTING=OFF",
                     f"-DCMAKE_PREFIX_PATH={prefix}"],
         env=env, build_dir=os.path.join(BUILD_TMP, "discover-build"))
     log("Plasma Discover + PackageKit + Flatpak + fwupd installed.", color=GREEN)
@@ -1271,8 +1822,12 @@ def phase_live_initramfs(target):
     env.pop("CC",     None)
     env.pop("LDFLAGS",None)
     run(["make", "defconfig"], cwd=bd, env=env)
-    with open(os.path.join(bd, ".config"), "a") as f:
-        f.write("\nCONFIG_STATIC=y\n")
+    cfg = os.path.join(bd, ".config")
+    with open(cfg) as f: cfg_text = f.read()
+    cfg_text = cfg_text.replace("CONFIG_TC=y", "# CONFIG_TC is not set")
+    cfg_text += "\nCONFIG_STATIC=y\n"
+    with open(cfg, "w") as f: f.write(cfg_text)
+    run(["make", "oldconfig"], cwd=bd, env=env, check=False)
     run(["make", "-j", nproc()], cwd=bd, env=env)
 
     # Assemble initramfs tree
@@ -1387,7 +1942,7 @@ def _grub_mkrescue(iso_path, work_dir, grub_cfg, files, label):
     mkrescue = shutil.which("grub-mkrescue") or shutil.which("grub2-mkrescue")
     if not mkrescue:
         err("grub-mkrescue not found. Install grub-pc-bin.")
-    run([mkrescue, "-o", iso_path, f"--volume-id={label}", work_dir])
+    run([mkrescue, "-o", iso_path, work_dir, "--", "-volid", label])
 
     import hashlib
     h = hashlib.sha256()
@@ -1489,6 +2044,8 @@ def phase_iso_live_smechos(target):
 
     # Squashfs the target root (exclude /boot — kernel lives separately in the ISO)
     log("Creating squashfs of root filesystem (this takes a while)...")
+    if os.path.exists(squashfs_path):
+        os.remove(squashfs_path)
     mksquashfs = shutil.which("mksquashfs")
     if not mksquashfs:
         err("mksquashfs not found. Install squashfs-tools.")
@@ -1565,8 +2122,12 @@ SMECHOS_PLASMA_LIVE_PHASES = [
     ("grub",            phase_grub,                      "Compile GRUB 2.12 EFI + BIOS"),
     ("qt-deps",         phase_qt_deps,                   "Compile Qt6 modules"),
     ("mesa",            phase_mesa,                      "Compile Mesa stack"),
-    ("cmake-bootstrap", phase_cmake_bootstrap,           f"Bootstrap CMake {CMAKE_BOOTSTRAP_VER}"),
-    ("kde",             phase_kde,                       "Compile KDE Frameworks + Plasma"),
+    ("cmake-bootstrap",    phase_cmake_bootstrap,        f"Bootstrap CMake {CMAKE_BOOTSTRAP_VER}"),
+    ("wayland",            phase_wayland,                f"Build wayland {WAYLAND_VER}"),
+    ("wayland-protocols",  phase_wayland_protocols,      f"Build wayland-protocols {WAYLAND_PROTO_VER}"),
+    ("libinput",           phase_libinput,               f"Build libinput {LIBINPUT_VER}"),
+    # libeis skipped: gitlab releases require auth; not in kwin's REQUIRED list (EIS feature optional)
+    ("kde",                phase_kde,                    "Compile KDE Frameworks + Plasma"),
     ("plasma-configure",phase_plasma_configure,          "Configure Plasma/SDDM session"),
     ("kwin-deps",       phase_kwin_deps,                 "Copy KWin dependencies"),
     ("qt6uitools",      phase_qt6uitools,                "Ensure Qt6UITools present"),
