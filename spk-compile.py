@@ -30,6 +30,7 @@ Usage:
 
 import argparse
 import glob
+import json
 import os
 import sys
 import subprocess
@@ -64,6 +65,8 @@ WAYLAND_PROTO_VER = "1.48"
 WAYLAND_VER       = "1.24.0"
 LIBINPUT_VER      = "1.28.0"
 LIBEIS_VER        = "1.4.0"
+BITCOIN_VER       = "28.0"
+SGMINER_VER       = "5.6.1"
 
 # Download URLs (KDE URLs are resolved dynamically at build time — see _resolve_kde_versions)
 LINUX_URL    = f"https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-{LINUX_VER}.tar.xz"
@@ -77,6 +80,8 @@ WAYLAND_URL       = f"https://gitlab.freedesktop.org/wayland/wayland/-/archive/{
 LIBINPUT_URL      = f"https://gitlab.freedesktop.org/libinput/libinput/-/archive/{LIBINPUT_VER}/libinput-{LIBINPUT_VER}.tar.gz"
 LIBEIS_URL        = f"https://gitlab.freedesktop.org/libeis/libeis/-/releases/{LIBEIS_VER}/downloads/libeis-{LIBEIS_VER}.tar.xz"
 OPENRC_URL   = f"https://github.com/OpenRC/openrc/archive/refs/tags/{OPENRC_VER}.tar.gz"
+BITCOIN_URL  = f"https://bitcoincore.org/bin/bitcoin-core-{BITCOIN_VER}/bitcoin-{BITCOIN_VER}.tar.gz"
+SGMINER_URL  = f"https://github.com/sgminer-dev/sgminer/archive/refs/tags/{SGMINER_VER}.tar.gz"
 # Plasma + KF6 URLs are set by _resolve_kde_versions() before each build
 PLASMA_URL   = f"https://download.kde.org/stable/plasma/{PLASMA_VER}"
 KF6_URL      = f"https://download.kde.org/stable/frameworks/6.27"
@@ -148,7 +153,18 @@ def ensure(path):
 
 def run(cmd, cwd=None, env=None, sudo=False, check=True):
     if sudo and os.geteuid() != 0:
-        cmd = ["sudo"] + list(cmd)
+        # Plain "sudo <cmd>" resets the environment by default (sudoers
+        # env_reset), silently dropping whatever `env=` was passed here —
+        # e.g. DESTDIR, which would otherwise make an install phase write
+        # straight to the real host /usr instead of the staging root.
+        # Route explicit env vars through the target-side `env` binary
+        # (invoked post-privilege-escalation) so they survive regardless of
+        # the sudoers env_reset/env_keep configuration.
+        if env is not None:
+            passthrough = {k: v for k, v in env.items() if os.environ.get(k) != v}
+            cmd = ["sudo", "env"] + [f"{k}={v}" for k, v in passthrough.items()] + list(cmd)
+        else:
+            cmd = ["sudo"] + list(cmd)
     log(f"$ {' '.join(str(c) for c in cmd)}", color=R)
     result = subprocess.run(list(cmd), cwd=cwd, env=env)
     if check and result.returncode != 0:
@@ -237,6 +253,22 @@ def active_env(target):
     """Return the right build environment for the currently running profile."""
     return build_env_glibc(target) if _USE_GLIBC else build_env(target)
 
+def build_env_bitcoin(target):
+    """build_env_glibc() with a conservative CPU baseline for old LGA775
+    Pentium/Celeron chips (Core-derived budget SKUs, no SSE4.2/AVX).
+
+    glibc rather than musl here, despite the rest of this profile's lean
+    OpenRC lineage -- Bitcoin Core and GPU miners (cgminer/sgminer) are
+    both far more commonly built and tested against glibc; musl support
+    for either is a much less-trodden path this pipeline has no way to
+    validate without a real build+boot cycle on the target hardware.
+    """
+    e = build_env_glibc(target)
+    baseline = "-march=core2 -mtune=generic"
+    e["CFLAGS"]   = f"{baseline} {e['CFLAGS']}"
+    e["CXXFLAGS"] = f"{baseline} {e['CXXFLAGS']}"
+    return e
+
 def _extract_deb(deb_path, dest):
     """Extract a .deb file's data.tar into dest."""
     work = deb_path + ".extract"
@@ -249,6 +281,20 @@ def _extract_deb(deb_path, dest):
             run(["tar", "-xf", data_tar, "-C", dest])
             break
     shutil.rmtree(work, ignore_errors=True)
+
+def _split_staging_prefix(prefix):
+    # Every caller passes prefix as exactly "<target>/usr" — the physical
+    # staging location. CMAKE_INSTALL_PREFIX/--prefix must instead be the
+    # *final runtime* prefix ("/usr"), with the staging root applied only at
+    # install time via DESTDIR. Baking the staging path itself into
+    # CMAKE_INSTALL_PREFIX/--prefix bakes the absolute build-root path into
+    # RPATH/RUNPATH, compiled-in string constants, and installed unit files
+    # (systemd, dbus, etc.) — those paths don't exist at boot on the real
+    # target, causing "cannot open shared object file" / "No such file or
+    # directory" failures at runtime.
+    if not prefix.endswith("/usr"):
+        raise ValueError(f"expected prefix ending in /usr, got: {prefix}")
+    return prefix[: -len("/usr")]  # staging root ("target"), real prefix is always "/usr"
 
 def cmake_install(src_dir, prefix, extra_args=None, env=None, build_dir=None):
     bd = build_dir or os.path.join(src_dir, "build")
@@ -272,23 +318,41 @@ def cmake_install(src_dir, prefix, extra_args=None, env=None, build_dir=None):
     existing_lp = build_env.get("LIBRARY_PATH", "")
     if prefix_arch_lib not in existing_lp:
         build_env["LIBRARY_PATH"] = f"{prefix_arch_lib}:{existing_lp}" if existing_lp else prefix_arch_lib
+    target_root = _split_staging_prefix(prefix)
     run([cmake_bin, src_dir,
          "-G", "Ninja",
-         f"-DCMAKE_INSTALL_PREFIX={prefix}",
+         "-DCMAKE_INSTALL_PREFIX=/usr",
          "-DCMAKE_BUILD_TYPE=Release",
+         # KDE's ECM/KDECMakeSettings modules default to baking the build-time
+         # library search path (derived from CMAKE_PREFIX_PATH, i.e. the
+         # staging root) into each installed binary's RPATH. Since
+         # CMAKE_INSTALL_PREFIX is now correctly "/usr" rather than the
+         # staging path, that auto-derived RPATH would otherwise still leak
+         # the staging root in — same failure mode as an unfixed
+         # CMAKE_INSTALL_PREFIX, just via a different mechanism. Force the
+         # install RPATH to the real runtime lib dir instead.
+         "-DCMAKE_SKIP_BUILD_RPATH=FALSE",
+         "-DCMAKE_BUILD_WITH_INSTALL_RPATH=FALSE",
+         "-DCMAKE_INSTALL_RPATH_USE_LINK_PATH=FALSE",
+         "-DCMAKE_INSTALL_RPATH=/usr/lib/x86_64-linux-gnu",
          ] + (extra_args or []), cwd=bd, env=build_env)
     run([ninja_bin, "-j", nproc(), "-k", "0"], cwd=bd, env=build_env, check=False)
-    run([cmake_bin, "--install", bd], env=build_env, sudo=(os.geteuid() != 0))
+    install_env = dict(build_env)
+    install_env["DESTDIR"] = target_root
+    run([cmake_bin, "--install", bd], env=install_env, sudo=(os.geteuid() != 0))
 
 def meson_install(src_dir, prefix, extra_args=None, env=None, build_dir=None):
     bd = build_dir or os.path.join(src_dir, "build")
     if os.path.exists(bd):
         shutil.rmtree(bd)
+    target_root = _split_staging_prefix(prefix)
     run(["meson", "setup", bd, src_dir,
-         f"--prefix={prefix}", "--buildtype=release",
+         "--prefix=/usr", "--buildtype=release",
          ] + (extra_args or []), env=env)
     run(["ninja", "-C", bd, "-j", nproc()], env=env)
-    run(["ninja", "-C", bd, "install"], env=env, sudo=(os.geteuid() != 0))
+    install_env = dict(env) if env else dict(os.environ)
+    install_env["DESTDIR"] = target_root
+    run(["ninja", "-C", bd, "install"], env=install_env, sudo=(os.geteuid() != 0))
 
 # ── Phase implementations ─────────────────────────────────────────────────────
 
@@ -495,6 +559,10 @@ def phase_kernel(target):
         CONFIG_DRM=m
         CONFIG_DRM_AMDGPU=m
         CONFIG_DRM_NOUVEAU=m
+        CONFIG_DRM_I915=y
+        CONFIG_DRM_RADEON=m
+        CONFIG_FW_LOADER_COMPRESS=y
+        CONFIG_FW_LOADER_COMPRESS_XZ=y
     """)
     with open(os.path.join(bd, ".config"), "a") as f:
         f.write(extras)
@@ -508,6 +576,74 @@ def phase_kernel(target):
     run(["make", f"INSTALL_MOD_PATH={target}", "modules_install"],
         cwd=bd, env=env, sudo=(os.geteuid() != 0))
     log(f"Linux {LINUX_VER} installed.", color=GREEN)
+
+def _decompress_firmware_dir(fw_dir):
+    """Decompress every .xz file in a firmware dir in place.
+
+    linux-firmware ships most blobs as .xz, but this kernel's config has
+    CONFIG_FW_LOADER_COMPRESS unverified end-to-end (added defensively above,
+    never build-tested this session) -- decompressing here guarantees the
+    firmware loads regardless. Many blobs are symlinks to a sibling .xz file
+    (dedup for chip variants sharing microcode); plain unxz refuses to follow
+    those, so regular files are decompressed first, then symlinks are
+    repointed at the now-decompressed target name.
+    """
+    need_sudo = (os.geteuid() != 0)
+    run(["bash", "-c",
+         f'cd "{fw_dir}" && '
+         f'for f in *.xz; do [ -f "$f" ] && [ ! -L "$f" ] && unxz "$f"; done'],
+        sudo=need_sudo)
+    fixed, broken = 0, []
+    for link in glob.glob(os.path.join(fw_dir, "*.xz")):
+        if not os.path.islink(link):
+            continue
+        tgt = os.readlink(link)
+        newname = link[:-3]     # strip .xz
+        newtgt  = tgt[:-3] if tgt.endswith(".xz") else tgt
+        if os.path.exists(os.path.join(fw_dir, newtgt)):
+            run(["ln", "-sf", newtgt, newname], sudo=need_sudo)
+            run(["rm", "-f", link], sudo=need_sudo)
+            fixed += 1
+        else:
+            broken.append(link)
+    if broken:
+        err(f"{fw_dir}: {len(broken)} firmware symlink(s) point at missing "
+            f"targets after decompression: {broken[:5]}")
+    remaining = glob.glob(os.path.join(fw_dir, "*.xz"))
+    if remaining:
+        err(f"{fw_dir}: {len(remaining)} .xz file(s) left undecompressed: {remaining[:5]}")
+    log(f"{fw_dir}: firmware decompressed ({fixed} symlinks repointed)", color=GREEN)
+
+def phase_firmware(target):
+    """Bundle GPU firmware from the host's linux-firmware into the target.
+
+    /usr/lib/firmware/{amdgpu,i915} were found completely absent from a
+    built image this session -- amdgpu is firmware-dependent even for basic
+    3D (GFX/compute ring bring-up silently hangs forever without it, not a
+    clean crash), and i915 needs DMC/GuC/HuC for full display power
+    management on Gemini Lake and newer. radeon covers pre-GCN2 cards (the
+    classic `radeon` kernel driver, distinct from amdgpu) for the
+    smechos-bitcoin profile's OpenCL mining target. All three are copied
+    wholesale (not filtered to one chip family) since extra unused chip
+    files are harmless and this pipeline has no reliable way to know the
+    target's exact GPU.
+    """
+    log_phase("firmware", "Bundle GPU firmware (amdgpu + i915 + radeon) from host")
+    fw_root = "/usr/lib/firmware"
+    dst_root = os.path.join(target, "usr", "lib", "firmware")
+    ensure(dst_root)
+    for family in ("amdgpu", "i915", "radeon"):
+        src = os.path.join(fw_root, family)
+        dst = os.path.join(dst_root, family)
+        if not os.path.isdir(src):
+            log(f"Host has no {src} -- skipping (install linux-firmware on the "
+                f"build host to include {family} GPU firmware)", color=YELLOW)
+            continue
+        if os.path.isdir(dst):
+            shutil.rmtree(dst)
+        shutil.copytree(src, dst, symlinks=True)
+        _decompress_firmware_dir(dst)
+        log(f"{family} firmware bundled.", color=GREEN)
 
 def phase_grub(target):
     log_phase("grub", f"Compile GRUB {GRUB_VER} EFI + BIOS")
@@ -556,7 +692,11 @@ def phase_qt_deps(target):
         shutil.rmtree(d, ignore_errors=True)
 
     modules = [
-        ("qtbase",        ["-DFEATURE_testlib=OFF"]),
+        # FEATURE_xcb must be forced ON: it silently auto-disables unless every
+        # XCB extension dev package is present at configure time (no hard build
+        # failure), which breaks QX11Info/KWindowSystem's X11 backend later.
+        ("qtbase",        ["-DFEATURE_testlib=OFF", "-DFEATURE_fontconfig=ON",
+                            "-DFEATURE_xcb=ON"]),
         ("qtshadertools", []),
         ("qtdeclarative", []),
         ("qtsvg",         []),
@@ -587,6 +727,24 @@ def phase_qt_deps(target):
             build_dir=os.path.join(BUILD_TMP, f"qt6-{name}-build"))
         log(f"Qt6/{name} done.", color=GREEN)
 
+        if name == "qtbase":
+            # FEATURE_xcb silently auto-disables (no build failure) if even one
+            # of ~20 XCB extension dev packages is missing at configure time.
+            # A silently-disabled FEATURE_xcb only surfaces hours later as
+            # kwin_wayland/KWindowSystem crashing with an undefined QX11Info
+            # symbol -- verify it actually landed here instead, immediately,
+            # while the fix (install the missing libxcb-*-dev package) is
+            # still obvious from context.
+            cache_file = os.path.join(BUILD_TMP, "qt6-qtbase-build", "CMakeCache.txt")
+            with open(cache_file) as f:
+                cache = f.read()
+            if "FEATURE_xcb:BOOL=ON" not in cache:
+                notfound = [l for l in cache.splitlines() if "X11_xcb_" in l and "NOTFOUND" in l]
+                err("qtbase built with FEATURE_xcb=OFF despite being forced ON -- "
+                    "an XCB extension dev package is missing on this build host. "
+                    "Unresolved X11_xcb_*_LIB entries:\n  " + "\n  ".join(notfound))
+            log("Verified: qtbase FEATURE_xcb=ON", color=GREEN)
+
     # KF6 tools embed RUNPATH pointing to the arch-specific lib dir (e.g.
     # lib/x86_64-linux-gnu) but Qt is installed to lib/ directly.  Symlink
     # all Qt shared libs into the arch dir so dynamic linker finds them.
@@ -600,6 +758,9 @@ def phase_qt_deps(target):
 
 CMAKE_BOOTSTRAP_VER = "3.31.6"
 CMAKE_BOOTSTRAP_URL = f"https://github.com/Kitware/CMake/releases/download/v{CMAKE_BOOTSTRAP_VER}/cmake-{CMAKE_BOOTSTRAP_VER}-linux-x86_64.tar.gz"
+
+FASTFETCH_VER = "2.66.0"
+FASTFETCH_URL = f"https://github.com/fastfetch-cli/fastfetch/archive/refs/tags/{FASTFETCH_VER}.tar.gz"
 
 def phase_cmake_bootstrap(target):
     log_phase("cmake-bootstrap", f"Bootstrap CMake {CMAKE_BOOTSTRAP_VER} (KDE requires 3.29+)")
@@ -633,13 +794,13 @@ def phase_mesa(target):
     extract(tarball, bd)
     meson_install(bd, f"{target}/usr",
         extra_args=[
-            "-Dgallium-drivers=radeonsi,nouveau,iris,crocus,swrast",
+            "-Dgallium-drivers=radeonsi,nouveau,iris,crocus,r300,svga,virgl,zink,swrast",
             "-Dvulkan-drivers=amd,intel",
             "-Dglx=dri", "-Degl=enabled", "-Dgbm=enabled",
             "-Dopengl=true", "-Dgles1=enabled", "-Dgles2=enabled",
             "-Dshared-glapi=enabled",
             "-Dplatforms=x11,wayland",
-            "-Dglvnd=disabled", "-Db_lto=false",
+            "-Dglvnd=enabled", "-Db_lto=false",
         ],
         env=active_env(target),
         build_dir=os.path.join(BUILD_TMP, "mesa-build"))
@@ -1166,41 +1327,150 @@ def phase_kde(target):
     for mod in plasma:
         _kde_pkg(mod, PLASMA_VER, PLASMA_URL, target, env)
 
-def phase_plasma_configure(target):
-    log_phase("plasma-configure", "Configure Plasma/SDDM session")
-    etc = os.path.join(target, "etc")
+def _pam_ensure_line(pam_file, marker_re, line):
+    """Idempotently append `line` to a PAM service file unless a line already
+    matches marker_re. Used to patch upstream-shipped PAM templates that are
+    missing a module this rootfs actually needs (see phase_plasma_configure).
+    """
+    import re
+    with open(pam_file) as f:
+        content = f.read()
+    if re.search(marker_re, content, re.MULTILINE):
+        return False
+    with open(pam_file, "a") as f:
+        if not content.endswith("\n"):
+            f.write("\n")
+        f.write(line + "\n")
+    return True
 
+def phase_plasma_configure(target):
+    """Configure the display manager: PLM (plasmalogin) if built, else SDDM.
+
+    This profile's actual shipping display manager is PLM
+    ("plasma-login-manager", sourced from a Fedora SRPM -- see
+    /home/smech/smechos-work/plm/src). It is NOT currently built by any
+    phase in this pipeline (no phase_kde plasma[] entry, no dedicated
+    phase) -- that gap is real and this function does not close it. What
+    this function does is configure PLM correctly *if* its binary is
+    already present in target (e.g. built out-of-band, as it was for every
+    image tested this session), while still falling back to SDDM
+    configuration if plasmalogin isn't there. A `plasma-login-manager`
+    build phase (cmake+ECM, Fedora patches reapplied for Debian
+    conventions) is still needed as a follow-up.
+
+    PLM's PAM template is Fedora/authselect-flavored (references
+    "postlogin", pam_passwdqc, system-auth) despite this rootfs being
+    Debian/Ubuntu ABI throughout -- that mismatch is the root cause behind
+    several of the fixes below, not something introduced here.
+    """
+    log_phase("plasma-configure", "Configure display manager (PLM, fallback SDDM)")
+    etc = os.path.join(target, "etc")
+    plasmalogin_bin = os.path.join(target, "usr", "bin", "plasmalogin")
+
+    if os.path.exists(plasmalogin_bin):
+        # --- Autologin config -------------------------------------------
+        # Group name is "Autologin" (lowercase "login") per mainconfig.kcfg
+        # -- KConfig group names are case-sensitive, and a wrong-case group
+        # here means autologinUser() silently returns empty and the daemon
+        # skips autologin with no error logged at all. Both the daemon's own
+        # config object (/etc/plasmalogin.conf, read by MainConfigLoader) and
+        # the frontend settings config object (/usr/lib/plasmalogin/
+        # defaults.conf, a *different* KSharedConfig, read by
+        # plasmaloginsettingsdefaults.cpp) need this written identically --
+        # they are two separate config objects in PLM's own source, not one
+        # cascading file.
+        autologin_conf = "[Autologin]\nUser=smech\nSession=plasma\nRelogin=false\n"
+        with open(os.path.join(etc, "plasmalogin.conf"), "w") as f:
+            f.write(autologin_conf)
+        defaults_dir = os.path.join(target, "usr", "lib", "plasmalogin")
+        ensure(defaults_dir)
+        with open(os.path.join(defaults_dir, "defaults.conf"), "w") as f:
+            f.write(autologin_conf)
+
+        # --- postlogin: guarantee it exists ------------------------------
+        # plasmalogin-autologin's PAM file (as shipped) has "auth include
+        # postlogin" / "session include postlogin". If that file is missing
+        # -- true for this rootfs, which has no authselect-style postlogin
+        # at all -- the include is a hard PAM_ABORT for that stack position,
+        # so pam_authenticate() returns PAM_AUTH_ERR ("Autologin failed!")
+        # even though pam_permit.so earlier in the same stack already
+        # unconditionally succeeded. A comment-only stub is sufficient: an
+        # include with zero lines in the target file contributes nothing to
+        # the combined result, it just needs to exist.
+        pam_dir = os.path.join(etc, "pam.d")
+        ensure(pam_dir)
+        postlogin = os.path.join(pam_dir, "postlogin")
+        if not os.path.exists(postlogin):
+            with open(postlogin, "w") as f:
+                f.write("# Intentionally minimal -- see phase_plasma_configure "
+                         "in spk-compile.py for why this needs to exist at all.\n")
+
+        # --- plasmalogin-autologin: add pam_systemd.so -------------------
+        # Even with auth fixed, the shipped session stack (ending in
+        # "session include system-auth", whose own session stack is just
+        # pam_limits/pam_env/pam_unix) never loads pam_systemd.so. Without
+        # it no logind session gets registered, so no systemd --user
+        # manager comes up, and startplasma falls back to a bare
+        # dbus-run-session with no working session bus -- kwin_wayland
+        # never starts. Observed effect: kwin_wayland to plasmashell gap
+        # went from 3 minutes (kcminit/ksmserver each hard-timeout at 90s)
+        # to ~7 seconds once this was added.
+        autologin_pam = os.path.join(target, "usr", "lib", "pam.d", "plasmalogin-autologin")
+        if os.path.exists(autologin_pam):
+            _pam_ensure_line(autologin_pam, r"^session\s+optional\s+pam_systemd\.so",
+                              "session    optional    pam_systemd.so")
+
+        # --- enable plasmalogin.service -----------------------------------
+        # PLM's own install already ships /usr/lib/systemd/system/
+        # plasmalogin.service (Alias=display-manager.service) -- only the
+        # enable symlink is needed, not a hand-written unit (unlike the
+        # SDDM fallback below, which has no shipped unit to enable).
+        unit = os.path.join(target, "usr", "lib", "systemd", "system", "plasmalogin.service")
+        if os.path.exists(unit):
+            gfx_wants = os.path.join(etc, "systemd", "system", "graphical.target.wants")
+            ensure(gfx_wants)
+            link = os.path.join(gfx_wants, "plasmalogin.service")
+            if not os.path.lexists(link):
+                os.symlink(unit, link)
+        else:
+            log("plasmalogin binary present but no systemd unit shipped with it "
+                "-- service not enabled.", color=YELLOW)
+
+        log("PLM (plasmalogin) configured.", color=GREEN)
+        return
+
+    # --- SDDM fallback (used only if plasmalogin was never built) --------
+    log("plasmalogin not found -- falling back to SDDM config.", color=YELLOW)
     sddm_dir = os.path.join(etc, "sddm.conf.d")
     ensure(sddm_dir)
     with open(os.path.join(sddm_dir, "autologin.conf"), "w") as f:
         f.write("[Autologin]\nUser=smech\nSession=plasma\n")
-
     with open(os.path.join(etc, "sddm.conf"), "w") as f:
         f.write("[Theme]\nCurrent=breeze\n\n[General]\nDisplayServer=wayland\n")
 
-    for name, content in [
-        ("sddm", textwrap.dedent("""\
-            #!/sbin/openrc-run
-            name="SDDM"
-            command="/usr/bin/sddm"
-            command_background=true
-            pidfile="/run/sddm.pid"
-            depend() { need localmount dbus udev; }
-        """)),
-        ("dbus", textwrap.dedent("""\
-            #!/sbin/openrc-run
-            name="D-Bus"
-            command="/usr/bin/dbus-daemon"
-            command_args="--system --fork --print-pid"
-            pidfile="/run/dbus.pid"
-            depend() { need localmount; }
-        """)),
-    ]:
-        path = os.path.join(etc, "init.d", name)
-        with open(path, "w") as f:
-            f.write(content)
-        os.chmod(path, 0o755)
-    log("Plasma session configured.", color=GREEN)
+    sddm_bin = os.path.join(target, "usr", "bin", "sddm")
+    if os.path.exists(sddm_bin):
+        sddm_unit_path = os.path.join(etc, "systemd", "system", "sddm.service")
+        ensure(os.path.dirname(sddm_unit_path))
+        with open(sddm_unit_path, "w") as f:
+            f.write(textwrap.dedent("""\
+                [Unit]
+                Description=Simple Desktop Display Manager
+                After=systemd-user-sessions.service
+
+                [Service]
+                ExecStart=/usr/bin/sddm
+                Restart=always
+
+                [Install]
+                Alias=display-manager.service
+            """))
+        gfx_wants = os.path.join(etc, "systemd", "system", "graphical.target.wants")
+        ensure(gfx_wants)
+        link = os.path.join(gfx_wants, "sddm.service")
+        if not os.path.lexists(link):
+            os.symlink(sddm_unit_path, link)
+    log("SDDM configured (fallback).", color=GREEN)
 
 def phase_kwin_deps(target):
     log_phase("kwin-deps", "Copy KWin compositor dependencies from host")
@@ -1222,6 +1492,87 @@ def phase_kwin_deps(target):
         else:
             log(f"Skipped (not on host): {os.path.basename(lib)}", color=YELLOW)
     log("KWin deps done.", color=GREEN)
+
+def phase_xwayland_deps(target):
+    """Fetch Xwayland + xkbcomp + xkb-data from an Ubuntu 24.04 container.
+
+    A built image this session shipped with NO Xwayland binary at all --
+    kwin_wayland logged "Xwayland process failed to start" once and moved
+    on, but downstream components (kcminit, ksmserver) block on Xwayland
+    becoming ready and hard-timeout after 90s each, which is what actually
+    caused a "just a cursor on a black screen, forever" desktop. Getting
+    xkbcomp right matters too: without it Xwayland crash-loops (XKB keymap
+    compile failure -> "Failed to activate virtual core keyboard" -> fatal),
+    and kwin gives up on Xwayland after 4 crashes in 10 minutes.
+
+    These are pulled from a matching-ABI Ubuntu 24.04 container rather than
+    the build host directly -- this pipeline's target rootfs is Debian/
+    Ubuntu glibc ABI (see build_env_glibc), but the build host itself may be
+    a different distro (this fix was discovered on a Fedora host); copying
+    Xwayland's binary/libs from a host with a different glibc/libstdc++
+    build risks the same silent-ABI-break class of bug already hit once
+    this session with a Qt private-symbol rebuild.
+    """
+    log_phase("xwayland-deps", "Fetch Xwayland + xkbcomp + xkb-data (Ubuntu 24.04 ABI)")
+    if not shutil.which("podman"):
+        err("podman not found on build host -- required to fetch Xwayland/xkbcomp "
+            "from a matching-ABI Ubuntu 24.04 container. Install podman and re-run "
+            "this phase (--phase xwayland-deps).")
+
+    container = "spk-xwayland-build"
+    run(["podman", "rm", "-f", container], check=False)
+    run(["podman", "run", "-d", "--name", container, "ubuntu:24.04", "sleep", "infinity"])
+    try:
+        run(["podman", "exec", container, "bash", "-c",
+             "apt-get update -qq && apt-get install -y -qq xwayland x11-xkb-utils"])
+
+        tmp = os.path.join(BUILD_TMP, "xwayland-import")
+        shutil.rmtree(tmp, ignore_errors=True)
+        ensure(tmp)
+        run(["podman", "cp", f"{container}:/usr/bin/Xwayland", tmp])
+        run(["podman", "cp", f"{container}:/usr/bin/xkbcomp", tmp])
+        run(["podman", "cp", f"{container}:/usr/share/X11/xkb", os.path.join(tmp, "xkb")])
+
+        # Only libs not already covered elsewhere in the pipeline (kwin-deps,
+        # qt-deps, mesa) -- checked against what those phases install.
+        extra_libs = ["libXfont2.so.2", "libfontenc.so.1", "libxkbfile.so.1"]
+        for lib in extra_libs:
+            proc = subprocess.run(
+                ["podman", "exec", container, "bash", "-c",
+                 f"readlink -f /lib/x86_64-linux-gnu/{lib}"],
+                capture_output=True, text=True, check=True)
+            real = proc.stdout.strip()
+            run(["podman", "cp", f"{container}:{real}", os.path.join(tmp, os.path.basename(real))])
+    finally:
+        run(["podman", "rm", "-f", container], check=False)
+
+    arch_libdir = os.path.join(target, "usr", "lib", "x86_64-linux-gnu")
+    ensure(arch_libdir)
+    ensure(os.path.join(target, "usr", "bin"))
+    ensure(os.path.join(target, "usr", "share", "X11"))
+
+    for binname in ("Xwayland", "xkbcomp"):
+        dest = os.path.join(target, "usr", "bin", binname)
+        shutil.copy2(os.path.join(tmp, binname), dest)
+        os.chmod(dest, 0o755)
+
+    xkb_dst = os.path.join(target, "usr", "share", "X11", "xkb")
+    if os.path.isdir(xkb_dst):
+        shutil.rmtree(xkb_dst)
+    shutil.copytree(os.path.join(tmp, "xkb"), xkb_dst)
+
+    for f in glob.glob(os.path.join(tmp, "*.so.*")):
+        base = os.path.basename(f)
+        # base is e.g. libXfont2.so.2.0.0 -- versioned .so + unversioned-minor symlink
+        dest = os.path.join(arch_libdir, base)
+        shutil.copy2(f, dest)
+        parts = base.split(".so.")
+        soname = f"{parts[0]}.so.{parts[1].split('.')[0]}"
+        link = os.path.join(arch_libdir, soname)
+        if not os.path.lexists(link):
+            os.symlink(base, link)
+
+    log("Xwayland + xkbcomp + xkb-data installed.", color=GREEN)
 
 def phase_qt6uitools(target):
     log_phase("qt6uitools", "Ensure Qt6UITools present")
@@ -1245,6 +1596,7 @@ def phase_patch_metadata(target):
             "NAME":         "SmechOS",
             "PRETTY_NAME":  "SmechOS 1.0 (Sovereign)",
             "HOME_URL":     "https://os.smech.xyz",
+            "LOGO":         "smechos-logo",
         }
         with open(release_file) as f:
             lines = f.readlines()
@@ -1263,6 +1615,89 @@ def phase_patch_metadata(target):
         with open(release_file, "w") as f:
             f.writelines(new_lines)
     log("Metadata patched.", color=GREEN)
+
+    # Logo: drop your downloaded SmechOS logo into config/branding/ under
+    # either/both of these names before running this phase --
+    #   config/branding/smechos-logo.svg  (preferred, scales cleanly)
+    #   config/branding/smechos-logo.png  (256x256 recommended fallback)
+    # This picks up whichever is present and installs it to the standard
+    # icon-theme paths KDE's kinfocenter (About This System) and the LOGO=
+    # os-release field above both resolve against.
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    branding_src = os.path.join(repo_root, "config", "branding")
+    svg_src = os.path.join(branding_src, "smechos-logo.svg")
+    png_src = os.path.join(branding_src, "smechos-logo.png")
+
+    if os.path.exists(svg_src):
+        dest_dir = os.path.join(target, "usr", "share", "icons", "hicolor", "scalable", "apps")
+        ensure(dest_dir)
+        shutil.copy2(svg_src, os.path.join(dest_dir, "smechos-logo.svg"))
+        log("Installed smechos-logo.svg to hicolor scalable icon theme.", color=GREEN)
+    if os.path.exists(png_src):
+        dest_dir = os.path.join(target, "usr", "share", "icons", "hicolor", "256x256", "apps")
+        ensure(dest_dir)
+        shutil.copy2(png_src, os.path.join(dest_dir, "smechos-logo.png"))
+        # Also drop a copy in pixmaps -- the simplest, most broadly-checked
+        # fallback path for tools that don't walk the full hicolor theme.
+        pixmaps_dir = os.path.join(target, "usr", "share", "pixmaps")
+        ensure(pixmaps_dir)
+        shutil.copy2(png_src, os.path.join(pixmaps_dir, "smechos-logo.png"))
+        log("Installed smechos-logo.png to hicolor + pixmaps.", color=GREEN)
+    if not os.path.exists(svg_src) and not os.path.exists(png_src):
+        log(f"No logo found in {branding_src} -- LOGO= field is set in "
+            f"os-release but has nothing to point at yet. Drop "
+            f"smechos-logo.svg or smechos-logo.png there and re-run this "
+            f"phase.", color=YELLOW)
+
+    _phase_fastfetch(target)
+
+def _phase_fastfetch(target):
+    log_phase("fastfetch", f"Compile fastfetch {FASTFETCH_VER} + SmechOS branding config")
+    src    = sources(target)
+    prefix = f"{target}/usr"
+
+    tarball = os.path.join(src, f"fastfetch-{FASTFETCH_VER}.tar.gz")
+    download(FASTFETCH_URL, tarball)
+    bd = os.path.join(BUILD_TMP, "fastfetch")
+    shutil.rmtree(bd, ignore_errors=True)
+    extract(tarball, bd)
+    bd_src = os.path.join(bd, f"fastfetch-{FASTFETCH_VER}")
+    cmake_install(bd_src, prefix)
+
+    # System-wide default config: fastfetch checks /etc/xdg/fastfetch first
+    # when no per-user config exists, so this is what a fresh SmechOS user
+    # sees by default without needing to run `fastfetch --gen-config` first.
+    cfg_dir = os.path.join(target, "etc", "xdg", "fastfetch")
+    ensure(cfg_dir)
+    fastfetch_config = {
+        "$schema": "https://github.com/fastfetch-cli/fastfetch/raw/dev/doc/json_schema.json",
+        "logo": {
+            "type": "auto",
+            "source": "smechos-logo",
+            "padding": {"top": 1, "left": 1, "right": 2}
+        },
+        "display": {"separator": " -> "},
+        "modules": [
+            "title",
+            "separator",
+            {"type": "os", "key": "OS"},
+            {"type": "kernel", "key": "Kernel"},
+            {"type": "packages", "key": "Packages"},
+            {"type": "de", "key": "DE"},
+            {"type": "wm", "key": "WM"},
+            {"type": "shell", "key": "Shell"},
+            {"type": "terminal", "key": "Terminal"},
+            {"type": "cpu", "key": "CPU"},
+            {"type": "gpu", "key": "GPU"},
+            {"type": "memory", "key": "Memory"},
+            {"type": "disk", "key": "Disk"},
+            "break",
+            "colors"
+        ]
+    }
+    with open(os.path.join(cfg_dir, "config.jsonc"), "w") as f:
+        json.dump(fastfetch_config, f, indent=2)
+    log("fastfetch installed with SmechOS-branded default config.", color=GREEN)
 
 def phase_plasma_discover(target):
     log_phase("discover", "Compile Plasma Discover + PackageKit + SPK backend")
@@ -1618,8 +2053,16 @@ def phase_systemd(target):
     log(f"systemd {systemd_ver} installed.", color=GREEN)
 
 def phase_systemd_configure(target):
-    """Configure systemd units for KDE Plasma desktop (graphical target, SDDM)."""
-    log_phase("systemd-config", "Configure systemd for KDE Plasma desktop")
+    """Configure baseline systemd state (graphical target, machine-id, hostname).
+
+    Display-manager service enablement (SDDM/PLM) deliberately does NOT live
+    here: this phase runs right after "systemd" in the phase list, before
+    "kde" has built anything -- neither sddm nor plasmalogin exists on disk
+    yet at this point in a fresh build, so an os.path.exists() check here was
+    dead code on every from-scratch run. That logic lives in
+    phase_plasma_configure instead, which runs after "kde".
+    """
+    log_phase("systemd-config", "Configure baseline systemd state")
     ensure(os.path.join(target, "etc", "systemd", "system"))
 
     # default.target → graphical.target
@@ -1627,29 +2070,6 @@ def phase_systemd_configure(target):
     graphical    = "/lib/systemd/system/graphical.target"
     if not os.path.lexists(default_link):
         os.symlink(graphical, default_link)
-
-    # Enable SDDM
-    gfx_wants = os.path.join(target, "etc", "systemd", "system", "graphical.target.wants")
-    ensure(gfx_wants)
-    sddm_bin = os.path.join(target, "usr", "bin", "sddm")
-    if os.path.exists(sddm_bin):
-        sddm_unit = os.path.join(target, "etc", "systemd", "system", "sddm.service")
-        with open(sddm_unit, "w") as f:
-            f.write(textwrap.dedent("""\
-                [Unit]
-                Description=Simple Desktop Display Manager
-                After=systemd-user-sessions.service
-
-                [Service]
-                ExecStart=/usr/bin/sddm
-                Restart=always
-
-                [Install]
-                Alias=display-manager.service
-            """))
-        sddm_link = os.path.join(gfx_wants, "sddm.service")
-        if not os.path.lexists(sddm_link):
-            os.symlink(sddm_unit, sddm_link)
 
     # machine-id placeholder
     mid = os.path.join(target, "etc", "machine-id")
@@ -1663,7 +2083,7 @@ def phase_systemd_configure(target):
         with open(hn, "w") as f:
             f.write("smechos\n")
 
-    log("systemd desktop config applied.", color=GREEN)
+    log("Baseline systemd config applied.", color=GREEN)
 
 def phase_calamares(target):
     """Build Calamares graphical installer and its deps (yaml-cpp, kpmcore)."""
@@ -1921,6 +2341,239 @@ def phase_install_smechvisord(target):
     os.chmod(init, 0o755)
     log("smechvisord installed.", color=GREEN)
 
+# ── SmechOS Bitcoin Edition phases ──────────────────────────────────────────────
+#
+# NOTE: unlike the rest of this file, these four phases have not been build-
+# tested end-to-end -- there's no way to run a multi-hour Bitcoin Core
+# compile or validate OpenCL mining against a real old-Radeon card in this
+# environment. Written as carefully as reasoning-from-documentation allows;
+# expect real iteration once actually run on the target P5KPL-class hardware,
+# same as everything else in this pipeline that started as a first pass.
+
+def phase_mesa_cl(target):
+    """Narrow Mesa build: just Clover (OpenCL) + the r600 gallium driver.
+
+    Unlike phase_mesa() (built for the live-desktop profile -- Vulkan, EGL,
+    GLX, the works), this profile is headless and only needs GPU *compute*
+    for the miner, not a display stack. r600 covers the classic pre-GCN
+    Radeon HD 2000-6000 series (matches CONFIG_DRM_RADEON, not amdgpu).
+    """
+    log_phase("mesa-cl", f"Compile Mesa {MESA_VER} (Clover/OpenCL + r600 only)")
+    src     = sources(target)
+    tarball = os.path.join(src, f"mesa-{MESA_VER}.tar.xz")
+    download(MESA_URL, tarball)
+    bd = os.path.join(BUILD_TMP, "mesa-cl")
+    shutil.rmtree(bd, ignore_errors=True)
+    extract(tarball, bd)
+    meson_install(bd, f"{target}/usr",
+        extra_args=[
+            "-Dgallium-drivers=r600",
+            "-Dgallium-opencl=icd",
+            "-Dvulkan-drivers=",
+            "-Dglx=disabled", "-Degl=disabled", "-Dgbm=disabled",
+            "-Dopengl=false", "-Dgles1=disabled", "-Dgles2=disabled",
+            "-Dplatforms=", "-Dglvnd=disabled", "-Db_lto=false",
+        ],
+        env=build_env_bitcoin(target),
+        build_dir=os.path.join(BUILD_TMP, "mesa-cl-build"))
+    log(f"Mesa {MESA_VER} (Clover/r600) installed.", color=GREEN)
+
+def phase_bitcoind(target):
+    """Build Bitcoin Core from source via its own contrib/depends system.
+
+    depends builds Boost, libevent, sqlite, and everything else Bitcoin
+    Core needs from scratch in a self-contained way -- deliberately reused
+    here rather than hand-rolling separate from-source phases for each of
+    those (Bitcoin Core's own build system is the actively-maintained,
+    correct-by-construction way to get this dependency set right; this
+    pipeline has no way to independently verify hand-rolled equivalents
+    without a real build cycle).
+
+    NO_QT=1 skips the GUI entirely (headless target, no Qt needed here).
+    """
+    log_phase("bitcoind", f"Compile Bitcoin Core {BITCOIN_VER} (bitcoind, headless)")
+    src     = sources(target)
+    tarball = os.path.join(src, f"bitcoin-{BITCOIN_VER}.tar.gz")
+    download(BITCOIN_URL, tarball)
+    bd = os.path.join(BUILD_TMP, "bitcoin")
+    shutil.rmtree(bd, ignore_errors=True)
+    extract(tarball, bd)
+    env = build_env_bitcoin(target)
+    host_triplet = "x86_64-pc-linux-gnu"
+
+    run(["make", f"-j{nproc()}", f"HOST={host_triplet}",
+         "NO_QT=1", "NO_UPNP=1", "NO_NATPMP=1", "NO_ZMQ=1"],
+        cwd=os.path.join(bd, "depends"), env=env)
+
+    depends_prefix = os.path.join(bd, "depends", host_triplet)
+    run(["./autogen.sh"], cwd=bd, env=env)
+    run(["./configure", f"--prefix={depends_prefix}",
+         "--disable-tests", "--disable-bench", "--without-gui",
+         "--disable-fuzz-binary"],
+        cwd=bd, env=env)
+    run(["make", f"-j{nproc()}"], cwd=bd, env=env)
+
+    dest_bin = os.path.join(target, "usr", "bin")
+    ensure(dest_bin)
+    for binname in ("bitcoind", "bitcoin-cli"):
+        shutil.copy2(os.path.join(bd, "src", binname), os.path.join(dest_bin, binname))
+        os.chmod(os.path.join(dest_bin, binname), 0o755)
+    log(f"Bitcoin Core {BITCOIN_VER} (bitcoind, bitcoin-cli) installed.", color=GREEN)
+
+def phase_gpu_miner(target):
+    """Build sgminer (OpenCL GPU mining, cgminer's actively-maintained fork
+    for GPU support -- upstream cgminer dropped OpenCL/GPU mining in favor
+    of ASIC-only once GPU mining stopped being remotely competitive; sgminer
+    forked specifically to keep GPU support alive). --disable-curses since
+    this profile is headless -- no terminal to attach a local UI to anyway.
+    """
+    log_phase("gpu-miner", f"Compile sgminer {SGMINER_VER} (OpenCL)")
+    src     = sources(target)
+    tarball = os.path.join(src, f"sgminer-{SGMINER_VER}.tar.gz")
+    download(SGMINER_URL, tarball)
+    bd = os.path.join(BUILD_TMP, "sgminer")
+    shutil.rmtree(bd, ignore_errors=True)
+    extract(tarball, bd)
+    env = build_env_bitcoin(target)
+    run(["./autogen.sh"], cwd=bd, env=env, check=False)  # autogen.sh commonly warns, non-fatal
+    run(["./configure", f"--prefix={target}/usr",
+         "--enable-opencl", "--disable-curses", "--disable-adl"],
+        cwd=bd, env=env)
+    run(["make", f"-j{nproc()}"], cwd=bd, env=env)
+    run(["make", "install"], cwd=bd, env=env, sudo=(os.geteuid() != 0))
+    log(f"sgminer {SGMINER_VER} installed.", color=GREEN)
+
+def phase_bitcoin_services(target):
+    """Dedicated bitcoin system user, default bitcoin.conf (pruned -- assume
+    modest disk unless told otherwise), OpenRC services for bitcoind +
+    sgminer, and a minimal headless status page (no local display on this
+    profile, so status has to be network-reachable).
+
+    Also removes the sddm symlink phase_openrc() unconditionally wires into
+    the default runlevel for every profile -- this profile has no display
+    manager at all.
+    """
+    log_phase("bitcoin-services", "Configure bitcoind + sgminer services, status page")
+    etc = os.path.join(target, "etc")
+
+    passwd = os.path.join(etc, "passwd")
+    if os.path.exists(passwd):
+        with open(passwd) as f:
+            has_user = any(line.startswith("bitcoin:") for line in f)
+        if not has_user:
+            with open(passwd, "a") as f:
+                f.write("bitcoin:x:900:900:bitcoind service:/var/lib/bitcoind:/sbin/nologin\n")
+        group = os.path.join(etc, "group")
+        with open(group) as f:
+            has_group = any(line.startswith("bitcoin:") for line in f)
+        if not has_group:
+            with open(group, "a") as f:
+                f.write("bitcoin:x:900:\n")
+
+    data_dir = os.path.join(target, "var", "lib", "bitcoind")
+    ensure(data_dir)
+    bitcoin_conf_dir = os.path.join(etc, "bitcoin")
+    ensure(bitcoin_conf_dir)
+    with open(os.path.join(bitcoin_conf_dir, "bitcoin.conf"), "w") as f:
+        f.write(textwrap.dedent("""\
+            # Pruned mode -- assumes modest disk on old hardware. Raise or
+            # remove `prune` if the target has room for a full/unpruned node.
+            prune=550
+            server=1
+            daemon=0
+            datadir=/var/lib/bitcoind
+            rpcbind=127.0.0.1
+            rpcallowip=127.0.0.1
+        """))
+
+    init_dir = os.path.join(etc, "init.d")
+    ensure(init_dir)
+    bitcoind_init = os.path.join(init_dir, "bitcoind")
+    with open(bitcoind_init, "w") as f:
+        f.write(textwrap.dedent("""\
+            #!/sbin/openrc-run
+            name="bitcoind"
+            command="/usr/bin/bitcoind"
+            command_args="-conf=/etc/bitcoin/bitcoin.conf"
+            command_user="bitcoin:bitcoin"
+            command_background=true
+            pidfile="/run/bitcoind.pid"
+            depend() { need localmount net.lo; }
+        """))
+    os.chmod(bitcoind_init, 0o755)
+
+    sgminer_init = os.path.join(init_dir, "sgminer")
+    with open(sgminer_init, "w") as f:
+        f.write(textwrap.dedent("""\
+            #!/sbin/openrc-run
+            name="sgminer"
+            command="/usr/bin/sgminer"
+            command_args="--opencl-platform 0 --opencl-devices 0 -o localhost:0 --quiet"
+            command_background=true
+            pidfile="/run/sgminer.pid"
+            depend() { need bitcoind; }
+        """))
+    os.chmod(sgminer_init, 0o755)
+
+    status_dir = os.path.join(target, "usr", "share", "smechos-bitcoin")
+    ensure(status_dir)
+    with open(os.path.join(status_dir, "status.py"), "w") as f:
+        f.write(textwrap.dedent("""\
+            #!/usr/bin/env python3
+            # Minimal headless status page -- no local display on this
+            # profile, so this is the only way to see sync/mining state.
+            import json
+            import subprocess
+            from http.server import BaseHTTPRequestHandler, HTTPServer
+
+            def bitcoin_cli(*args):
+                try:
+                    out = subprocess.run(
+                        ["bitcoin-cli", "-conf=/etc/bitcoin/bitcoin.conf", *args],
+                        capture_output=True, text=True, timeout=10)
+                    return out.stdout.strip()
+                except Exception as e:
+                    return f"error: {e}"
+
+            class Handler(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    info = bitcoin_cli("getblockchaininfo")
+                    body = f"<pre>bitcoind:\\n{info}\\n</pre>"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html")
+                    self.end_headers()
+                    self.wfile.write(body.encode())
+
+            if __name__ == "__main__":
+                HTTPServer(("0.0.0.0", 8333), Handler).serve_forever()
+        """))
+    os.chmod(os.path.join(status_dir, "status.py"), 0o755)
+
+    status_init = os.path.join(init_dir, "smechos-bitcoin-status")
+    with open(status_init, "w") as f:
+        f.write(textwrap.dedent("""\
+            #!/sbin/openrc-run
+            name="smechos-bitcoin-status"
+            command="/usr/bin/python3"
+            command_args="/usr/share/smechos-bitcoin/status.py"
+            command_background=true
+            pidfile="/run/smechos-bitcoin-status.pid"
+            depend() { need bitcoind net.lo; }
+        """))
+    os.chmod(status_init, 0o755)
+
+    default_rl = os.path.join(etc, "runlevels", "default")
+    ensure(default_rl)
+    sddm_link = os.path.join(default_rl, "sddm")
+    if os.path.lexists(sddm_link):
+        os.remove(sddm_link)
+    for svc in ("bitcoind", "sgminer", "smechos-bitcoin-status"):
+        link = os.path.join(default_rl, svc)
+        if not os.path.lexists(link):
+            os.symlink(f"/etc/init.d/{svc}", link)
+
+    log("bitcoind + sgminer services configured, sddm disabled (headless profile).", color=GREEN)
+
 # ── ISO builders ──────────────────────────────────────────────────────────────
 
 def _grub_mkrescue(iso_path, work_dir, grub_cfg, files, label):
@@ -2118,7 +2771,7 @@ SMECHOS_PLASMA_LIVE_PHASES = [
     ("userland-glibc",  phase_bootstrap_userland_glibc, "Bootstrap GNU userland against host glibc"),
     ("etc",             phase_write_etc,                 "Write /etc skeleton"),
     ("systemd",         phase_systemd,                   "Install systemd from Debian packages"),
-    ("systemd-config",  phase_systemd_configure,         "Configure systemd for KDE Plasma desktop"),
+    ("systemd-config",  phase_systemd_configure,         "Configure baseline systemd state"),
     ("grub",            phase_grub,                      "Compile GRUB 2.12 EFI + BIOS"),
     ("qt-deps",         phase_qt_deps,                   "Compile Qt6 modules"),
     ("mesa",            phase_mesa,                      "Compile Mesa stack"),
@@ -2128,10 +2781,12 @@ SMECHOS_PLASMA_LIVE_PHASES = [
     ("libinput",           phase_libinput,               f"Build libinput {LIBINPUT_VER}"),
     # libeis skipped: gitlab releases require auth; not in kwin's REQUIRED list (EIS feature optional)
     ("kde",                phase_kde,                    "Compile KDE Frameworks + Plasma"),
-    ("plasma-configure",phase_plasma_configure,          "Configure Plasma/SDDM session"),
+    ("plasma-configure",phase_plasma_configure,          "Configure display manager (PLM, fallback SDDM)"),
     ("kwin-deps",       phase_kwin_deps,                 "Copy KWin dependencies"),
+    ("xwayland-deps",   phase_xwayland_deps,             "Fetch Xwayland + xkbcomp + xkb-data"),
     ("qt6uitools",      phase_qt6uitools,                "Ensure Qt6UITools present"),
     ("kernel",          phase_kernel,                    "Compile Linux 6.12.16"),
+    ("firmware",        phase_firmware,                  "Bundle GPU firmware (amdgpu + i915 + radeon)"),
     ("patch-metadata",  phase_patch_metadata,            "Patch metadata for SmechOS branding"),
     ("discover",        phase_plasma_discover,           "Compile Plasma Discover + PackageKit"),
     ("calamares",       phase_calamares,                 "Build Calamares graphical installer"),
@@ -2140,10 +2795,30 @@ SMECHOS_PLASMA_LIVE_PHASES = [
     ("bundle",          phase_bundle_packages,           "Bundle output into spk-installable .tar.xz packages"),
 ]
 
+# Headless, no desktop -- old LGA775 Pentium/Celeron (Core-derived, no
+# SSE4.2/AVX) + a pre-GCN Radeon card for OpenCL mining. Reuses the lean
+# OpenRC/no-desktop phases already proven by SMECHVISOR_PHASES, but glibc
+# for the userland (see build_env_bitcoin()) since Bitcoin Core and sgminer
+# are both far more commonly built against glibc than musl.
+SMECHOS_BITCOIN_PHASES = [
+    ("userland-glibc",     phase_bootstrap_userland_glibc, "Bootstrap GNU userland against host glibc"),
+    ("etc",                phase_write_etc,                 "Write /etc skeleton"),
+    ("openrc",              phase_openrc,                   "Deploy OpenRC"),
+    ("inittab",             phase_inittab,                  "Write inittab"),
+    ("kernel",              phase_kernel,                   "Compile Linux 6.12.16 (CONFIG_DRM_RADEON)"),
+    ("grub",                phase_grub,                     "Compile GRUB 2.12 EFI + BIOS"),
+    ("firmware",            phase_firmware,                 "Bundle GPU firmware (amdgpu + i915 + radeon)"),
+    ("mesa-cl",             phase_mesa_cl,                  f"Compile Mesa {MESA_VER} (Clover/OpenCL + r600 only)"),
+    ("bitcoind",            phase_bitcoind,                 f"Compile Bitcoin Core {BITCOIN_VER} (headless)"),
+    ("gpu-miner",           phase_gpu_miner,                f"Compile sgminer {SGMINER_VER} (OpenCL)"),
+    ("bitcoin-services",    phase_bitcoin_services,         "Configure bitcoind + sgminer services, status page"),
+]
+
 PROFILES = {
     "smechos":            SMECHOS_PHASES,
     "smechvisor":         SMECHVISOR_PHASES,
     "smechos-plasma-live": SMECHOS_PLASMA_LIVE_PHASES,
+    "smechos-bitcoin":     SMECHOS_BITCOIN_PHASES,
 }
 
 ISO_BUILDERS = {
