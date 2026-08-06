@@ -56,7 +56,12 @@ echo "package : $PKG-$VER  (track: $TRACK)"
 echo "rootfs  : $ROOT"
 echo "url     : $URL"
 
-[ -d "$ROOT/usr/lib/x86_64-linux-gnu" ] || { echo "ERROR: '$ROOT' does not look like a SmechOS rootfs"; exit 1; }
+# Check via sudo: an extracted rootfs is normally root-owned drwxr-x---, so
+# an unprivileged test cannot traverse it and would wrongly report a valid
+# rootfs as invalid. unsquashfs run under sudo produces exactly that mode,
+# which is the usual way to obtain one.
+sudo test -d "$ROOT/usr/lib/x86_64-linux-gnu" \
+    || { echo "ERROR: '$ROOT' does not look like a SmechOS rootfs"; exit 1; }
 command -v podman >/dev/null || { echo "ERROR: podman is required"; exit 1; }
 
 sudo mkdir -p "$WORK"
@@ -83,13 +88,19 @@ apt-get install -y -qq --no-install-recommends \
 # The rootfs is the same glibc as this container, so pointing the loader at
 # it is safe here (and is what lets its qtpaths/moc/msgfmt run natively).
 export LD_LIBRARY_PATH="$ROOT/usr/lib/x86_64-linux-gnu:$ROOT/usr/lib"
-export PATH="$ROOT/usr/bin:$PATH"
+# Rootfs bin goes LAST. Putting it first makes the rootfs's own cmake win
+# over the container's, and it then looks for its modules under a version
+# directory that does not exist there:
+#   Modules directory not found in <rootfs>/usr/share/cmake-3.28
+# cmake locates the rootfs's qtpaths/moc/msgfmt through CMAKE_PREFIX_PATH by
+# absolute path regardless, so nothing is lost by de-prioritising it here.
+export PATH="$PATH:$ROOT/usr/bin"
 
 echo "=== sanity: rootfs tools run natively ==="
 "$ROOT/usr/bin/qtpaths" --query QT_INSTALL_PREFIX
 
 rm -rf "$BD"; mkdir -p "$BD"; cd "$BD"
-cmake "$SRC" -G Ninja \
+/usr/bin/cmake "$SRC" -G Ninja \
     -DCMAKE_INSTALL_PREFIX=/usr \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_PREFIX_PATH="$ROOT/usr" \
@@ -97,8 +108,8 @@ cmake "$SRC" -G Ninja \
     -DCMAKE_INSTALL_RPATH=/usr/lib/x86_64-linux-gnu \
     -DBUILD_TESTING=OFF -DBUILD_QCH=OFF -DBUILD_PYTHON_BINDINGS=OFF
 
-ninja -j"$(nproc)"
-DESTDIR="$ROOT" cmake --install "$BD" | tee /tmp/install.log
+/usr/bin/ninja -j"$(nproc)"
+DESTDIR="$ROOT" /usr/bin/cmake --install "$BD" | tee /tmp/install.log
 
 # cmake bakes the staging path into RUNPATH even with
 # CMAKE_INSTALL_RPATH_USE_LINK_PATH=FALSE. Left alone that ships the

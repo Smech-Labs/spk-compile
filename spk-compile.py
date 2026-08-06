@@ -1747,6 +1747,11 @@ def phase_kde(target):
         # mandatory, not optional. Ships in the Plasma release alongside the
         # libs, and must stay version-matched to them.
         "kactivitymanagerd",
+        # milou provides the org.kde.milou QML module that KWin's Overview
+        # effect imports. Without it the effect fails at runtime with
+        # 'module "org.kde.milou" is not installed' -- a visible desktop
+        # feature breaking, not an optional extra.
+        "milou",
         # libplasma (was plasma-framework in KF5) ships with Plasma release
         "libplasma",
         # kdecoration provides KDecoration3; kwayland requires wayland >= 1.24 (now built)
