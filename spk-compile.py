@@ -1729,6 +1729,9 @@ def phase_kde(target):
         "syntax-highlighting",  # KF6SyntaxHighlighting: required by ktexteditor
         "ktexteditor",         # KF6TextEditor: text editor component (required by plasma-workspace)
         "kded",                # KF6KDED: KDE daemon infrastructure (required by plasma-workspace)
+        "kpty",                # KF6Pty: pseudo-terminal support. Hard requirement
+                               # of konsole and kwrited -- no terminal emulator can
+                               # be built without it.
         "networkmanager-qt",   # KF6NetworkManagerQt: REQUIRED by plasma-workspace on Linux
         "modemmanager-qt",     # KF6ModemManagerQt: required by plasma-nm for mobile broadband
         "kquickcharts",        # KF6QuickCharts: required by plasma-pa (volume applet charts)

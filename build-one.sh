@@ -25,6 +25,7 @@
 #
 #   ./build-one.sh spectacle 6.7.2 /path/to/rootfs
 #   ./build-one.sh konsole 25.08.3 /path/to/rootfs --gear
+#   ./build-one.sh kpty 6.27.0 /path/to/rootfs --kf6
 #
 # Plasma packages live under stable/plasma/<ver>/. KDE Gear applications
 # (Konsole, Dolphin, ...) live under stable/release-service/<ver>/src/ and
@@ -35,18 +36,30 @@ PKG="${1:-}"
 VER="${2:-}"
 ROOT="${3:-/home/smech/smechos-work/root}"
 TRACK="plasma"
-for a in "$@"; do [ "$a" = "--gear" ] && TRACK="gear"; done
+for a in "$@"; do
+    [ "$a" = "--gear" ] && TRACK="gear"
+    [ "$a" = "--kf6" ] && TRACK="kf6"
+done
 
 if [ -z "$PKG" ] || [ -z "$VER" ]; then
     sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
     exit 1
 fi
 
-if [ "$TRACK" = "gear" ]; then
-    URL="https://download.kde.org/stable/release-service/$VER/src/$PKG-$VER.tar.xz"
-else
-    URL="https://download.kde.org/stable/plasma/$VER/$PKG-$VER.tar.xz"
-fi
+case "$TRACK" in
+    gear)
+        URL="https://download.kde.org/stable/release-service/$VER/src/$PKG-$VER.tar.xz"
+        ;;
+    kf6)
+        # Frameworks nest under a major.minor directory while the tarball
+        # carries the full major.minor.patch -- 6.27.0 lives in 6.27/.
+        KF6_DIR="${VER%.*}"
+        URL="https://download.kde.org/stable/frameworks/$KF6_DIR/$PKG-$VER.tar.xz"
+        ;;
+    *)
+        URL="https://download.kde.org/stable/plasma/$VER/$PKG-$VER.tar.xz"
+        ;;
+esac
 
 WORK="${SMECH_BUILD_TMP:-/mnt/smechos_build_tmp}"
 SRC="$WORK/one-$PKG"
@@ -103,6 +116,14 @@ export LD_LIBRARY_PATH="$ROOT/usr/lib/x86_64-linux-gnu:$ROOT/usr/lib"
 # cmake locates the rootfs's qtpaths/moc/msgfmt through CMAKE_PREFIX_PATH by
 # absolute path regardless, so nothing is lost by de-prioritising it here.
 export PATH="$PATH:$ROOT/usr/bin"
+# Rootfs tools that look up data files by XDG path rather than through
+# CMAKE_PREFIX_PATH need this, otherwise they search their compiled-in
+# prefix -- which is empty inside the container. kdoctools is the usual
+# casualty: "kf.doctools.core: Error: Could not find kdoctools catalogs",
+# even though the catalogs are present in the rootfs.
+export XDG_DATA_DIRS="$ROOT/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+# DocBook entity resolution for packages that build handbooks.
+[ -f "$ROOT/etc/xml/catalog" ] && export XML_CATALOG_FILES="$ROOT/etc/xml/catalog"
 
 echo "=== sanity: rootfs tools run natively ==="
 "$ROOT/usr/bin/qtpaths" --query QT_INSTALL_PREFIX

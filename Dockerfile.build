@@ -34,11 +34,13 @@ ENV DEBIAN_FRONTEND=noninteractive
 # libx11-dev, libvulkan-dev: pulled in transitively via KF6KIO ->
 #   KF6WindowSystem -> find_dependency(X11), and Qt6Gui wants WrapVulkanHeaders.
 # libxkbcommon-dev, libwayland-dev: common to Plasma components.
+# libicu-dev: Konsole requires ICU >= 61. The rootfs ships ICU 74 and
+#   ubuntu:24.04 provides the matching 74 headers, so they agree.
+# libcups2-dev, zlib1g-dev: commonly probed by KDE applications.
 # gettext: several packages run msgfmt/msgmerge during build.
 RUN apt-get update -qq && \
     apt-get install -y -qq --no-install-recommends \
         build-essential \
-        cmake \
         ninja-build \
         pkg-config \
         patchelf \
@@ -48,9 +50,36 @@ RUN apt-get update -qq && \
         libvulkan-dev \
         libxkbcommon-dev \
         libwayland-dev \
+        libicu-dev \
+        libcups2-dev \
+        zlib1g-dev \
         ca-certificates \
+        curl \
         xz-utils \
     && rm -rf /var/lib/apt/lists/*
+
+# CMake from upstream binaries rather than the distro package.
+#
+# KDE Frameworks 6.27 declares cmake_minimum_required(VERSION 3.29), but
+# ubuntu:24.04 ships 3.28.3, so every KF6 package fails to configure with:
+#     CMake 3.29 or higher is required. You are running version 3.28.3
+#
+# The base image cannot be bumped to a newer Ubuntu -- 24.04 is glibc 2.39
+# to match the rootfs, and that is the entire reason builds are ABI-correct.
+# So the toolchain is upgraded in place instead.
+#
+# Pinned to 3.31.x deliberately: it satisfies KF6's floor, while CMake 4.x
+# drops compatibility with projects declaring minimums below 3.5 and would
+# break other packages in the tree.
+ARG CMAKE_VERSION=3.31.6
+RUN curl -fsSL -o /tmp/cmake.tar.gz \
+        "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz" && \
+    tar -xzf /tmp/cmake.tar.gz -C /opt && \
+    rm /tmp/cmake.tar.gz && \
+    ln -sf "/opt/cmake-${CMAKE_VERSION}-linux-x86_64/bin/cmake" /usr/local/bin/cmake && \
+    ln -sf "/opt/cmake-${CMAKE_VERSION}-linux-x86_64/bin/ctest" /usr/local/bin/ctest && \
+    ln -sf "/opt/cmake-${CMAKE_VERSION}-linux-x86_64/bin/cmake" /usr/bin/cmake && \
+    cmake --version | head -1
 
 # Sanity marker so build-one.sh can confirm it is running in the prepared
 # image rather than a bare ubuntu:24.04.
