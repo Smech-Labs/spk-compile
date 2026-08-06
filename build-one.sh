@@ -79,11 +79,19 @@ sudo tar --strip-components 1 -xf "$TARBALL" -C "$SRC"
 cat > "$WORK/one-build-inner.sh" <<'INNER'
 set -euo pipefail
 PKG="$1"; ROOT="$2"; SRC="$3"; BD="$4"
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq --no-install-recommends \
-    build-essential cmake ninja-build pkg-config patchelf \
-    libboost-dev libx11-dev libvulkan-dev libxkbcommon-dev libwayland-dev >/dev/null
+# The published image already has the toolchain, so skip the apt step --
+# that download is otherwise the slowest part of a run and repeats every
+# time. Falls back to installing when running on a bare ubuntu:24.04.
+if [ -f /etc/smechos-build-image ]; then
+    echo "=== prepared build image, toolchain present ==="
+else
+    echo "=== bare base image, installing toolchain ==="
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq --no-install-recommends \
+        build-essential cmake ninja-build pkg-config patchelf gettext \
+        libboost-dev libx11-dev libvulkan-dev libxkbcommon-dev libwayland-dev >/dev/null
+fi
 
 # The rootfs is the same glibc as this container, so pointing the loader at
 # it is safe here (and is what lets its qtpaths/moc/msgfmt run natively).
@@ -126,10 +134,23 @@ done
 echo "INSTALL_OK"
 INNER
 
-echo "=== building in ubuntu:24.04 ==="
+# Prefer the prepared image (toolchain baked in). If it cannot be obtained
+# -- offline, or before it has been published -- fall back to a bare
+# ubuntu:24.04 and let the inner script install the toolchain itself. The
+# base must stay 24.04 either way: it is glibc 2.39 like the rootfs, which
+# is the whole reason this builds correctly.
+IMAGE="${SMECH_BUILD_IMAGE:-ghcr.io/smech-labs/smechos-build:latest}"
+if ! sudo podman image exists "$IMAGE" 2>/dev/null; then
+    if ! sudo podman pull -q "$IMAGE" >/dev/null 2>&1; then
+        echo "note: $IMAGE unavailable, falling back to ubuntu:24.04"
+        IMAGE="ubuntu:24.04"
+    fi
+fi
+
+echo "=== building in $IMAGE ==="
 sudo podman run --rm --security-opt label=disable \
     -v "$ROOT:$ROOT" -v "$WORK:$WORK" \
-    ubuntu:24.04 bash "$WORK/one-build-inner.sh" "$PKG" "$ROOT" "$SRC" "$BD"
+    "$IMAGE" bash "$WORK/one-build-inner.sh" "$PKG" "$ROOT" "$SRC" "$BD"
 
 echo
 echo "Done. $PKG-$VER installed into $ROOT"
