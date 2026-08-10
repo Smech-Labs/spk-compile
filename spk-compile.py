@@ -43,7 +43,14 @@ import textwrap
 
 VERSION = "2.2.39"
 DEFAULT_TARGET = "/mnt/smechos_build_root"
-BUILD_TMP  = "/tmp/smechos_build"
+# Disk-backed, NOT /tmp: this host's /tmp is a 6.8G tmpfs (RAM-backed), and
+# a heavy parallel Qt6/KDE compile blows straight through that -- hit real
+# "Disk quota exceeded" errors on GCC's own .s/PCH temp files mid-build.
+# /mnt has 489G of real disk free. See also TMPDIR in build_env()/
+# build_env_glibc() -- BUILD_TMP alone doesn't cover GCC's OWN internal
+# temp files (those follow $TMPDIR, independently of where source is
+# extracted/built).
+BUILD_TMP  = "/mnt/smechos_build_tmp"
 STAMP_DIR  = "/mnt/spk-compile-sources/.stamps"  # persistent across reboots
 
 # Source versions
@@ -109,6 +116,34 @@ def err(msg):
     print(f"{RED}{BOLD}[ERROR]{R} {msg}", file=sys.stderr, flush=True)
     sys.exit(1)
 
+def _detect_gcc():
+    """Resolve a CC/CXX pair with GCC >= 14 (needed for std::ranges::to /
+    C++23 in libkscreen and other Plasma 6 packages). Hardcoding "gcc-14"
+    broke on this host, which only ships "gcc" (GCC 16, newer than the
+    requirement) -- no gcc-14 binary exists at all. Probe for whatever the
+    host actually calls its compiler instead of assuming a specific
+    versioned binary name exists.
+    """
+    for cc in ("gcc-14", "gcc-15", "gcc-16", "gcc-17", "gcc-18", "gcc"):
+        path = shutil.which(cc)
+        if not path:
+            continue
+        result = subprocess.run([cc, "-dumpversion"], capture_output=True, text=True)
+        if result.returncode != 0:
+            continue
+        try:
+            major = int(result.stdout.strip().split(".")[0])
+        except ValueError:
+            continue
+        if major < 14:
+            continue
+        cxx = cc.replace("gcc", "g++")
+        if not shutil.which(cxx):
+            continue
+        return cc, cxx
+    err("No GCC >= 14 found (need C++23's std::ranges::to for Plasma 6 "
+        "packages like libkscreen). Install a newer gcc/g++ package.")
+
 def _resolve_kde_versions():
     """Query download.kde.org and return (plasma_ver, kf6_minor, kf6_ver).
     Always resolves to the highest published stable release so builds never
@@ -149,7 +184,36 @@ def nproc():
     return str(os.cpu_count() or 4)
 
 def ensure(path):
-    os.makedirs(path, exist_ok=True)
+    """Create path, escalating via sudo if a parent (e.g. a bare-mounted
+    /mnt) is root-owned. Every other phase in this script does plain,
+    unprivileged file I/O once a directory exists, so a sudo-created dir is
+    chowned back to the invoking user rather than left root-owned -- leaving
+    it root-owned would just move this same PermissionError one level
+    deeper, into the first plain open()/write() call inside it.
+    """
+    try:
+        os.makedirs(path, exist_ok=True)
+    except PermissionError:
+        if os.geteuid() == 0:
+            raise
+        subprocess.run(["sudo", "mkdir", "-p", path], check=True)
+        subprocess.run(["sudo", "chown", "-R", f"{os.getuid()}:{os.getgid()}", path], check=True)
+
+def symlink(src, dst):
+    """os.symlink() with the same sudo-fallback as ensure() -- a parent
+    directory can end up root-owned (e.g. created by an earlier phase's
+    `sudo make install`) even when ensure() itself didn't need to escalate
+    for it (os.makedirs is a no-op on an already-existing dir, so it never
+    reveals whether that dir is actually writable). Hit this exact class of
+    bug on phase_systemd_configure's default.target symlink.
+    """
+    try:
+        os.symlink(src, dst)
+    except PermissionError:
+        if os.geteuid() == 0:
+            raise
+        subprocess.run(["sudo", "ln", "-sf", src, dst], check=True)
+        subprocess.run(["sudo", "chown", "-h", f"{os.getuid()}:{os.getgid()}", dst], check=True)
 
 def run(cmd, cwd=None, env=None, sudo=False, check=True):
     if sudo and os.geteuid() != 0:
@@ -223,6 +287,10 @@ def build_env(target):
     e["CC"]  = "musl-gcc"
     e["CXX"] = "musl-g++"
     e["FORCE_UNSAFE_CONFIGURE"] = "1"
+    # GCC's own internal temp files (.s, PCH) follow $TMPDIR, independent of
+    # BUILD_TMP -- route them off the tiny tmpfs /tmp too. See BUILD_TMP.
+    ensure(BUILD_TMP)
+    e["TMPDIR"] = BUILD_TMP
     return e
 
 def build_env_glibc(target):
@@ -230,20 +298,36 @@ def build_env_glibc(target):
     e = dict(os.environ)
     e["SMECH_TARGET"] = target
     e.pop("TARGET", None)
-    # Use GCC 14 — required for std::ranges::to (C++23) in libkscreen and other Plasma 6 packages
-    e["CC"]  = "gcc-14"
-    e["CXX"] = "g++-14"
+    # GCC >= 14 required for std::ranges::to (C++23) in libkscreen and other
+    # Plasma 6 packages. Probed rather than hardcoded -- see _detect_gcc().
+    e["CC"], e["CXX"] = _detect_gcc()
     prefix = f"{target}/usr"
     e["PATH"] = f"{prefix}/bin:{e.get('PATH', '/usr/local/bin:/usr/bin:/bin')}"
     e["PKG_CONFIG_PATH"] = (
         f"{prefix}/lib/x86_64-linux-gnu/pkgconfig:{prefix}/lib/pkgconfig:{prefix}/share/pkgconfig:"
         "/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig:/usr/lib/pkgconfig"
     )
-    e["CFLAGS"]   = f"-I{prefix}/include"
+    # -std=gnu17 (C only, NOT CXXFLAGS): GCC 14 switched its DEFAULT C
+    # dialect from gnu17 to gnu23, and that switch (not C89-vs-C99 age) is
+    # what broke bash's mkbuiltins.c -- gnu23 strictly checks old K&R
+    # empty-parens prototypes like `write_documentation();` as "zero
+    # arguments". -std=gnu89 "fixed" that but overcorrected: it also
+    # disallows C99 features (coreutils' `for (int i = ...)` loop-variable
+    # declarations), which regressed a different package. gnu17 -- GCC's
+    # own pre-14 default -- is the actually-correct middle ground: fully
+    # C99/C11-featured (coreutils is fine) without gnu23's new stricter
+    # K&R-prototype checking (bash is fine). Scoped to C only because
+    # C++23 strictness is the entire reason GCC>=14 is required here --
+    # loosening CXXFLAGS the same way would undermine that.
+    e["CFLAGS"]   = f"-I{prefix}/include -std=gnu17 -fpermissive"
     e["CXXFLAGS"] = f"-I{prefix}/include"
     e["LDFLAGS"]  = f"-L{prefix}/lib/x86_64-linux-gnu -L{prefix}/lib"
     e["LD_LIBRARY_PATH"] = f"{prefix}/lib/x86_64-linux-gnu:{prefix}/lib"
     e["FORCE_UNSAFE_CONFIGURE"] = "1"
+    # GCC's own internal temp files (.s, PCH) follow $TMPDIR, independent of
+    # BUILD_TMP -- route them off the tiny tmpfs /tmp too. See BUILD_TMP.
+    ensure(BUILD_TMP)
+    e["TMPDIR"] = BUILD_TMP
     return e
 
 # Set to True by cmd_build when the active profile uses glibc instead of musl.
@@ -346,11 +430,35 @@ def meson_install(src_dir, prefix, extra_args=None, env=None, build_dir=None):
     if os.path.exists(bd):
         shutil.rmtree(bd)
     target_root = _split_staging_prefix(prefix)
+    # meson/ninja are HOST-side orchestration tools (meson probes compilers/
+    # pkg-config; ninja is itself a dynamically-linked binary that has to
+    # start up before it can spawn anything) -- none of them may inherit
+    # LD_LIBRARY_PATH/PATH/PKG_CONFIG_PATH pointing at the target's own
+    # dirs, or the host's tools try to resolve THEIR OWN shared libraries
+    # (libpython, ninja's own libc dependency, etc.) against whatever
+    # happens to already exist in target/usr/lib -- which can be an
+    # incompatible version (hit this when target was pre-populated from an
+    # existing built rootfs rather than built fresh; a from-scratch build
+    # never has its own target/usr/lib/.../libc.so.6 yet by the time these
+    # tools first run, which is why this was latent rather than a
+    # from-scratch-build bug -- first hit as a meson/python crash, then as
+    # meson's own pkg-config/cmake subprocess probes picking up stale
+    # target-bundled configs, then as ninja itself crashing on startup).
+    # meson_install() is only used for low-level meson-based C libraries
+    # (Mesa, Wayland, libinput) that don't need to execute target-built
+    # codegen tools mid-build the way Qt6/KDE's separate CMake path does,
+    # so it's safe to strip these for all three steps here, not just setup.
+    host_env = dict(env) if env else dict(os.environ)
+    host_env.pop("LD_LIBRARY_PATH", None)
+    host_env["PATH"] = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
+    host_env["PKG_CONFIG_PATH"] = os.environ.get(
+        "PKG_CONFIG_PATH",
+        "/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig:/usr/lib/pkgconfig")
     run(["meson", "setup", bd, src_dir,
          "--prefix=/usr", "--buildtype=release",
-         ] + (extra_args or []), env=env)
-    run(["ninja", "-C", bd, "-j", nproc()], env=env)
-    install_env = dict(env) if env else dict(os.environ)
+         ] + (extra_args or []), env=host_env)
+    run(["ninja", "-C", bd, "-j", nproc()], env=host_env)
+    install_env = dict(host_env)
     install_env["DESTDIR"] = target_root
     run(["ninja", "-C", bd, "install"], env=install_env, sudo=(os.geteuid() != 0))
 
@@ -505,7 +613,7 @@ def phase_openrc(target):
             dst = os.path.join(rl, svc)
             if not os.path.lexists(dst):
                 try:
-                    os.symlink(f"/etc/init.d/{svc}", dst)
+                    symlink(f"/etc/init.d/{svc}", dst)
                 except FileExistsError:
                     pass
     log("OpenRC deployed.", color=GREEN)
@@ -561,13 +669,23 @@ def phase_kernel(target):
         CONFIG_DRM_NOUVEAU=m
         CONFIG_DRM_I915=y
         CONFIG_DRM_RADEON=m
+        CONFIG_DRM_VIRTIO_GPU=m
         CONFIG_FW_LOADER_COMPRESS=y
         CONFIG_FW_LOADER_COMPRESS_XZ=y
     """)
     with open(os.path.join(bd, ".config"), "a") as f:
         f.write(extras)
     run(["make", "olddefconfig"], cwd=bd, env=env)
-    run(["make", "-j", nproc(), "bzImage", "modules"], cwd=bd, env=env)
+    # GCC 16 is newer than this kernel (6.12.16) was tested against and
+    # promotes several warnings to hard errors under -Werror that older GCC
+    # treated as non-fatal: unterminated ACPICA signature-array initializers
+    # (include/acpi/actbl*.h) and a harmless set-but-unused local in
+    # drivers/gpu/drm/amd/amdgpu/amdgpu_gart.c. Neither is a real bug, so
+    # disable just these two warnings-as-errors rather than patch sources.
+    kcflags = ("-Wno-error=unterminated-string-initialization "
+               "-Wno-error=unused-but-set-variable")
+    run(["make", "-j", nproc(), f"KCFLAGS={kcflags}", "bzImage", "modules"],
+        cwd=bd, env=env)
 
     boot = os.path.join(target, "boot")
     ensure(boot)
@@ -753,7 +871,7 @@ def phase_qt_deps(target):
     for sopath in glob.glob(f"{prefix}/lib/libQt6*.so*"):
         dest = os.path.join(arch_libdir, os.path.basename(sopath))
         if not os.path.lexists(dest):
-            os.symlink(sopath, dest)
+            symlink(sopath, dest)
     log("Qt6 arch-dir symlinks created.", color=GREEN)
 
 CMAKE_BOOTSTRAP_VER = "3.31.6"
@@ -792,19 +910,377 @@ def phase_mesa(target):
     bd = os.path.join(BUILD_TMP, "mesa")
     shutil.rmtree(bd, ignore_errors=True)
     extract(tarball, bd)
+    _patch_mesa_c11_threads(bd)
+    _patch_mesa_clc_clang_api(bd)
+    _patch_mesa_ac_llvm_api(bd)
+    _patch_mesa_loader_wayland_timespec(bd)
+    # Mesa doesn't depend on anything from target/usr -- it's built early
+    # (before Wayland/KDE, which DO need to link against target-installed
+    # Qt6/etc.), so the -I{target}/include / -L{target}/lib CFLAGS/LDFLAGS
+    # that later phases legitimately need are actively harmful here: Mesa's
+    # own intel_clc build tool links against BOTH Mesa's static libs AND
+    # host LLVM/libedit shared libraries in the same command, and with
+    # -L{target}/lib/x86_64-linux-gnu searched first, the linker resolves
+    # glibc itself from there -- RC1's older bundled libc.so, which is
+    # missing GLIBC_2.42-versioned termios symbols (cfgetispeed etc.) that
+    # the HOST's libedit.so.0 was built against ("undefined reference to
+    # cfgetispeed@GLIBC_2.42"). Same root cause as the meson/ninja
+    # env fixes above, just showing up in linker flags instead of PATH/
+    # LD_LIBRARY_PATH this time. Strip the target -I/-L entirely for Mesa.
+    mesa_env = dict(active_env(target))
+    mesa_env["CFLAGS"]   = "-std=gnu17 -fpermissive"
+    mesa_env["CXXFLAGS"] = ""
+    mesa_env["LDFLAGS"]  = ""
     meson_install(bd, f"{target}/usr",
         extra_args=[
             "-Dgallium-drivers=radeonsi,nouveau,iris,crocus,r300,svga,virgl,zink,swrast",
-            "-Dvulkan-drivers=amd,intel",
+            "-Dvulkan-drivers=amd,intel,virtio",
             "-Dglx=dri", "-Degl=enabled", "-Dgbm=enabled",
             "-Dopengl=true", "-Dgles1=enabled", "-Dgles2=enabled",
             "-Dshared-glapi=enabled",
             "-Dplatforms=x11,wayland",
             "-Dglvnd=enabled", "-Db_lto=false",
+            # Intel ray-tracing (GRL) pulls in the intel-clc compiler, which
+            # uses internal clang::driver::Driver/llvm::Target C++ APIs that
+            # genuinely changed between whatever LLVM Mesa 24.3.4 was built
+            # against and LLVM 22.x on this host (Driver::GetResourcesPath
+            # removed, Target::createTargetMachine's first param changed
+            # from const char* to const llvm::Triple&) -- a real upstream
+            # API break, not an environment issue. Ray tracing acceleration
+            # is irrelevant to both VirtIO GPU (virgl/venus) and basic
+            # Intel integrated graphics (e.g. the NUC7PJYHN's i915) -- the
+            # rest of the intel Vulkan driver builds and works fine without
+            # it, so disable just this piece rather than dropping intel
+            # from vulkan-drivers entirely.
+            "-Dintel-rt=disabled",
         ],
-        env=active_env(target),
+        env=mesa_env,
         build_dir=os.path.join(BUILD_TMP, "mesa-build"))
     log(f"Mesa {MESA_VER} installed.", color=GREEN)
+
+def _patch_tar_acl(bd):
+    """tar 1.35's src/xattrs.c hand-rolls three private static "at"-variant
+    wrappers around libacl (its own comment: "acl-at wrappers, TODO: move to
+    gnulib in future?"): acl_delete_def_file_at, acl_get_file_at, and
+    acl_set_file_at. Fedora 44's libacl-devel 2.4.0 has since added *real*,
+    differently-signed (extra at_flags int) functions of all three exact
+    names to the public sys/acl.h -- a genuine name collision with tar's
+    private helpers, not a dialect/strictness issue, so no CFLAGS change
+    fixes it. (file_has_acl_at is untouched -- it's gnulib-only, never
+    existed in libacl's public API, confirmed absent from sys/acl.h.)
+    Rename tar's three private symbols out of the way of the now-real
+    system functions of the same name.
+    """
+    path = os.path.join(bd, "src", "xattrs.c")
+    with open(path) as f:
+        txt = f.read()
+    replacements = [
+        ("static int acl_delete_def_file_at (int, char const *);",
+         "static int tar_acl_delete_def_file_at (int, char const *);"),
+        ("#define AT_FUNC_NAME acl_delete_def_file_at",
+         "#define AT_FUNC_NAME tar_acl_delete_def_file_at"),
+        ("if (acl_delete_def_file_at (chdir_fd, file_name))",
+         "if (tar_acl_delete_def_file_at (chdir_fd, file_name))"),
+        ("static acl_t acl_get_file_at (int, const char *, acl_type_t);",
+         "static acl_t tar_acl_get_file_at (int, const char *, acl_type_t);"),
+        ("#define AT_FUNC_NAME acl_get_file_at",
+         "#define AT_FUNC_NAME tar_acl_get_file_at"),
+        ("if (!(acl = acl_get_file_at (parentfd, file_name, type)))",
+         "if (!(acl = tar_acl_get_file_at (parentfd, file_name, type)))"),
+        ("static int acl_set_file_at (int, const char *, acl_type_t, acl_t);",
+         "static int tar_acl_set_file_at (int, const char *, acl_type_t, acl_t);"),
+        ("#define AT_FUNC_NAME acl_set_file_at",
+         "#define AT_FUNC_NAME tar_acl_set_file_at"),
+        ("if (acl_set_file_at (chdir_fd, file_name, type, acl) == -1)",
+         "if (tar_acl_set_file_at (chdir_fd, file_name, type, acl) == -1)"),
+    ]
+    missing = [old for old, _ in replacements if old not in txt]
+    if missing:
+        err(f"_patch_tar_acl: expected string(s) not found in xattrs.c "
+            f"(tar source changed?): {missing}")
+    for old, new in replacements:
+        txt = txt.replace(old, new)
+    with open(path, "w") as f:
+        f.write(txt)
+    log("Patched tar/src/xattrs.c: renamed private acl_{delete_def,get,set}_file_at "
+        "to avoid colliding with libacl 2.4.0's new functions of the same names.",
+        color=GREEN)
+
+def _patch_mesa_c11_threads(bd):
+    """Mesa 24.3.4 deliberately keeps HAVE_THRD_CREATE (real glibc C11
+    <threads.h>) restricted to Android in meson.build:
+
+        if cc.has_function('thrd_create', prefix: '#include <threads.h>')
+          if with_platform_android
+            # Current only Android's c11 <threads.h> are verified
+            pre_args += '-DHAVE_THRD_CREATE'
+
+    That gate is intentional and correct, not a bug to route around --
+    confirmed by trying exactly that first: enabling it broadly makes
+    src/util/cnd_monotonic.c fail to compile, because it passes an mtx_t*
+    directly to pthread_cond_wait()/pthread_cond_timedwait() (which expect
+    pthread_mutex_t*), relying on Mesa's own mtx_t being a bare typedef
+    alias of pthread_mutex_t -- true for Mesa's pthread-based shim, NOT
+    guaranteed for glibc's real (opaque) C11 mtx_t. Mesa's own codebase
+    genuinely isn't audited for that outside Android, so leave
+    HAVE_THRD_CREATE/mtx_t/cnd_t/thrd_t alone entirely.
+
+    The ACTUAL, narrower problem: on glibc >= 2.34, <stdlib.h> unconditionally
+    pulls in <bits/types/once_flag.h>, which declares once_flag/call_once
+    regardless of whether HAVE_THRD_CREATE is set -- so Mesa's own
+    once_flag typedef + call_once() declaration (in c11/threads.h) and
+    definition (in c11/impl/threads_posix.c) collide with glibc's, even
+    though nothing else about C11 threads is being used. glibc's call_once
+    is a real, strong exported libc symbol (confirmed via `nm -D libc.so.6`),
+    so this needs guards in BOTH the header (declaration) and the impl file
+    (definition), not just one -- otherwise a link-time duplicate-symbol
+    error replaces the compile-time conflicting-types error. mtx_t/cnd_t/
+    thrd_t stay exactly as Mesa's own pthread-based typedefs throughout;
+    only the two colliding names are affected, and only when glibc's own
+    guard macro proves they're already declared.
+    """
+    header_path = os.path.join(bd, "src", "c11", "threads.h")
+    with open(header_path) as f:
+        header = f.read()
+    header_old = (
+        "typedef pthread_once_t  once_flag;\n"
+        "#  define ONCE_FLAG_INIT PTHREAD_ONCE_INIT\n"
+    )
+    header_new = (
+        "#ifndef __once_flag_defined\n"
+        "typedef pthread_once_t  once_flag;\n"
+        "#  define ONCE_FLAG_INIT PTHREAD_ONCE_INIT\n"
+        "#endif\n"
+    )
+    call_once_old = "void call_once(once_flag *, void (*)(void));\n"
+    call_once_new = (
+        "#ifndef __once_flag_defined\n"
+        "void call_once(once_flag *, void (*)(void));\n"
+        "#endif\n"
+    )
+    if header_old not in header or call_once_old not in header:
+        err("_patch_mesa_c11_threads: expected once_flag/call_once "
+            "declarations not found in c11/threads.h (mesa source changed?)")
+    header = header.replace(header_old, header_new).replace(call_once_old, call_once_new)
+    with open(header_path, "w") as f:
+        f.write(header)
+
+    impl_path = os.path.join(bd, "src", "c11", "impl", "threads_posix.c")
+    with open(impl_path) as f:
+        impl = f.read()
+    impl_old = (
+        "void\n"
+        "call_once(once_flag *flag, void (*func)(void))\n"
+        "{\n"
+        "    pthread_once(flag, func);\n"
+        "}\n"
+    )
+    impl_new = (
+        "#ifndef __once_flag_defined\n"
+        "void\n"
+        "call_once(once_flag *flag, void (*func)(void))\n"
+        "{\n"
+        "    pthread_once(flag, func);\n"
+        "}\n"
+        "#endif\n"
+    )
+    if impl_old not in impl:
+        err("_patch_mesa_c11_threads: expected call_once() definition not "
+            "found in c11/impl/threads_posix.c (mesa source changed?)")
+    with open(impl_path, "w") as f:
+        f.write(impl.replace(impl_old, impl_new))
+    log("Patched mesa c11/threads.h + threads_posix.c: defer to glibc's "
+        "native once_flag/call_once (a real symbol collision on glibc "
+        ">= 2.34) without touching mtx_t/cnd_t/thrd_t or HAVE_THRD_CREATE.",
+        color=GREEN)
+
+def _patch_mesa_clc_clang_api(bd):
+    """src/compiler/clc/clc_helpers.cpp (intel-clc's internal-shader
+    compiler, needed by both the Intel Vulkan driver AND iris/OpenGL --
+    "-Dintel-rt=disabled" does NOT skip this, it's required regardless)
+    already has #if LLVM_VERSION_MAJOR guards for several past Clang/LLVM
+    API breaks, but three more calls broke again on LLVM/Clang 22.x, past
+    what Mesa 24.3.4 (built against an older LLVM) anticipated:
+
+    1. clang::driver::Driver::GetResourcesPath() was removed entirely (not
+       just resignatured -- Mesa's own ">= 20" branch already calls a
+       1-arg form that doesn't exist either). Traced what it actually
+       computed instead of guessing: clang_path is the real path to the
+       loaded libclang shared library (via dladdr), and CLANG_RESOURCE_DIR
+       (already a macro Mesa's own "< 20" branch references, currently
+       "../lib/clang/22") is a relative suffix joined against that
+       library's parent directory -- so compute it directly with
+       std::filesystem instead of calling the now-removed API, for every
+       LLVM version, replacing both existing branches with one.
+    2. CompilerInvocation::TargetOpts changed from a plain public
+       TargetOptions value to a protected std::shared_ptr<TargetOptions>
+       -- direct member access no longer compiles at all regardless of
+       dereferencing, use the existing public getTargetOpts() accessor
+       instead (which already dereferences it internally).
+    3. Target::createTargetMachine()'s first parameter changed from
+       const char* to const llvm::Triple& -- wrap the existing triple
+       string in llvm::Triple(...).
+    4. TextDiagnosticPrinter's constructor took DiagnosticOptions* before;
+       now it takes DiagnosticOptions& -- Mesa's call still does
+       &c->getDiagnosticOpts(), taking the address of a function that
+       already returns a reference (producing a pointer where a
+       reference is now required). Drop the &.
+
+    None of these change what gets computed, only how -- same resource
+    path, same target options object, same SPIR-V triple, same
+    diagnostics options, just expressed against the current API shape.
+    """
+    path = os.path.join(bd, "src", "compiler", "clc", "clc_helpers.cpp")
+    with open(path) as f:
+        txt = f.read()
+
+    diag_opts_old = (
+        "   c->createDiagnostics(new clang::TextDiagnosticPrinter(\n"
+        "                           diag_log_stream,\n"
+        "                           &c->getDiagnosticOpts()));\n"
+    )
+    diag_opts_new = (
+        "   c->createDiagnostics(new clang::TextDiagnosticPrinter(\n"
+        "                           diag_log_stream,\n"
+        "                           c->getDiagnosticOpts()));\n"
+    )
+
+    # A second, separate occurrence of the same DiagnosticOptions*/&
+    # mismatch, in a different function -- a DiagnosticsEngine constructed
+    # directly via brace-init instead of through CompilerInstance's
+    # createDiagnostics() helper. Two distinct problems in this one block:
+    # DiagnosticsEngine's own 2nd constructor arg now wants
+    # DiagnosticOptions& too (was pointer-accepting before), and the same
+    # &c->getDiagnosticOpts() pattern as above is nested inside it.
+    diag_engine_old = (
+        "   clang::DiagnosticsEngine diag {\n"
+        "      new clang::DiagnosticIDs,\n"
+        "      new clang::DiagnosticOptions,\n"
+        "      new clang::TextDiagnosticPrinter(diag_log_stream,\n"
+        "                                       &c->getDiagnosticOpts())\n"
+        "   };\n"
+    )
+    diag_engine_new = (
+        "   clang::DiagnosticsEngine diag {\n"
+        "      new clang::DiagnosticIDs,\n"
+        "      *new clang::DiagnosticOptions,\n"
+        "      new clang::TextDiagnosticPrinter(diag_log_stream,\n"
+        "                                       c->getDiagnosticOpts())\n"
+        "   };\n"
+    )
+
+    resource_path_old = (
+        "   auto tmp_res_path =\n"
+        "#if LLVM_VERSION_MAJOR >= 20\n"
+        "      Driver::GetResourcesPath(std::string(clang_path));\n"
+        "#else\n"
+        "      Driver::GetResourcesPath(std::string(clang_path), CLANG_RESOURCE_DIR);\n"
+        "#endif\n"
+    )
+    resource_path_new = (
+        "   auto tmp_res_path =\n"
+        "      (fs::path(clang_path).parent_path() / CLANG_RESOURCE_DIR).string();\n"
+    )
+
+    target_opts_old = (
+        "   c->setTarget(clang::TargetInfo::CreateTargetInfo(\n"
+        "                   c->getDiagnostics(), c->getInvocation().TargetOpts));\n"
+    )
+    target_opts_new = (
+        "   c->setTarget(clang::TargetInfo::CreateTargetInfo(\n"
+        "                   c->getDiagnostics(), c->getInvocation().getTargetOpts()));\n"
+    )
+
+    triple_old = (
+        "         auto TM = target->createTargetMachine(\n"
+        "            triple, \"\", \"\", {}, std::nullopt, std::nullopt,\n"
+    )
+    triple_new = (
+        "         auto TM = target->createTargetMachine(\n"
+        "            llvm::Triple(triple), \"\", \"\", {}, std::nullopt, std::nullopt,\n"
+    )
+
+    missing = [name for name, old in [
+        ("TextDiagnosticPrinter diag opts arg", diag_opts_old),
+        ("DiagnosticsEngine brace-init block", diag_engine_old),
+        ("GetResourcesPath block", resource_path_old),
+        ("TargetOpts call", target_opts_old),
+        ("createTargetMachine triple arg", triple_old),
+    ] if old not in txt]
+    if missing:
+        err(f"_patch_mesa_clc_clang_api: expected string(s) not found in "
+            f"clc_helpers.cpp (mesa source changed?): {missing}")
+
+    txt = (txt.replace(diag_opts_old, diag_opts_new)
+              .replace(diag_engine_old, diag_engine_new)
+              .replace(resource_path_old, resource_path_new)
+              .replace(target_opts_old, target_opts_new)
+              .replace(triple_old, triple_new))
+    with open(path, "w") as f:
+        f.write(txt)
+    log("Patched mesa clc_helpers.cpp for Clang/LLVM 22.x API changes: "
+        "fixed two DiagnosticOptions pointer/reference mismatches "
+        "(TextDiagnosticPrinter's arg + DiagnosticsEngine's own brace-init "
+        "constructor), removed Driver::GetResourcesPath (computed the "
+        "same path directly), switched to the public getTargetOpts() "
+        "accessor (the field itself is now protected), wrapped the "
+        "SPIR-V triple in llvm::Triple for createTargetMachine.",
+        color=GREEN)
+
+def _patch_mesa_ac_llvm_api(bd):
+    """src/amd/llvm/ac_llvm_helper.cpp (radeonsi's LLVM-based shader
+    compiler helper) hits the same class of LLVM 22.x API break as
+    clc_helpers.cpp, just a different call: llvm::Module::setTargetTriple()
+    used to take a std::string/StringRef, now takes a llvm::Triple
+    directly. Mesa's code still converts TM->getTargetTriple() (already a
+    Triple) down to a string via .getTriple() before passing it -- drop
+    that conversion and pass the Triple straight through.
+    """
+    path = os.path.join(bd, "src", "amd", "llvm", "ac_llvm_helper.cpp")
+    with open(path) as f:
+        txt = f.read()
+    old = "   unwrap(module)->setTargetTriple(TM->getTargetTriple().getTriple());\n"
+    new = "   unwrap(module)->setTargetTriple(TM->getTargetTriple());\n"
+    if old not in txt:
+        err("_patch_mesa_ac_llvm_api: expected setTargetTriple() call not "
+            "found in ac_llvm_helper.cpp (mesa source changed?)")
+    with open(path, "w") as f:
+        f.write(txt.replace(old, new))
+    log("Patched mesa ac_llvm_helper.cpp: pass llvm::Triple directly to "
+        "setTargetTriple() instead of converting to std::string first "
+        "(LLVM 22.x API change).", color=GREEN)
+
+def _patch_mesa_loader_wayland_timespec(bd):
+    """src/loader/loader_wayland_helper.c calls timespec_sub_saturate()
+    (declared in util/timespec.h) but never includes that header -- a
+    genuine missing #include in Mesa's own source, not an API/environment
+    issue. Presumably not exercised in Mesa's usual CI build configuration.
+    Confirmed the exact include convention against two other Mesa files
+    that use the same function (cnd_monotonic.c, lp_fence.c): both use
+    #include "util/timespec.h".
+    """
+    path = os.path.join(bd, "src", "loader", "loader_wayland_helper.c")
+    with open(path) as f:
+        txt = f.read()
+    old = (
+        "#include \"util/perf/cpu_trace.h\"\n"
+        "\n"
+        "#include \"loader_wayland_helper.h\"\n"
+    )
+    new = (
+        "#include \"util/perf/cpu_trace.h\"\n"
+        "#include \"util/timespec.h\"\n"
+        "\n"
+        "#include \"loader_wayland_helper.h\"\n"
+    )
+    if old not in txt:
+        err("_patch_mesa_loader_wayland_timespec: expected include block "
+            "not found in loader_wayland_helper.c (mesa source changed?)")
+    with open(path, "w") as f:
+        f.write(txt.replace(old, new))
+    log("Patched mesa loader_wayland_helper.c: added missing "
+        "#include \"util/timespec.h\" for timespec_sub_saturate().",
+        color=GREEN)
 
 def _patch_kwin_vulkan(bd):
     """Patch kwin Vulkan files for GCC 14 C++23: ResultValue<T> structured bindings not supported.
@@ -1176,7 +1652,7 @@ def _symlink_arch_libs(target):
         if ".so" in fname and fname.startswith("lib"):
             dest = os.path.join(top_dir, fname)
             if not os.path.lexists(dest):
-                os.symlink(os.path.join("x86_64-linux-gnu", fname), dest)
+                symlink(os.path.join("x86_64-linux-gnu", fname), dest)
 
 def _build_xkbregistry(target, profile="smechos-plasma-live"):
     """Rebuild libxkbcommon 1.6.0 with xkbregistry enabled (not in Ubuntu packages)."""
@@ -1253,6 +1729,9 @@ def phase_kde(target):
         "syntax-highlighting",  # KF6SyntaxHighlighting: required by ktexteditor
         "ktexteditor",         # KF6TextEditor: text editor component (required by plasma-workspace)
         "kded",                # KF6KDED: KDE daemon infrastructure (required by plasma-workspace)
+        "kpty",                # KF6Pty: pseudo-terminal support. Hard requirement
+                               # of konsole and kwrited -- no terminal emulator can
+                               # be built without it.
         "networkmanager-qt",   # KF6NetworkManagerQt: REQUIRED by plasma-workspace on Linux
         "modemmanager-qt",     # KF6ModemManagerQt: required by plasma-nm for mobile broadband
         "kquickcharts",        # KF6QuickCharts: required by plasma-pa (volume applet charts)
@@ -1264,6 +1743,18 @@ def phase_kde(target):
     plasma = [
         # plasma-activities must precede libplasma
         "plasma-activities", "plasma-activities-stats",
+        # kactivitymanagerd is the *daemon* behind plasma-activities' client
+        # libs. plasmashell hard-aborts shell load if it is not running
+        # ("Aborting shell load: The activity manager daemon ... is not
+        # running"), leaving a black screen with only a cursor -- so it is
+        # mandatory, not optional. Ships in the Plasma release alongside the
+        # libs, and must stay version-matched to them.
+        "kactivitymanagerd",
+        # milou provides the org.kde.milou QML module that KWin's Overview
+        # effect imports. Without it the effect fails at runtime with
+        # 'module "org.kde.milou" is not installed' -- a visible desktop
+        # feature breaking, not an optional extra.
+        "milou",
         # libplasma (was plasma-framework in KF5) ships with Plasma release
         "libplasma",
         # kdecoration provides KDecoration3; kwayland requires wayland >= 1.24 (now built)
@@ -1431,7 +1922,7 @@ def phase_plasma_configure(target):
             ensure(gfx_wants)
             link = os.path.join(gfx_wants, "plasmalogin.service")
             if not os.path.lexists(link):
-                os.symlink(unit, link)
+                symlink(unit, link)
         else:
             log("plasmalogin binary present but no systemd unit shipped with it "
                 "-- service not enabled.", color=YELLOW)
@@ -1469,7 +1960,7 @@ def phase_plasma_configure(target):
         ensure(gfx_wants)
         link = os.path.join(gfx_wants, "sddm.service")
         if not os.path.lexists(link):
-            os.symlink(sddm_unit_path, link)
+            symlink(sddm_unit_path, link)
     log("SDDM configured (fallback).", color=GREEN)
 
 def phase_kwin_deps(target):
@@ -1570,7 +2061,7 @@ def phase_xwayland_deps(target):
         soname = f"{parts[0]}.so.{parts[1].split('.')[0]}"
         link = os.path.join(arch_libdir, soname)
         if not os.path.lexists(link):
-            os.symlink(base, link)
+            symlink(base, link)
 
     log("Xwayland + xkbcomp + xkb-data installed.", color=GREEN)
 
@@ -1936,6 +2427,8 @@ def phase_bootstrap_userland_glibc(target):
         bd = os.path.join(BUILD_TMP, name)
         shutil.rmtree(bd, ignore_errors=True)
         extract(tarball, bd)
+        if name == "tar":
+            _patch_tar_acl(bd)
         run(["./configure", f"--prefix={pfix}"] + flags, cwd=bd, env=env)
         run(["make", "-j", nproc()], cwd=bd, env=env)
         run(["make", "install"], cwd=bd, env=env, sudo=(os.geteuid() != 0))
@@ -2069,7 +2562,7 @@ def phase_systemd_configure(target):
     default_link = os.path.join(target, "etc", "systemd", "system", "default.target")
     graphical    = "/lib/systemd/system/graphical.target"
     if not os.path.lexists(default_link):
-        os.symlink(graphical, default_link)
+        symlink(graphical, default_link)
 
     # machine-id placeholder
     mid = os.path.join(target, "etc", "machine-id")
@@ -2262,7 +2755,7 @@ def phase_live_initramfs(target):
     for applet in ["sh", "mount", "mkdir", "ln", "switch_root", "mdev"]:
         link = os.path.join(init_tree, "bin", applet)
         if not os.path.lexists(link):
-            os.symlink("busybox", link)
+            symlink("busybox", link)
 
     # Live init script
     init_script = os.path.join(init_tree, "init")
@@ -2570,7 +3063,7 @@ def phase_bitcoin_services(target):
     for svc in ("bitcoind", "sgminer", "smechos-bitcoin-status"):
         link = os.path.join(default_rl, svc)
         if not os.path.lexists(link):
-            os.symlink(f"/etc/init.d/{svc}", link)
+            symlink(f"/etc/init.d/{svc}", link)
 
     log("bitcoind + sgminer services configured, sddm disabled (headless profile).", color=GREEN)
 
