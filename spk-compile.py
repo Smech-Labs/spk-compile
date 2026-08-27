@@ -2968,6 +2968,7 @@ def phase_bundle_packages(target):
         "usr/lib/libc.so", "usr/lib/libm.so",
         "etc/passwd", "etc/group", "etc/shells", "etc/hostname",
         "etc/hosts", "etc/resolv.conf", "etc/fstab", "etc/os-release",
+        "etc/spk-repo-conf.yaml",
     ])
 
     tar_paths("kernel-modules", [
