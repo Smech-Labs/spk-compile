@@ -34,13 +34,258 @@ ENV DEBIAN_FRONTEND=noninteractive
 # libx11-dev, libvulkan-dev: pulled in transitively via KF6KIO ->
 #   KF6WindowSystem -> find_dependency(X11), and Qt6Gui wants WrapVulkanHeaders.
 # libxkbcommon-dev, libwayland-dev: common to Plasma components.
+# libglib2.0-dev: Qt6's corelib/gui/xcb-plugin/glib-networkinformation
+#   CMakeLists all pull in the GLIB2::GLIB2 imported target (via
+#   pkg-config), which resolves to a non-existent include path without
+#   the dev headers -- same "runtime .so already present, headers
+#   missing" gap as the rest of this list.
+# libxml2-dev: wayland's src/meson.build depends on libxml-2.0 (for
+#   wayland-scanner's protocol XML parsing) -- same gap again.
+# libmtdev-dev, libevdev-dev, libudev-dev, libwacom-dev: libinput's
+#   meson.build hard-requires libudev/mtdev/libevdev, and defaults
+#   libwacom (tablet identification) to enabled -- same gap again, all
+#   four confirmed present at runtime in the target rootfs already.
+# libical-dev: kcalendarcore hard-requires LibIcal >= 3.0 (find_package
+#   REQUIRED). Unlike the rest of this list, the target rootfs has NO
+#   libical runtime .so at all yet -- phase_kde separately copies the
+#   container's own libical*.so* into the target's arch lib dir once,
+#   since KF6CalendarCore.so will carry a real NEEDED entry for it.
+# libfreetype-dev, libfontconfig1-dev, libx11-xcb-dev, libxkbcommon-x11-dev,
+# libxcb-{util,render0,shape0,xfixes0,sync,shm0,icccm4,image0,keysyms1,randr0,
+#   render-util0,xinerama0,xkb,cursor,res0}-dev: Qt6's qtbase CMake feature
+#   checks (fontconfig/xcb) force these features ON but fail hard if the dev
+#   headers aren't present to satisfy them, even though the target rootfs
+#   already ships every one of these libraries' matching runtime .so -- same
+#   "headers only" gap as libicu-dev/libbz2-dev above. libxcb-res0-dev
+#   specifically is needed later too, by KWin's XCB_RES probe.
+#   libxcb-dpms0-dev is needed by libkscreen's KF6ScreenDpms (XCB::DPMS).
+#   libxcb-xtest0-dev is needed by kscreenlocker (XCB_XTEST) -- unlike the
+#   rest of this list, the target rootfs has no runtime libxcb-xtest at
+#   all either, so phase_kde copies it in like libical/libhunspell/etc.
+#   libxcb-composite0-dev, libxcb-dri3-dev, libxcb-present-dev,
+#   libxcb-xinput-dev: kwin's own FindXCB.cmake additionally requires
+#   COMPOSITE/DRI3/PRESENT/XINPUT -- target rootfs already ships all four
+#   matching runtime .so, just the headers were missing.
+# libpipewire-0.3-dev: kwin's screencast plugin (PkgConfig::PipeWire) --
+#   target rootfs already ships matching libpipewire-0.3.so.0.1202.0.
+# libxft-dev, libxcb-damage0-dev: plasma-workspace requires X11's Xft
+#   component and XCB_DAMAGE -- target rootfs already ships matching
+#   libXft.so.2.3.6/libxcb-damage.so.0.0.0.
+# libdbus-1-dev: plasma-workspace's components/dbus also needs D-Bus
+#   headers directly -- target rootfs already ships libdbus-1.so.3.32.4.
+# libxkbfile-dev, libibus-1.0-dev: plasma-desktop's kcms/keyboard KCM
+#   (X11::xkbfile) and kimpanel's ibus input-method backend -- target
+#   rootfs already ships matching libxkbfile.so.1.0.2/libibus-1.0.so.5.0.529.
+# libxxf86vm-dev: kgamma (gamma-correction KCM) needs X11's XF86VidMode --
+#   target rootfs already ships matching libXxf86vm.so.1.0.0.
+# sassc: breeze-gtk (GTK theme matching Breeze) compiles its .scss sources
+#   with sassc at build time -- pure build tool, not a runtime dependency.
+# python3-cairo: breeze-gtk also needs the Python cairo module to render
+#   its theme assets at build time.
+# libavcodec-dev, libavutil-dev, libavformat-dev, libavfilter-dev,
+# libswscale-dev, libva-dev, libgbm-dev: kpipewire (screen-recording/
+#   screencast backend, needed by kwin's screencast plugin and
+#   plasma-workspace's remote-desktop portal) hard-requires the full
+#   FFmpeg codec/format/filter/scale stack plus VA-API and GBM. Unlike
+#   most of this list, the target rootfs has NO FFmpeg/VA-API runtime at
+#   all yet (only libgbm already exists) -- phase_kde copies the rest in
+#   the same way as libical/libhunspell/etc.
+# freerdp3-dev: krdp (KDE's RDP remote-desktop server, needed alongside
+#   kpipewire for remote-desktop portal support) hard-requires FreeRDP
+#   >= 3.1 -- again nothing in the target rootfs at all, including its
+#   companion WinPR runtime libs (libwinpr*), both copied in by phase_kde.
+# gsettings-desktop-schemas: kde-gtk-config's FindGSettingSchemas.cmake
+#   does a pure find_path() sanity check for GNOME's standard schema file
+#   at build time -- not linked against, no runtime seeding needed.
+# libgtk-3-dev: kde-gtk-config's real requirement is only gtk+-3.0
+#   (REQUIRED) -- GTK4 isn't actually referenced anywhere in its
+#   CMakeLists despite the list's old comment suggesting otherwise, so
+#   libgtk-4-dev was deliberately not added (would have needed a full
+#   GTK4 runtime seed into the target, which nothing here actually needs).
+#   Target rootfs already ships matching libgtk-3.so.0.2409.32.
+# libflatpak-dev: flatpak-kcm needs flatpak >= 0.11.8 -- target rootfs
+#   already ships matching libflatpak.so.0.11508.0.
+# xserver-xorg-input-wacom: wacomtablet's pkg_check_modules(xorg-wacom
+#   REQUIRED) is a pure presence/version check (grepped its whole source
+#   tree -- the resulting PkgConfig::XORGWACOM target is never actually
+#   linked against anywhere), so this only needs to exist in the
+#   container for the build; no runtime seeding needed.
+# libopencv-dev: spectacle needs OpenCV >= 4.7 (find_package REQUIRED),
+#   but ubuntu:24.04 only ships 4.6.0 -- see _patch_spectacle_opencv() in
+#   spk-compile.py for why lowering that floor is safe here. Target rootfs
+#   has no OpenCV runtime at all; phase_kde copies just the core/imgproc
+#   modules spectacle actually links (not the full OpenCV suite).
+# libyaml-dev: AppStream (used by Discover) needs yaml-0.1 via
+#   pkg-config/cmake -- target rootfs already ships matching libyaml-0.so.2.0.9.
+# libstemmer-dev: AppStream also needs the Snowball stemmer library --
+#   target rootfs already ships matching libstemmer.so.0d.0.0.
+# gobject-introspection: AppStream also needs the actual g-ir-scanner
+#   build tool binary (libglib2.0-dev only provides the pkg-config
+#   metadata referencing it, not the executable itself). Pure build tool,
+#   no runtime seeding needed.
+# itstool: AppStream also needs it (XML translation via gettext PO files
+#   for its data/ docs) -- pure build tool, no runtime seeding needed.
+# xsltproc: AppStream also needs it (docs/ subdir XSLT processing, probed
+#   regardless of -Ddocs=false) -- pure build tool, no runtime seeding needed.
+# libsqlite3-dev: PackageKit (Discover's package-manager backend) needs
+#   sqlite3 -- target rootfs already ships matching libsqlite3.so.0.8.6.
+# valac: PackageKit also needs vapigen (generates Vala .vapi bindings for
+#   packagekit-glib2) -- provided by the valac package. Pure build tool,
+#   no runtime seeding needed.
+# bash-completion: PackageKit's contrib/ also needs bash-completion's
+#   pkg-config metadata (locates the completions install dir), no runtime
+#   seeding needed for the build itself.
+# libpolkit-gobject-1-dev: PackageKit's msgfmt --xml step needs gettext
+#   ITS rules for PolicyKit's .policy XML format (/usr/share/gettext/its/
+#   polkit.its), shipped by this package -- target rootfs already ships
+#   matching libpolkit-gobject-1.so.0.0.0.
+# libcurl4-openssl-dev, libxmlb-dev: AppStream's actual C sources need
+#   real headers for both (pkg-config already found their .pc files from
+#   elsewhere, but not the headers) -- target rootfs already ships
+#   matching libcurl.so.4.8.0/libxmlb.so.2.0.0.
+# libzxing-dev: spectacle's main binary unconditionally links
+#   KF6::PrisonScanner, so prison needs WITH_ZXING=ON (see spk-compile.py's
+#   pkg_extra) -- Ubuntu universe ships a real ZXingConfig.cmake. Target
+#   rootfs has no ZXing runtime at all; phase_kde copies it in.
+# libplymouth-dev: plymouth-kcm's FindPlymouth.cmake only reads pkg-config
+#   path variables (pluginsdir/themesdir) at configure time -- it never
+#   actually links against libplymouth, so this is purely a build-time
+#   need; no runtime plymouth install exists (or is needed) in the target
+#   rootfs, since SmechOS's live boot uses its own busybox initramfs, not
+#   plymouth, for the splash.
+# libxext-dev, libxrender-dev, libxrandr-dev, libxcursor-dev, libxi-dev,
+#   libxtst-dev, libxdamage-dev, libxcomposite-dev, libxinerama-dev,
+#   libice-dev, libsm-dev, libxfixes-dev: KF6WindowSystem and friends link
+#   against the matching X11::* imported targets (X11::Xfixes first surfaced
+#   this) -- same gap, whole batch checked and confirmed present at runtime
+#   in the target rootfs up front instead of one-at-a-time.
 # libicu-dev: Konsole requires ICU >= 61. The rootfs ships ICU 74 and
 #   ubuntu:24.04 provides the matching 74 headers, so they agree.
 # libcups2-dev, zlib1g-dev: commonly probed by KDE applications.
+# libbz2-dev: systemd's compress.c includes bzlib.h directly. The rootfs
+#   already ships libbz2.so.1.0.8 and ubuntu:24.04's libbz2-1.0 runtime is
+#   the exact same 1.0.8 build, so only the header is missing here --
+#   same story as libicu-dev above.
 # gettext: several packages run msgfmt/msgmerge during build.
+# liblmdb-dev: baloo's on-disk index storage (KF6Baloo hard-requires LMDB).
+# libdrm-dev: kinfocenter's about-distro KCM (GPU info) needs libdrm headers.
+# docbook-xml: kdoctools' kdedbx45.dtd hardcodes an absolute reference to
+#   /usr/share/xml/docbook/schema/dtd/4.5/docbookx.dtd -- not a catalog
+#   lookup, not $ROOT-relative -- so any package building a handbook needs
+#   the real DocBook 4.5 DTD present in the container itself at that path.
+# docbook-xsl: same story, but for the HTML stylesheets (meinproc6 imports
+#   /usr/share/xml/docbook/stylesheet/docbook-xsl/html/*.xsl by absolute
+#   path) -- required to actually render a handbook, not just validate it.
+# liburi-perl: kdoctools' kdoctools_encode_uri() cmake macro shells out to
+#   a perl script that `use`s URI::Escape.
+# libxslt1-dev: kdoctools also hard-requires LibXslt (processes DocBook XML
+#   for the help system) -- target rootfs already ships libxslt.so.1.1.39.
+# libhunspell-dev: sonnet (KF6Sonnet) hard-requires at least one spell-check
+#   backend (aspell/hspell/hunspell/voikko); none were present at all.
+#   Hunspell chosen as the standard modern choice (matches Firefox/
+#   LibreOffice/most distros). Like libical, the target rootfs has no
+#   runtime libhunspell either -- phase_kde copies it in the same way.
+# python3-lxml: breeze-icons' icon-generation script imports lxml to build
+#   breeze-icons.qrc from the SVG sources.
+# libsecret-1-dev: kwallet hard-requires libsecret-1 via pkg-config. Like
+#   libical/libhunspell, the target rootfs has no runtime libsecret either
+#   -- phase_kde copies it in the same way.
+# libnm-dev: networkmanager-qt (KF6NetworkManagerQt) hard-requires libnm
+#   >= 1.4.0 via pkg-config. Like libical/libhunspell/libsecret, the target
+#   rootfs has no runtime libnm either -- phase_kde copies it in the same way.
+# libmm-glib-dev: modemmanager-qt (KF6ModemManagerQt) hard-requires
+#   ModemManager's glib bindings; like libnm above, no runtime in the
+#   target rootfs -- phase_kde copies it in the same way.
+# libpulse-dev: pulseaudio-qt (KF6PulseAudioQt, required by plasma-pa)
+#   includes pulse/*.h directly -- target rootfs already ships matching
+#   libpulse.so.0.24.2, only the header is missing.
+# libqrencode-dev, libdmtx-dev: prison (barcode/QR generator) hard-requires
+#   both regardless of -DWITH_ZXING=OFF (that only disables the separate
+#   zxing-cpp scanner backend) -- target rootfs already ships matching
+#   libqrencode.so.4/libdmtx.so.0.
+# python3-pip: drkonqi vendors pygdbmi/psutil/sentry-sdk into its data dir
+#   via `pip install --target` at build time (find_program(pip) must succeed).
+# libpam0g-dev: kwallet-pam is a PAM module -- needs PAM headers to build at all.
+# libgcrypt20-dev: kwallet-pam's pam_kwallet.c includes gcrypt.h directly.
+# meson/python3-mako: systemd (and wayland/wayland-protocols) build with
+#   meson, not cmake.
+# liblz4-dev, libacl1-dev, libseccomp-dev, libarchive-dev: systemd's
+#   meson.build detects all of these as `feature`-type options defaulting
+#   to 'auto', silently enabling them without headers genuinely being
+#   available (acl-util.c: #include <acl/libacl.h> fails the same way
+#   compress.c's lz4.h and libarchive-util.c's archive.h did). Each only
+#   surfaced on the first truly-fresh systemd rebuild all session (every
+#   earlier attempt skipped it via a stale phase stamp) -- expect more of
+#   this class of gap from other systemd feature options as the fresh
+#   rebuild proceeds. All also need their runtime .so seeded into the
+#   target -- systemd links a hard NEEDED entry for each once enabled.
+#   See phase_systemd's own seed step.
+# gperf: meson_install() deliberately strips PATH back to the bare host
+#   PATH before invoking meson/ninja (see its own comment -- this stops
+#   those HOST-side tools from resolving their own shared libs against
+#   target/usr/lib). systemd's meson.build calls find_program('gperf'),
+#   so a self-built gperf installed only under the target rootfs prefix
+#   is invisible to it -- gperf needs to be a host tool for the same
+#   reason meson/ninja/cmake already are.
+# python3-jinja2: systemd's meson.build templates several generated files
+#   (e.g. standard-conf, sysusers/tmpfiles fragments) through Jinja2 at
+#   configure time -- it imports the module directly into the same host
+#   python3 that meson itself runs under.
+# gawk: GRUB's grub-core/genmoddep.awk calls asorti(), a gawk-only
+#   extension (sorts an array by index) -- ubuntu:24.04's default `awk`
+#   alternative is mawk, which doesn't implement it at all, so GRUB's
+#   `make` fails at the moddep.lst generation step. Forced as the active
+#   `awk` alternative below since mawk is a required/essential package
+#   and would otherwise still win by default priority.
+# bison/flex/bc/libssl-dev/libelf-dev/dwarves: standard Linux kernel build
+#   requirements (Kconfig parser, BTF/pahole for debuginfo).
+# cpio: live initramfs packing. rsync/kmod: kernel install + module tooling.
+# libkmod-dev: lets systemd build with -Dkmod=enabled, so udev can actually
+#   auto-load =m drivers (e.g. virtio_gpu) for hotplugged/PCI-probed hardware
+#   -- without it meson silently disables kmod support and nothing ever
+#   auto-loads a module-only driver on live boot, on real hardware or QEMU.
+# python3-dev: phase_calamares passes -DWITH_PYTHON=ON to Calamares' cmake
+#   configure, but without Python.h/libpython3 present CMake's FindPython3
+#   silently drops embedded-Python support rather than failing the build --
+#   confirmed via a real boot test: `calamares` launches, but every stock
+#   job module shipped with Calamares 3.3.10 that's genuinely still
+#   interface: python upstream (mount/unpackfs/fstab/localecfg/etc.) refuses
+#   to load with "Python modules are not supported in this version of
+#   Calamares", making the installer non-functional past the welcome page.
+# None of the above were needed for build-one.sh's KDE-only single-package
+# builds, but are for the full spk-compile.py orchestrator, which this
+# image is now also used for.
+# gcc-14/g++-14: default `gcc`/`g++` on 24.04 is GCC 13, but libkscreen and
+#   other Plasma 6 packages need C++23's std::ranges::to, which requires
+#   GCC >= 14. Ubuntu 24.04 ships gcc-14 directly in universe (no PPA
+#   needed) -- spk-compile.py's _detect_gcc() already probes for a binary
+#   literally named "gcc-14" before falling back to bare "gcc", so no
+#   further configuration is needed once this package is present.
 RUN apt-get update -qq && \
     apt-get install -y -qq --no-install-recommends \
         build-essential \
+        gcc-14 \
+        g++-14 \
+        meson \
+        python3-mako \
+        python3-dev \
+        liblz4-dev \
+        libacl1-dev \
+        libseccomp-dev \
+        libarchive-dev \
+        libkmod-dev \
+        python3-jinja2 \
+        gperf \
+        gawk \
+        bison \
+        flex \
+        bc \
+        libssl-dev \
+        libelf-dev \
+        cpio \
+        rsync \
+        kmod \
+        dwarves \
         ninja-build \
         pkg-config \
         patchelf \
@@ -50,13 +295,211 @@ RUN apt-get update -qq && \
         libvulkan-dev \
         libxkbcommon-dev \
         libwayland-dev \
+        libglib2.0-dev \
+        libxml2-dev \
+        libmtdev-dev \
+        libevdev-dev \
+        libudev-dev \
+        libwacom-dev \
+        libfreetype-dev \
+        libfontconfig1-dev \
+        libx11-xcb-dev \
+        libxkbcommon-x11-dev \
+        libxcb-util-dev \
+        libxcb-render0-dev \
+        libxcb-shape0-dev \
+        libxcb-xfixes0-dev \
+        libxcb-sync-dev \
+        libxcb-shm0-dev \
+        libxcb-icccm4-dev \
+        libxcb-image0-dev \
+        libxcb-keysyms1-dev \
+        libxcb-randr0-dev \
+        libxcb-render-util0-dev \
+        libxcb-xinerama0-dev \
+        libxcb-xkb-dev \
+        libxcb-cursor-dev \
+        libxcb-res0-dev \
+        libxcb-dpms0-dev \
+        libxcb-xtest0-dev \
+        libxcb-composite0-dev \
+        libxcb-dri3-dev \
+        libxcb-present-dev \
+        libxcb-xinput-dev \
+        libpipewire-0.3-dev \
+        libxft-dev \
+        libxcb-damage0-dev \
+        libdbus-1-dev \
+        libxkbfile-dev \
+        libibus-1.0-dev \
+        libxxf86vm-dev \
+        sassc \
+        python3-cairo \
+        libavcodec-dev \
+        libavutil-dev \
+        libavformat-dev \
+        libavfilter-dev \
+        libswscale-dev \
+        libva-dev \
+        libgbm-dev \
+        freerdp3-dev \
+        gsettings-desktop-schemas \
+        libgtk-3-dev \
+        libflatpak-dev \
+        xserver-xorg-input-wacom \
+        libopencv-dev \
+        libyaml-dev \
+        libstemmer-dev \
+        gobject-introspection \
+        itstool \
+        xsltproc \
+        libsqlite3-dev \
+        valac \
+        bash-completion \
+        libpolkit-gobject-1-dev \
+        libcurl4-openssl-dev \
+        libxmlb-dev \
+        libzxing-dev \
+        libplymouth-dev \
+        libxfixes-dev \
+        libxext-dev \
+        libxrender-dev \
+        libxrandr-dev \
+        libxcursor-dev \
+        libxi-dev \
+        libxtst-dev \
+        libxdamage-dev \
+        libxcomposite-dev \
+        libxinerama-dev \
+        libice-dev \
+        libsm-dev \
+        libical-dev \
         libicu-dev \
         libcups2-dev \
         zlib1g-dev \
+        libbz2-dev \
+        liblmdb-dev \
+        libdrm-dev \
+        docbook-xml \
+        docbook-xsl \
+        liburi-perl \
+        libxslt1-dev \
+        libhunspell-dev \
+        python3-lxml \
+        libsecret-1-dev \
+        libnm-dev \
+        libmm-glib-dev \
+        libpulse-dev \
+        libqrencode-dev \
+        libdmtx-dev \
+        python3-pip \
+        libpam0g-dev \
+        libgcrypt20-dev \
         ca-certificates \
         curl \
         xz-utils \
+        llvm-20-dev \
+        libclang-cpp20-dev \
+        libclang-20-dev \
+        libclc-20 \
+        libclc-20-dev \
+        libllvmspirvlib-20-dev \
+        spirv-tools \
+        libwayland-egl-backend-dev \
+        libxcb-glx0-dev \
+        squashfs-tools \
+        grub-pc-bin \
+        grub-efi-amd64-bin \
+        xorriso \
+        mtools \
+        libxcb-dri2-0-dev \
+        x11proto-dev \
+        libxshmfence-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Mesa (with vulkan-drivers=amd,intel,virtio + gallium-drivers including
+# iris) sets with_intel_clc=true unconditionally for Anv/Iris's internal
+# shaders regardless of -Dintel-rt=disabled (see phase_mesa's own comment) --
+# this pulls in dependency('libclc'), dependency('LLVM'), dependency('Clang')
+# and (since with_clc implies clover_spirv-style SPIR-V support)
+# dependency('LLVMSPIRVLib') + dependency('SPIRV-Tools') too, none of which
+# exist in a base ubuntu:24.04 image (confirmed via dpkg -l -- zero llvm-dev/
+# clang packages, only two transitively-pulled runtime .so's).
+#
+# Pinned to LLVM 20 specifically (Ubuntu's own newest packaged major,
+# directly apt-installable -- no apt.llvm.org repo, no building
+# SPIRV-LLVM-Translator from source to version-match a newer LLVM) rather
+# than LLVM 22: verified directly against real upstream headers
+# (llvmorg-20.1.2 tags on github.com/llvm/llvm-project) that Mesa 24.3.4's
+# UNPATCHED source already compiles clean against LLVM 20's API shape --
+# TextDiagnosticPrinter still takes DiagnosticOptions* (not &), Compiler
+# Invocation::TargetOpts is still re-exposed public via a `using` decl (not
+# yet protected-only), and Target::createTargetMachine's first param is
+# still StringRef (not const llvm::Triple&). Those three are exactly what
+# _patch_mesa_clc_clang_api/_patch_mesa_ac_llvm_api rewrite for LLVM 22.x --
+# applying those patches against LLVM 20 would therefore break compilation
+# the other direction, so phase_mesa now runtime-detects the installed
+# llvm-config major version and only applies them if it's actually >= 22.
+#
+# libclc-20/-dev: dependency('libclc') -- ships libclc.pc + prebuilt bitcode.
+# llvm-20-dev: dependency('LLVM', method:'config-tool') -- llvm-config-20 +
+#   static component libs (target/linker/irreader/coverage/etc modules).
+# libclang-cpp20-dev: mesa's cpp.find_library('clang-cpp', ...) fallback (and
+#   the individual clangBasic/clangAST/etc modules if that fails).
+# libclang-20-dev: separate package from libclang-cpp20-dev -- ships Clang's
+#   own generated clang/Config/config.h (confirmed via apt-file), which
+#   clc_helpers.cpp #includes directly. libclang-cpp*-dev alone doesn't
+#   provide it (verified: build failed on exactly this missing header with
+#   only libclang-cpp20-dev installed).
+# libllvmspirvlib-20-dev, spirv-tools: dependency('LLVMSPIRVLib')/
+#   dependency('SPIRV-Tools') -- both required once with_clc is true.
+#
+# libwayland-egl-backend-dev: separate Debian/Ubuntu package from
+#   libwayland-dev (which only ships wayland-client/cursor/egl/server.pc) --
+#   confirmed via dpkg -L that libwayland-dev alone does NOT provide
+#   wayland-egl-backend.pc. Mesa's own EGL Wayland platform implements this
+#   interface (it's the backend, not a consumer of one), so only the header
+#   is needed at Mesa's build time -- no runtime seeding into target, and no
+#   version-matching concern against the later self-built "wayland" phase.
+#
+# libxcb-glx0-dev: Mesa's X11/GLX platform requires dependency('xcb-glx',
+#   '>= 1.8.1') directly -- not part of the existing libxcb-* list added
+#   for KDE/kwin above (that list's FindXCB.cmake components don't overlap
+#   with what Mesa's own meson.build checks for GLX).
+#
+# libxcb-dri2-0-dev: the dri gallium target's own dri_target.c meson.build
+#   unconditionally links -lxcb-dri2 regardless of with_x11_dri2 (that option
+#   only gates the separate legacy-X11 DRI2/GLX code path) -- confirmed via
+#   the real link failure ("cannot find -lxcb-dri2") after a full clean
+#   compile, not a configure-time dependency() check at all.
+#
+# x11proto-dev: umbrella X11 protocol headers package -- provides
+#   glproto.pc and dri2proto.pc (confirmed via apt-file), both hard-required
+#   by Mesa's GLX=dri path (dep_glproto unconditional under with_glx=='dri';
+#   dep_dri2proto only under with_dri_platform=='drm', which is Linux's
+#   only real value). libxxf86vm-dev (already present above, for kgamma)
+#   happens to also satisfy Mesa's xxf86vm dependency -- same package,
+#   no separate addition needed there.
+# libxshmfence-dev: dep_xshmfence required both under GLX=dri (drm platform)
+#   and under with_any_vk (true here: vulkan-drivers=amd,intel,virtio) --
+#   X shared-memory fences, used for present/sync.
+#
+# squashfs-tools, grub-pc-bin, grub-efi-amd64-bin, xorriso, mtools:
+#   phase_iso_live_smechos's mksquashfs + _grub_mkrescue calls need these --
+#   none were ever installed since no ISO-packing phase had been exercised
+#   until now. grub-pc-bin (BIOS boot image) + grub-efi-amd64-bin (EFI boot
+#   image) + xorriso (actual ISO9660 authoring) + mtools (FAT manipulation
+#   for the EFI boot partition image) together are what grub-mkrescue needs
+#   to produce a real BIOS+EFI hybrid bootable ISO.
+#
+# llvm-config symlink: the meson version in this image (see
+# mesonbuild/environment.py's get_llvm_tool_names()) only tries suffixes up
+# to "-17"/"17" when auto-discovering llvm-config -- it predates LLVM 20 and
+# will never find "llvm-config-20" on its own. The bare "llvm-config" name
+# (no suffix) IS the first name it tries, so symlinking it to the real
+# versioned binary is the fix, not a meson upgrade (meson itself is fine;
+# the version resolution is what's stale).
+RUN ln -sf /usr/bin/llvm-config-20 /usr/bin/llvm-config
 
 # CMake from upstream binaries rather than the distro package.
 #
@@ -80,6 +523,9 @@ RUN curl -fsSL -o /tmp/cmake.tar.gz \
     ln -sf "/opt/cmake-${CMAKE_VERSION}-linux-x86_64/bin/ctest" /usr/local/bin/ctest && \
     ln -sf "/opt/cmake-${CMAKE_VERSION}-linux-x86_64/bin/cmake" /usr/bin/cmake && \
     cmake --version | head -1
+
+# Force gawk as the `awk` alternative -- see the gawk comment above.
+RUN update-alternatives --set awk /usr/bin/gawk
 
 # Sanity marker so build-one.sh can confirm it is running in the prepared
 # image rather than a bare ubuntu:24.04.

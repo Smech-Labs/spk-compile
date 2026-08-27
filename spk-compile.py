@@ -38,6 +38,8 @@ import shutil
 import urllib.request
 import time
 import textwrap
+import struct
+import zlib
 
 # ── Version & constants ───────────────────────────────────────────────────────
 
@@ -58,8 +60,18 @@ LINUX_VER      = "6.12.16"
 GRUB_VER       = "2.12"
 MUSL_VER       = "1.2.5"
 QT6_VER        = "6.10.3"
-PLASMA_VER     = "6.7.2"
-KF6_VER        = "6.27.0"
+# SmechOS tracks the "bullet-proof KDE" LTS line (Kubuntu Focus +
+# Techpaladin Software + KDE e.V., announced August 2026 -- 3 years of
+# backported fixes across Plasma/Frameworks/Gear, through ~2029) instead
+# of chasing the newest Plasma release every cycle. See _resolve_kde_versions
+# for why: that function enforces this pin at build time, not just these
+# two defaults. PLASMA_VER/KF6_VER below are the last-known-good point
+# release within the pinned line, refreshed by that resolver; the LTS_MINOR
+# constants are the actual pin and only change on a deliberate LTS-line move.
+PLASMA_LTS_MINOR = "6.6"
+KF6_LTS_MINOR    = "6.24"
+PLASMA_VER     = "6.6.6"
+KF6_VER        = "6.24.0"
 MESA_VER       = "24.3.4"
 OPENRC_VER     = "0.54"
 APPSTREAM_VER     = "1.0.4"
@@ -91,7 +103,11 @@ BITCOIN_URL  = f"https://bitcoincore.org/bin/bitcoin-core-{BITCOIN_VER}/bitcoin-
 SGMINER_URL  = f"https://github.com/sgminer-dev/sgminer/archive/refs/tags/{SGMINER_VER}.tar.gz"
 # Plasma + KF6 URLs are set by _resolve_kde_versions() before each build
 PLASMA_URL   = f"https://download.kde.org/stable/plasma/{PLASMA_VER}"
-KF6_URL      = f"https://download.kde.org/stable/frameworks/6.27"
+KF6_URL      = f"https://download.kde.org/stable/frameworks/{KF6_LTS_MINOR}"
+# KDE Gear (Konsole, Dolphin, ...) has its own release-service version series,
+# independent of Plasma/KF6 -- do not conflate with PLASMA_VER.
+GEAR_VER     = "25.08.3"
+GEAR_URL     = f"https://download.kde.org/stable/release-service/{GEAR_VER}/src"
 
 # ANSI
 R       = "\x1b[0m"
@@ -146,10 +162,22 @@ def _detect_gcc():
 
 def _resolve_kde_versions():
     """Query download.kde.org and return (plasma_ver, kf6_minor, kf6_ver).
-    Always resolves to the highest published stable release so builds never
-    pin stale EoL versions."""
+
+    SmechOS tracks the "bullet-proof KDE" LTS line (Kubuntu Focus +
+    Techpaladin Software + KDE e.V., announced August 2026: 3 years of
+    backported fixes for Plasma 6.6 / Frameworks 6.24 / Gear 25.12,
+    through ~2029) rather than whatever Plasma/Frameworks shipped most
+    recently. The whole point of anchoring to an LTS line instead of
+    chasing latest is stability for users, and Techpaladin's own CI-backed
+    hardware validation -- so this resolves the newest *point release
+    within that line* (e.g. 6.6.6 -> 6.6.7 as Techpaladin backports land),
+    never jumping to 6.7+/6.8+. Bump PLASMA_LTS_MINOR deliberately if
+    SmechOS ever moves to a newer LTS line; don't let this silently track
+    latest again, which is what it did before and is exactly what an LTS
+    pin exists to avoid.
+    """
     import re
-    log("Resolving latest stable KDE Plasma + Frameworks from download.kde.org...")
+    log(f"Resolving latest {PLASMA_LTS_MINOR}.x LTS point release from download.kde.org...", )
 
     def _fetch(url):
         try:
@@ -158,29 +186,47 @@ def _resolve_kde_versions():
         except Exception as e:
             err(f"Could not reach {url}: {e}")
 
-    # Plasma: directory listing gives x.y.z/ entries
-    plasma_vers = re.findall(r'href="([0-9]+\.[0-9]+\.[0-9]+)/"',
-                             _fetch("https://download.kde.org/stable/plasma/"))
+    # Plasma: directory listing gives x.y.z/ entries -- keep only the
+    # pinned LTS minor line, then take the highest patch within it.
+    all_plasma_vers = re.findall(r'href="([0-9]+\.[0-9]+\.[0-9]+)/"',
+                                  _fetch("https://download.kde.org/stable/plasma/"))
+    plasma_vers = [v for v in all_plasma_vers if v.startswith(f"{PLASMA_LTS_MINOR}.")]
     if not plasma_vers:
-        err("Could not detect latest Plasma version from download.kde.org/stable/plasma/")
+        err(f"No {PLASMA_LTS_MINOR}.x release found under download.kde.org/stable/plasma/ "
+            f"-- has the LTS line reached end-of-life?")
     plasma_ver = sorted(plasma_vers, key=lambda v: [int(x) for x in v.split(".")])[-1]
 
-    # KF6 minor: directory listing gives x.y/ entries
-    kf6_minors = re.findall(r'href="([0-9]+\.[0-9]+)/"',
-                            _fetch("https://download.kde.org/stable/frameworks/"))
-    if not kf6_minors:
-        err("Could not detect latest KF6 version from download.kde.org/stable/frameworks/")
-    kf6_minor = sorted(kf6_minors, key=lambda v: [int(x) for x in v.split(".")])[-1]
+    # KF6 doesn't point-release the way Plasma does -- one tarball set per
+    # X.Y -- so the minor is just the pinned LTS value directly, not
+    # resolved from a directory listing.
+    kf6_minor = KF6_LTS_MINOR
 
     # KF6 full version: parse from a known filename inside the minor directory
     kf6_listing = _fetch(f"https://download.kde.org/stable/frameworks/{kf6_minor}/")
     full = re.findall(rf'extra-cmake-modules-([0-9]+\.[0-9]+\.[0-9]+)\.tar', kf6_listing)
     kf6_ver = full[0] if full else f"{kf6_minor}.0"
 
-    log(f"KDE Plasma {plasma_ver}  |  KDE Frameworks {kf6_ver}", color=GREEN)
+    log(f"KDE Plasma {plasma_ver} (LTS {PLASMA_LTS_MINOR}.x)  |  KDE Frameworks {kf6_ver}", color=GREEN)
     return plasma_ver, kf6_minor, kf6_ver
 
+def _in_matching_build_image():
+    """True when this process is itself running inside the Ubuntu-24.04-ABI
+    build container (see Dockerfile.build in the sde-shell/SmechDeploy repo,
+    and build-one.sh's identical check) rather than directly on some
+    arbitrary host. Phases that would otherwise spin up a throwaway podman
+    container just to get a matching-ABI toolchain (phase_xwayland_deps,
+    phase_locale) can skip that and act directly once this is true.
+    """
+    return os.path.exists("/etc/smechos-build-image")
+
 def nproc():
+    """Parallel job count for compiler invocations. Defaults to all cores;
+    override with SMECH_BUILD_JOBS to leave headroom for whatever else is
+    running on the machine during a build (a GPU-heavy app, a browser,
+    etc.) instead of a compile job flood starving it of RAM/CPU."""
+    override = os.environ.get("SMECH_BUILD_JOBS")
+    if override:
+        return override
     return str(os.cpu_count() or 4)
 
 def ensure(path):
@@ -323,6 +369,16 @@ def build_env_glibc(target):
     e["CXXFLAGS"] = f"-I{prefix}/include"
     e["LDFLAGS"]  = f"-L{prefix}/lib/x86_64-linux-gnu -L{prefix}/lib"
     e["LD_LIBRARY_PATH"] = f"{prefix}/lib/x86_64-linux-gnu:{prefix}/lib"
+    # kdoctools' meinproc6 (a real, target-installed but container-executed
+    # binary, invoked un-chrooted like everything else in this build) looks
+    # up its own DTD/catalog files via QStandardPaths::GenericDataLocation,
+    # which is driven entirely by XDG_DATA_DIRS -- left unset, it defaults
+    # to the container's own /usr/share, which never has kdoctools' files
+    # installed (only {target}/usr/share does), so any later package that
+    # builds documentation through kdoctools (kpackage was first to hit
+    # this) dies with "Could not find kdoctools catalogs". Prepending the
+    # target's share dir fixes the lookup without needing an actual chroot.
+    e["XDG_DATA_DIRS"] = f"{prefix}/share:" + e.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share")
     e["FORCE_UNSAFE_CONFIGURE"] = "1"
     # GCC's own internal temp files (.s, PCH) follow $TMPDIR, independent of
     # BUILD_TMP -- route them off the tiny tmpfs /tmp too. See BUILD_TMP.
@@ -352,19 +408,6 @@ def build_env_bitcoin(target):
     e["CFLAGS"]   = f"{baseline} {e['CFLAGS']}"
     e["CXXFLAGS"] = f"{baseline} {e['CXXFLAGS']}"
     return e
-
-def _extract_deb(deb_path, dest):
-    """Extract a .deb file's data.tar into dest."""
-    work = deb_path + ".extract"
-    shutil.rmtree(work, ignore_errors=True)
-    ensure(work)
-    run(["ar", "x", os.path.abspath(deb_path)], cwd=work)
-    for ext in ("data.tar.xz", "data.tar.zst", "data.tar.gz", "data.tar"):
-        data_tar = os.path.join(work, ext)
-        if os.path.exists(data_tar):
-            run(["tar", "-xf", data_tar, "-C", dest])
-            break
-    shutil.rmtree(work, ignore_errors=True)
 
 def _split_staging_prefix(prefix):
     # Every caller passes prefix as exactly "<target>/usr" — the physical
@@ -419,6 +462,14 @@ def cmake_install(src_dir, prefix, extra_args=None, env=None, build_dir=None):
          "-DCMAKE_BUILD_WITH_INSTALL_RPATH=FALSE",
          "-DCMAKE_INSTALL_RPATH_USE_LINK_PATH=FALSE",
          "-DCMAKE_INSTALL_RPATH=/usr/lib/x86_64-linux-gnu",
+         # This rootfs's Qt6 was built with QT_INSTALL_PLUGINS=/usr/plugins
+         # (non-multiarch), not the lib/<triplet>/plugins path KDE's ECM/
+         # KDECMakeSettings computes by default from CMAKE_INSTALL_LIBDIR.
+         # Without this override, KDE packages install their Qt plugins
+         # (KCMs, kpart, applets, ...) to a directory Qt's plugin loader
+         # never scans -- they build and link fine, and are simply invisible
+         # at runtime (e.g. a KCM that never appears in System Settings).
+         "-DKDE_INSTALL_PLUGINDIR=/usr/plugins",
          ] + (extra_args or []), cwd=bd, env=build_env)
     run([ninja_bin, "-j", nproc(), "-k", "0"], cwd=bd, env=build_env, check=False)
     install_env = dict(build_env)
@@ -444,16 +495,54 @@ def meson_install(src_dir, prefix, extra_args=None, env=None, build_dir=None):
     # from-scratch-build bug -- first hit as a meson/python crash, then as
     # meson's own pkg-config/cmake subprocess probes picking up stale
     # target-bundled configs, then as ninja itself crashing on startup).
-    # meson_install() is only used for low-level meson-based C libraries
-    # (Mesa, Wayland, libinput) that don't need to execute target-built
-    # codegen tools mid-build the way Qt6/KDE's separate CMake path does,
-    # so it's safe to strip these for all three steps here, not just setup.
+    # meson_install() was originally only used for low-level meson-based C
+    # libraries (Mesa, Wayland, libinput) that don't need to execute
+    # target-built codegen tools mid-build the way Qt6/KDE's separate CMake
+    # path does -- AppStream's -Dqt=true build broke that assumption (needs
+    # moc/uic/rcc/lrelease, which only exist in our self-built target Qt6,
+    # never in the container). Appending (not prepending) the target's Qt6
+    # tool dirs to PATH lets meson find those specific tools as a fallback
+    # without a host tool of the same name ever losing to a target one.
+    # It's safe to actually *run* them despite LD_LIBRARY_PATH staying
+    # stripped below: verified their RUNPATH is
+    # "/usr/lib/x86_64-linux-gnu:$ORIGIN/../lib" -- the first (absolute,
+    # broken when un-chrooted) entry just falls through to the second
+    # ($ORIGIN-relative, i.e. real relative to the binary's own location on
+    # disk) for every library, so they resolve their own Qt6 .so files
+    # correctly with no extra environment at all.
     host_env = dict(env) if env else dict(os.environ)
     host_env.pop("LD_LIBRARY_PATH", None)
-    host_env["PATH"] = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
-    host_env["PKG_CONFIG_PATH"] = os.environ.get(
-        "PKG_CONFIG_PATH",
-        "/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig:/usr/lib/pkgconfig")
+    host_env["PATH"] = (
+        os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
+        + f":{prefix}/bin:{prefix}/libexec")
+    # PKG_CONFIG_PATH (unlike PATH/LD_LIBRARY_PATH above) is safe to point at
+    # the target prefix too: pkg-config only ever reads .pc text files, it
+    # never dynamically links against what they describe, so this can't
+    # trigger the host-tool-crash scenario the comment above warns about.
+    # It has to include the target prefix, though -- packages built earlier
+    # in this same phase by meson_install() itself (wayland, wayland-protocols)
+    # land their .pc files only under the target staging root, never in any
+    # apt-installed/host location, so later meson-based packages that
+    # legitimately depend on them (e.g. xkbcommon's wayland support needing
+    # wayland-client/wayland-protocols) can't find them without this.
+    host_env["PKG_CONFIG_PATH"] = (
+        f"{prefix}/lib/x86_64-linux-gnu/pkgconfig:{prefix}/lib/pkgconfig:{prefix}/share/pkgconfig:"
+        + os.environ.get(
+            "PKG_CONFIG_PATH",
+            "/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig:/usr/lib/pkgconfig"))
+    # PKG_CONFIG_SYSROOT_DIR was tried here and reverted: it globally
+    # prepends the sysroot to *every* resolved .pc file's absolute paths,
+    # which fixed Qt6's own .pc files (their Cflags/-I bakes in the real
+    # deployment prefix "/usr", not "{target}/usr" -- unlike CMake's
+    # relocatable _IMPORT_PREFIX pattern, .pc files aren't relocatable this
+    # way) but broke gobject-introspection-1.0.pc, whose g_ir_scanner tool
+    # variable legitimately points at the *container's* own real /usr
+    # (apt-installed there on purpose, see Dockerfile.build). PKG_CONFIG_PATH
+    # mixes target-only and container-only .pc files by design, and
+    # PKG_CONFIG_SYSROOT_DIR can't tell those two cases apart -- see
+    # _fix_target_pc_prefix() instead, which corrects the target's own .pc
+    # files in place (Qt6 specifically, so far) rather than reinterpreting
+    # every .pc file's paths at lookup time.
     run(["meson", "setup", bd, src_dir,
          "--prefix=/usr", "--buildtype=release",
          ] + (extra_args or []), env=host_env)
@@ -461,6 +550,52 @@ def meson_install(src_dir, prefix, extra_args=None, env=None, build_dir=None):
     install_env = dict(host_env)
     install_env["DESTDIR"] = target_root
     run(["ninja", "-C", bd, "install"], env=install_env, sudo=(os.geteuid() != 0))
+
+def _fix_target_pc_prefix(target):
+    """Rewrite `prefix=/usr` to `prefix={target}/usr`, but ONLY in .pc
+    files belonging to packages this pipeline itself builds into the
+    target (Qt6 so far) -- deliberately an include-list, not a blanket
+    sweep of every .pc file under the target rootfs.
+
+    Tried the blanket sweep first and had to revert it: the target rootfs
+    (pre-populated from an earlier build, not created fresh by this
+    session -- see project memory) turns out to carry a bunch of *stray*
+    .pc files left over from that prior population (glib-2.0.pc,
+    libxml-2.0.pc, gobject-introspection-1.0.pc, likely more) that don't
+    correspond to any real headers/binaries actually present under
+    {target}/usr at all -- they're apt-package .pc files that only work,
+    to the extent they ever did, by accident: their unmangled "prefix=/usr"
+    happens to coincidentally match the *container's* real installation of
+    the same package (installed there deliberately, see Dockerfile.build),
+    not the target's. Rewriting those breaks that accidental-but-working
+    resolution and points them at target paths with nothing real behind
+    them (confirmed: /mnt/smechos_build_root/usr/include/glib-2.0 doesn't
+    exist). Qt6's own .pc files are different -- genuinely built by this
+    pipeline (phase_qt_deps -> cmake_install(), --prefix=/usr per
+    _split_staging_prefix's staging convention) with real matching headers
+    on disk under target, so only those get rewritten.
+
+    Unlike CMake's exports (relocatable via _IMPORT_PREFIX computed from
+    the file's own on-disk location), pkg-config .pc files have no
+    equivalent mechanism; PKG_CONFIG_SYSROOT_DIR was tried as a
+    lookup-time alternative (see meson_install()'s comment) but rejected
+    for the same reason as the blanket sweep -- it can't distinguish
+    target-built .pc files from container-only ones sharing the same
+    PKG_CONFIG_PATH search either.
+    """
+    import re
+    fixed = 0
+    for pat in (f"{target}/usr/lib/*/pkgconfig/Qt6*.pc",
+                f"{target}/usr/lib/pkgconfig/Qt6*.pc"):
+        for pc in glob.glob(pat):
+            with open(pc) as f:
+                txt = f.read()
+            new_txt = re.sub(r"^prefix=/usr$", f"prefix={target}/usr", txt, flags=re.MULTILINE)
+            if new_txt != txt:
+                with open(pc, "w") as f:
+                    f.write(new_txt)
+                fixed += 1
+    log(f"Rewrote prefix= in {fixed} target Qt6 .pc file(s) for un-chrooted pkg-config use", color=GREEN)
 
 # ── Phase implementations ─────────────────────────────────────────────────────
 
@@ -544,20 +679,62 @@ def phase_write_etc(target):
         "hostname":    "smechos\n",
         "hosts":       "127.0.0.1  localhost\n127.0.1.1  smechos\n::1  localhost\n",
         "resolv.conf": "nameserver 1.1.1.1\nnameserver 8.8.8.8\n",
+        # Read by spk (see Smech-Labs/spk's load_repos()) instead of a
+        # hardcoded URL baked into the binary. pkg.smech.xyz is the
+        # independent repo (Cloudflare Worker + R2); GitHub Releases stays
+        # as a lower-priority fallback rather than being dropped outright.
+        "spk-repo-conf.yaml": (
+            "repos:\n"
+            "  - name: smech-pkg\n"
+            "    url: https://pkg.smech.xyz\n"
+            "    priority: 1\n"
+            "  - name: github-releases\n"
+            "    url: https://github.com/Smech-Labs/SmechDeploy/releases/download/v1.0.0-packages\n"
+            "    priority: 10\n"
+        ),
         "fstab":       (
             "proc     /proc     proc    defaults  0 0\n"
             "sysfs    /sys      sysfs   defaults  0 0\n"
             "devtmpfs /dev      devtmpfs defaults 0 0\n"
         ),
         "shells":      "/bin/sh\n/bin/bash\n",
+        # messagebus/systemd-{network,oom,resolve,timesync}: standard system
+        # service accounts the shipped dbus-daemon system config and policy
+        # files reference by name -- confirmed via a real boot as the actual
+        # reason the system D-Bus never comes up at all: dbus-daemon --system
+        # setuid/setgid's to "messagebus" to drop root privileges, and with
+        # no such user in /etc/passwd it exits(1) immediately with "Could not
+        # get UID and GID for username \"messagebus\"" (the systemd-* ones
+        # only produce non-fatal "Unknown username" warnings from the policy
+        # parser, but are added too since they're clearly expected). This is
+        # the same root-cause class as the missing "render" group below --
+        # phase_write_etc's account list was never reconciled against what
+        # the actual shipped systemd/dbus config expects.
         "passwd":      (
             "root:x:0:0:root:/root:/bin/bash\n"
             "smech:x:1000:1000:SmechOS User:/home/smech:/bin/bash\n"
             "sddm:x:999:999:SDDM:/var/lib/sddm:/sbin/nologin\n"
+            "messagebus:x:100:100:D-Bus Message Daemon User:/nonexistent:/sbin/nologin\n"
+            "systemd-network:x:101:101:systemd Network Management:/:/sbin/nologin\n"
+            "systemd-oom:x:102:102:systemd Userspace OOM Killer:/:/sbin/nologin\n"
+            "systemd-resolve:x:103:103:systemd Resolver:/:/sbin/nologin\n"
+            "systemd-timesync:x:105:105:systemd Time Synchronization:/:/sbin/nologin\n"
         ),
+        # render group (GID 104, matching Debian/Ubuntu's udev/systemd
+        # convention): the shipped 60-drm.rules udev rule sets
+        # /dev/dri/renderD* to GROUP="render" MODE="0660", but with no
+        # "render" group in /etc/group that GID never resolves, so the
+        # render node stays root:root 600 -- confirmed directly on a real
+        # boot as the reason kwin_wayland_wr immediately dumped core: smech
+        # was in "video" (grants /dev/dri/card0) but had no access at all to
+        # /dev/dri/renderD128, which Mesa/EGL/GBM needs for the actual
+        # rendering context.
         "group":       (
             "root:x:0:\nwheel:x:10:smech\nvideo:x:14:smech\n"
-            "audio:x:29:smech\nsmech:x:1000:\nsddm:x:999:\n"
+            "audio:x:29:smech\nrender:x:104:smech\n"
+            "messagebus:x:100:\nsystemd-network:x:101:\nsystemd-oom:x:102:\n"
+            "systemd-resolve:x:103:\nsystemd-timesync:x:105:\n"
+            "smech:x:1000:\nsddm:x:999:\n"
         ),
         "shadow":      "root:!:19900:0:99999:7:::\nsmech:!:19900:0:99999:7:::\n",
         "os-release":  (
@@ -647,6 +824,21 @@ def phase_kernel(target):
     run(["make", "defconfig"], cwd=bd, env=env)
 
     # Append sovereign feature set
+    #
+    # SQUASHFS/OVERLAY_FS: neither is in x86_64 defconfig's baseline, and
+    # neither was ever explicitly forced here -- confirmed via the actual
+    # compiled .config ("# CONFIG_SQUASHFS is not set", "# CONFIG_OVERLAY_FS
+    # is not set") after boot-testing the live ISO hit a real kernel panic
+    # ("Attempted to kill init!", Comm: switch_root): busybox's `mount -t
+    # squashfs`/`mount -t overlay` in the live init script both failed
+    # silently (no `set -e`), so /mnt/rootfs never became a real mountpoint,
+    # and switch_root correctly refused + exited, killing PID 1. Both are
+    # hard requirements for the live-boot design (squashfs holds the
+    # compressed rootfs, overlay provides the writable live session layer),
+    # not optional. SQUASHFS_XZ specifically because phase_iso_live_smechos
+    # builds the squashfs with `-comp xz`; SQUASHFS_COMPILE_DECOMP_SINGLE
+    # satisfies XZ's decompressor-backend `select`, since SQUASHFS_XZ alone
+    # doesn't imply one.
     extras = textwrap.dedent("""\
         CONFIG_KVM=m
         CONFIG_KVM_INTEL=m
@@ -672,18 +864,39 @@ def phase_kernel(target):
         CONFIG_DRM_VIRTIO_GPU=m
         CONFIG_FW_LOADER_COMPRESS=y
         CONFIG_FW_LOADER_COMPRESS_XZ=y
+        CONFIG_SQUASHFS=y
+        CONFIG_SQUASHFS_XZ=y
+        CONFIG_SQUASHFS_FILE_DIRECT=y
+        CONFIG_SQUASHFS_COMPILE_DECOMP_SINGLE=y
+        CONFIG_SQUASHFS_XATTR=y
+        CONFIG_OVERLAY_FS=y
     """)
     with open(os.path.join(bd, ".config"), "a") as f:
         f.write(extras)
     run(["make", "olddefconfig"], cwd=bd, env=env)
-    # GCC 16 is newer than this kernel (6.12.16) was tested against and
-    # promotes several warnings to hard errors under -Werror that older GCC
-    # treated as non-fatal: unterminated ACPICA signature-array initializers
-    # (include/acpi/actbl*.h) and a harmless set-but-unused local in
-    # drivers/gpu/drm/amd/amdgpu/amdgpu_gart.c. Neither is a real bug, so
-    # disable just these two warnings-as-errors rather than patch sources.
-    kcflags = ("-Wno-error=unterminated-string-initialization "
-               "-Wno-error=unused-but-set-variable")
+    # -Wno-error=unused-but-set-variable: a harmless set-but-unused local in
+    # drivers/gpu/drm/amd/amdgpu/amdgpu_gart.c, not a real bug, disabled
+    # rather than patching source. This warning has existed forever in GCC,
+    # safe unconditionally.
+    #
+    # -Wno-error=unterminated-string-initialization: only needed on GCC>=16,
+    # which promotes unterminated ACPICA signature-array initializers
+    # (include/acpi/actbl*.h) to a hard error under -Werror -- but this
+    # warning was only ever *added* in GCC 15 (see gcc.gnu.org release
+    # notes), and gcc -Wno-error=<X> is a hard configure-time error if
+    # warning X doesn't exist in the compiler at all -- not silently
+    # ignored the way -Wno-<X> would be. Inside this container the bare
+    # `gcc` this build resolves is Ubuntu 24.04's default (GCC 13), so
+    # unconditionally passing this flag was breaking the very first
+    # compile (scripts/mod/empty.o) with "no option
+    # '-Wunterminated-string-initialization'" -- gate it on the real
+    # detected version instead of assuming GCC 16.
+    gcc_ver_str = subprocess.run(["gcc", "-dumpversion"], capture_output=True,
+                                  text=True, check=True).stdout.strip()
+    gcc_major = int(gcc_ver_str.split(".")[0])
+    kcflags = "-Wno-error=unused-but-set-variable"
+    if gcc_major >= 15:
+        kcflags += " -Wno-error=unterminated-string-initialization"
     run(["make", "-j", nproc(), f"KCFLAGS={kcflags}", "bzImage", "modules"],
         cwd=bd, env=env)
 
@@ -692,6 +905,14 @@ def phase_kernel(target):
     shutil.copy2(os.path.join(bd, "arch/x86/boot/bzImage"),
                  os.path.join(boot, "vmlinuz"))
     run(["make", f"INSTALL_MOD_PATH={target}", "modules_install"],
+        cwd=bd, env=env, sudo=(os.geteuid() != 0))
+    # modules_install alone does not reliably regenerate modules.dep/modules.alias
+    # for a cross-target INSTALL_MOD_PATH -- confirmed missing entirely on a real
+    # build (no modules.dep at all under target/lib/modules/6.12.16). Without it,
+    # udev/modprobe has no alias index, so no `=m` module (e.g. CONFIG_DRM_VIRTIO_GPU=m)
+    # can ever auto-load for any PCI device, built-in drivers only. Root cause of the
+    # permanently black QEMU framebuffer this session -- not a display-backend issue.
+    run(["depmod", "-a", "-b", target, LINUX_VER],
         cwd=bd, env=env, sudo=(os.geteuid() != 0))
     log(f"Linux {LINUX_VER} installed.", color=GREEN)
 
@@ -813,7 +1034,15 @@ def phase_qt_deps(target):
         # FEATURE_xcb must be forced ON: it silently auto-disables unless every
         # XCB extension dev package is present at configure time (no hard build
         # failure), which breaks QX11Info/KWindowSystem's X11 backend later.
-        ("qtbase",        ["-DFEATURE_testlib=OFF", "-DFEATURE_fontconfig=ON",
+        # FEATURE_testlib must stay ON despite QT_BUILD_TESTS=OFF below: that
+        # flag only controls whether Qt's *own* internal test suite gets
+        # compiled, not whether the QtTest library itself is built. Several
+        # KF6 packages (threadweaver first surfaced it) unconditionally
+        # add_subdirectory(examples), and those examples find_package(Qt6Test)
+        # with no BUILD_EXAMPLES/BUILD_TESTING gate at all -- forcing it OFF
+        # here just means Qt6TestConfig.cmake never exists anywhere, breaking
+        # every KF6 package structured that way.
+        ("qtbase",        ["-DFEATURE_testlib=ON", "-DFEATURE_fontconfig=ON",
                             "-DFEATURE_xcb=ON"]),
         ("qtshadertools", []),
         ("qtdeclarative", []),
@@ -874,6 +1103,8 @@ def phase_qt_deps(target):
             symlink(sopath, dest)
     log("Qt6 arch-dir symlinks created.", color=GREEN)
 
+    _fix_target_pc_prefix(target)
+
 CMAKE_BOOTSTRAP_VER = "3.31.6"
 CMAKE_BOOTSTRAP_URL = f"https://github.com/Kitware/CMake/releases/download/v{CMAKE_BOOTSTRAP_VER}/cmake-{CMAKE_BOOTSTRAP_VER}-linux-x86_64.tar.gz"
 
@@ -911,8 +1142,35 @@ def phase_mesa(target):
     shutil.rmtree(bd, ignore_errors=True)
     extract(tarball, bd)
     _patch_mesa_c11_threads(bd)
-    _patch_mesa_clc_clang_api(bd)
-    _patch_mesa_ac_llvm_api(bd)
+    # _patch_mesa_clc_clang_api / _patch_mesa_ac_llvm_api rewrite Mesa's
+    # intel-clc/radeonsi LLVM helper code for Clang/LLVM 22.x's API shape
+    # (TextDiagnosticPrinter&, protected TargetOpts, Triple-typed
+    # createTargetMachine). Verified directly against real llvmorg-20.1.2
+    # headers that LLVM 20 (what Dockerfile.build actually installs -- see
+    # its own comment) still has the OLD shape Mesa 24.3.4 already handles
+    # unpatched, so applying these patches against LLVM 20 would break the
+    # build the other way. Only apply them if the installed toolchain is
+    # genuinely >= 22, so this self-corrects if the pinned LLVM version ever
+    # changes without anyone remembering to touch this gate.
+    _llvm_major = 0
+    try:
+        _llvm_ver_out = subprocess.run(["llvm-config", "--version"],
+            capture_output=True, text=True, check=True).stdout.strip()
+        _llvm_major = int(_llvm_ver_out.split(".")[0])
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
+        pass
+    if _llvm_major >= 22:
+        _patch_mesa_clc_clang_api(bd)
+        _patch_mesa_ac_llvm_api(bd)
+    else:
+        log(f"Skipping LLVM-22.x-specific mesa patches (llvm-config reports "
+            f"major version {_llvm_major or 'unknown'})", color=YELLOW)
+    # Unlike the three call sites above (genuinely still fine at LLVM 20,
+    # confirmed against real llvmorg-20.1.2 headers), this one breaks even
+    # at 20 -- CompilerInstance::createDiagnostics(DiagnosticConsumer*) was
+    # already removed by then. Applies unconditionally, independent of the
+    # >=22 gate above.
+    _patch_mesa_clc_create_diagnostics(bd)
     _patch_mesa_loader_wayland_timespec(bd)
     # Mesa doesn't depend on anything from target/usr -- it's built early
     # (before Wayland/KDE, which DO need to link against target-installed
@@ -1227,6 +1485,58 @@ def _patch_mesa_clc_clang_api(bd):
         "SPIR-V triple in llvm::Triple for createTargetMachine.",
         color=GREEN)
 
+def _patch_mesa_clc_create_diagnostics(bd):
+    """src/compiler/clc/clc_helpers.cpp's single-arg
+    CompilerInstance::createDiagnostics(DiagnosticConsumer*) call was
+    removed by LLVM 20 (confirmed directly against real llvmorg-20.1.2
+    clang/Frontend/CompilerInstance.h -- the only two overloads left both
+    take a llvm::vfs::FileSystem& as their first parameter, one a member
+    void-returning form, one a static DiagnosticsEngine-returning form).
+    Unlike the three breaks _patch_mesa_clc_clang_api fixes (all still fine
+    at LLVM 20, only broken at 22+), this one is broken already at 20 --
+    real compile error: "no matching function for call to
+    CompilerInstance::createDiagnostics(clang::TextDiagnosticPrinter*)".
+
+    Fix: pass a real filesystem as the new required first argument, via
+    llvm::vfs::getRealFileSystem() (dereferenced -- it returns an
+    IntrusiveRefCntPtr<FileSystem>), matching the member overload's
+    signature. `c` has no VFS of its own configured yet at this point in
+    the function (freshly constructed two lines above, no createFileManager
+    call in between), so getVirtualFileSystem() would be the wrong thing to
+    reach for here -- a fresh real filesystem is what every other LLVM tool
+    calling this same overload this early passes.
+    """
+    path = os.path.join(bd, "src", "compiler", "clc", "clc_helpers.cpp")
+    with open(path) as f:
+        txt = f.read()
+    old = (
+        "   c->createDiagnostics(new clang::TextDiagnosticPrinter(\n"
+        "                           diag_log_stream,\n"
+    )
+    new = (
+        "   c->createDiagnostics(*llvm::vfs::getRealFileSystem(),\n"
+        "                        new clang::TextDiagnosticPrinter(\n"
+        "                           diag_log_stream,\n"
+    )
+    if old not in txt:
+        err("_patch_mesa_clc_create_diagnostics: expected createDiagnostics "
+            "call not found in clc_helpers.cpp (mesa source changed?)")
+    txt = txt.replace(old, new)
+    include_old = "#include <clang/Frontend/CompilerInstance.h>\n"
+    include_new = (
+        "#include <clang/Frontend/CompilerInstance.h>\n"
+        "#include <llvm/Support/VirtualFileSystem.h>\n"
+    )
+    if include_old not in txt:
+        err("_patch_mesa_clc_create_diagnostics: expected #include line not "
+            "found in clc_helpers.cpp (mesa source changed?)")
+    txt = txt.replace(include_old, include_new, 1)
+    with open(path, "w") as f:
+        f.write(txt)
+    log("Patched mesa clc_helpers.cpp: pass a real llvm::vfs::FileSystem to "
+        "createDiagnostics() (its single-arg DiagnosticConsumer* overload "
+        "was removed by LLVM 20).", color=GREEN)
+
 def _patch_mesa_ac_llvm_api(bd):
     """src/amd/llvm/ac_llvm_helper.cpp (radeonsi's LLVM-based shader
     compiler helper) hits the same class of LLVM 22.x API break as
@@ -1507,6 +1817,44 @@ def _patch_plasma_workspace(bd):
         with open(cmake, "w") as f:
             f.write(txt.replace(old, new))
 
+def _patch_xdg_desktop_portal_kde(bd):
+    """xdg-desktop-portal-kde's top-level CMakeLists.txt does
+    add_subdirectory(autotests) with no BUILD_TESTING guard, so
+    -DBUILD_TESTING=OFF does not stop it configuring tests that link
+    Qt::Test -- which nothing else in the project find_package()s.
+    """
+    cmake = os.path.join(bd, "CMakeLists.txt")
+    if not os.path.exists(cmake):
+        return
+    with open(cmake) as f:
+        txt = f.read()
+    old = "add_subdirectory(autotests)"
+    new = "if(BUILD_TESTING)\n  add_subdirectory(autotests)\nendif()"
+    if old in txt:
+        with open(cmake, "w") as f:
+            f.write(txt.replace(old, new))
+
+def _patch_spectacle_opencv(bd):
+    """spectacle's CMakeLists.txt hard-requires OpenCV >= 4.7, but
+    ubuntu:24.04's libopencv-dev is 4.6.0 -- one point release short.
+    Its actual OpenCV usage (ImagePlatformKWin.cpp: cv::Rect, cv::resize,
+    cv::INTER_AREA/INTER_LANCZOS4 for screenshot DPI downscaling) is
+    trivial core/imgproc API stable since OpenCV 2.x/3.x, nothing specific
+    to 4.7 -- the version pin reads as a defensive "whatever we tested
+    against" floor, not a real technical requirement, so lowering it to
+    match what's actually available is safe here.
+    """
+    cmake = os.path.join(bd, "CMakeLists.txt")
+    if not os.path.exists(cmake):
+        return
+    with open(cmake) as f:
+        txt = f.read()
+    old = "find_package(OpenCV 4.7 REQUIRED core imgproc)"
+    new = "find_package(OpenCV 4.6 REQUIRED core imgproc)"
+    if old in txt:
+        with open(cmake, "w") as f:
+            f.write(txt.replace(old, new))
+
 def _kde_pkg(name, version, base_url, target, env, profile="smechos-plasma-live"):
     stamp = f"kde-pkg-{name}"
     if _phase_done(profile, stamp):
@@ -1528,12 +1876,32 @@ def _kde_pkg(name, version, base_url, target, env, profile="smechos-plasma-live"
         _patch_plasma_workspace(bd)
     if name == "syntax-highlighting":
         _patch_syntax_highlighting(bd)
+    if name == "xdg-desktop-portal-kde":
+        _patch_xdg_desktop_portal_kde(bd)
+    if name == "spectacle":
+        _patch_spectacle_opencv(bd)
     # Per-package extra cmake args for packages with optional/missing system deps
     pkg_extra = {
-        "prison":            ["-DWITH_ZXING=OFF"],
+        # WITH_ZXING flipped ON: spectacle's main binary unconditionally
+        # target_link_libraries(KF6::PrisonScanner) -- not gateable, no
+        # feature flag on spectacle's side -- so prison must provide it.
+        # libzxing-dev (Ubuntu universe, real ZXingConfig.cmake) makes
+        # find_package(ZXing CONFIG) succeed; target rootfs gets the real
+        # runtime .so copied in the same way as libical/libhunspell/etc.
+        "prison":            ["-DWITH_ZXING=ON"],
         "plasma-workspace":  ["-DWITH_X11=OFF"],
         "breeze":            ["-DBUILD_QT5=OFF"],
         "plasma-integration":["-DBUILD_QT5=OFF"],      # Qt5 not installed; Qt6-only build
+        "oxygen":            ["-DBUILD_QT5=OFF"],      # legacy window-deco theme; both BUILD_QT5/BUILD_QT6 default ON
+        # kquickimageeditor's cv::stackBlur (its only real OpenCV call) was
+        # only added to OpenCV in 4.7, genuinely absent from ubuntu:24.04's
+        # 4.6.0 -- unlike spectacle's OpenCV usage (cv::Rect/resize, stable
+        # since ancient versions), this one is a real version gap, not just
+        # a defensive floor. WITH_OPENCV is a real cmake_dependent_option
+        # (defaults ON on Linux) with a full non-OpenCV stackblur.cpp
+        # fallback already in the source -- use that instead of building a
+        # newer OpenCV from source just for this one optional blur effect.
+        "kquickimageeditor": ["-DWITH_OPENCV=OFF"],
         "plasma-desktop":    ["-DWITH_KACCOUNTS=OFF",
                               "-DBUILD_KCMS_JOYSTICK=OFF",
                               "-DBUILD_KCM_MOUSE_X11=OFF",
@@ -1682,10 +2050,100 @@ def phase_kde(target):
     log_phase("kde", f"Compile KDE Frameworks {KF6_VER} + Plasma {PLASMA_VER}")
     _symlink_arch_libs(target)
     _build_xkbregistry(target)
+    _profile = "smechos-plasma-live"
+    # Some -dev packages this session needed (see Dockerfile.build) back a
+    # library the target rootfs never shipped at all, unlike the far more
+    # common case of "runtime .so already present, only headers missing".
+    # kcalendarcore hard-requires LibIcal >= 3.0; sonnet hard-requires at
+    # least one spell-check backend, and hunspell was picked since none
+    # were present. Both need their real, ABI-matched runtime .so copied
+    # into the target once -- same as phase_xwayland_deps already does for
+    # binaries the target rootfs never had either.
+    for libname, glob_pat in (("libical", "/usr/lib/x86_64-linux-gnu/libical*.so*"),
+                               ("libhunspell", "/usr/lib/x86_64-linux-gnu/libhunspell*.so*"),
+                               ("libsecret", "/usr/lib/x86_64-linux-gnu/libsecret*.so*"),
+                               ("libnm", "/usr/lib/x86_64-linux-gnu/libnm.so*"),
+                               ("libmm-glib", "/usr/lib/x86_64-linux-gnu/libmm-glib.so*"),
+                               ("libxcb-xtest", "/usr/lib/x86_64-linux-gnu/libxcb-xtest.so*"),
+                               ("libavcodec", "/usr/lib/x86_64-linux-gnu/libavcodec.so*"),
+                               ("libavutil", "/usr/lib/x86_64-linux-gnu/libavutil.so*"),
+                               ("libavformat", "/usr/lib/x86_64-linux-gnu/libavformat.so*"),
+                               ("libavfilter", "/usr/lib/x86_64-linux-gnu/libavfilter.so*"),
+                               ("libswscale", "/usr/lib/x86_64-linux-gnu/libswscale.so*"),
+                               ("libva", "/usr/lib/x86_64-linux-gnu/libva*.so*"),
+                               ("libfreerdp", "/usr/lib/x86_64-linux-gnu/libfreerdp*.so*"),
+                               ("libwinpr", "/usr/lib/x86_64-linux-gnu/libwinpr*.so*"),
+                               ("libopencv_core", "/usr/lib/x86_64-linux-gnu/libopencv_core.so*"),
+                               ("libopencv_imgproc", "/usr/lib/x86_64-linux-gnu/libopencv_imgproc.so*"),
+                               ("libZXing", "/usr/lib/x86_64-linux-gnu/libZXing.so*")):
+        stamp = f"kde-{libname}-runtime"
+        if _phase_done(_profile, stamp):
+            continue
+        arch_libdir = os.path.join(target, "usr", "lib", "x86_64-linux-gnu")
+        ensure(arch_libdir)
+        copied = 0
+        for f in glob.glob(glob_pat):
+            # Idempotent: a prior crash mid-loop (before this libname's
+            # stamp got set) can leave a partial copy already in place --
+            # same failure mode fixed in phase_systemd's lz4/acl/seccomp/
+            # archive copies (FileExistsError on a pre-existing symlink).
+            dst = os.path.join(arch_libdir, os.path.basename(f))
+            if os.path.lexists(dst):
+                os.remove(dst)
+            shutil.copy2(f, dst, follow_symlinks=False)
+            copied += 1
+        if copied == 0:
+            err(f"No {libname}*.so* found in the build container -- is the matching "
+                "-dev package installed? (see Dockerfile.build)")
+        log(f"Copied {copied} {libname} runtime file(s) into target rootfs", color=GREEN)
+        _mark_done(_profile, stamp)
+
+    # qca-qt6 (pre-existing in the target rootfs -- not built by this
+    # pipeline, most likely inherited from whatever seeded the rootfs
+    # before this session's LTS work) exports a Qca-qt6Targets.cmake that,
+    # unlike every ECM-based KF6 package, hardcodes an absolute non-
+    # relocatable `_IMPORT_PREFIX "/usr"` for both its .so
+    # (IMPORTED_LOCATION) and its headers (INTERFACE_INCLUDE_DIRECTORIES),
+    # instead of the standard CMake pattern computed relative to the
+    # Targets.cmake file's own on-disk location. Running un-chrooted, that
+    # literal "/usr/..." resolves against the *container's* real root, not
+    # the target rootfs, so any later package that find_package()s Qca-qt6
+    # (kwallet was first) dies with "the imported target ... references
+    # the file ... but this file does not exist." Mirroring the real files
+    # into the container's own real /usr at the same absolute paths is the
+    # only fix available short of an actual chroot -- same idea as the
+    # container-side libical/libhunspell copies above, just the other
+    # direction (target -> container, since this specific package's own
+    # export is what's broken, not a container-side gap).
+    #
+    # NOT stamped, deliberately: `podman run --rm` starts a brand-new,
+    # ephemeral container on every single invocation of this pipeline, so
+    # anything written to the container's own real filesystem (as opposed
+    # to the bind-mounted /mnt) never survives to the next run. A prior
+    # version of this fix stamped it via the normal (persistent, /mnt-
+    # backed) _phase_done/_mark_done mechanism, which marked it "done"
+    # forever after the first run's container -- every subsequent run then
+    # saw a fresh container with none of the mirrored files, but skipped
+    # rewriting them anyway, and this exact error came right back. Just
+    # always redo it; it's a handful of file copies, not a rebuild.
+    qca_so_glob = os.path.join(target, "usr", "lib", "libqca-qt6.so*")
+    qca_so_files = glob.glob(qca_so_glob)
+    qca_include = os.path.join(target, "usr", "include", "Qca-qt6")
+    if not qca_so_files or not os.path.isdir(qca_include):
+        err(f"qca-qt6 not found under {target}/usr (expected {qca_so_glob} and "
+            f"{qca_include}) -- can't mirror it into the container for the "
+            "Qca-qt6Targets.cmake absolute-path workaround.")
+    for f in qca_so_files:
+        shutil.copy2(f, os.path.join("/usr/lib", os.path.basename(f)), follow_symlinks=False)
+    dest_include = "/usr/include/Qca-qt6"
+    if os.path.isdir(dest_include):
+        shutil.rmtree(dest_include)
+    shutil.copytree(qca_include, dest_include)
+    log(f"Mirrored qca-qt6 ({len(qca_so_files)} .so file(s) + headers) "
+        "into the container's real /usr", color=GREEN)
     # Purge stale KF6/KDE cmake configs installed by Ubuntu packages into the
     # build root's multiarch cmake path — they carry wrong versions (e.g. 6.6.0)
-    # that cmake prefers over our freshly built 6.27.0 ones.
-    _profile = "smechos-plasma-live"
+    # that cmake prefers over our freshly built KF6_VER ones.
     if not _phase_done(_profile, "kde-cmake-purge"):
         multiarch_cmake = os.path.join(target, "usr/lib/x86_64-linux-gnu/cmake")
         if os.path.isdir(multiarch_cmake):
@@ -1703,10 +2161,31 @@ def phase_kde(target):
         "kguiaddons", "ki18n", "kitemmodels", "kitemviews",
         "kunitconversion",      # required by plasma5support
         "kwidgetsaddons", "kwindowsystem",
+        # kidletime moved up from its original Tier 8 spot: it only needs
+        # kcoreaddons, but baloo (Tier 6) hard-requires KF6::IdleTime via
+        # find_package(KF6 ... COMPONENTS IdleTime) -- built this late it
+        # failed baloo's configure with "Missing required components: IdleTime".
+        "kidletime",
+        "threadweaver",         # KF6ThreadWeaver: job-queue threading helper, no KF6 deps
+        "kplotting",            # KF6Plotting: 2D plotting widgets, no KF6 deps
+        # oxygen-icons has its own release schedule, well behind KF6_VER --
+        # built separately below, not through this KF6_URL/KF6_VER loop.
+        "ktexttemplate",        # KF6TextTemplate: Django-style templating, Qt6-only deps
+        "kdnssd",               # KF6DNSSD: zeroconf/mDNS service discovery
+        "kcalendarcore",        # KF6CalendarCore: iCal data model, Qt6-only deps
+        # kmime is released via Gear (release-service), not the Frameworks
+        # train -- confirmed absent from download.kde.org/stable/frameworks/
+        # 6.24/ entirely; its real tarball is kmime-{GEAR_VER}.tar.xz. Built
+        # separately below, same as oxygen-icons/kirigami-addons.
+        "bluez-qt",             # KF6BluezQt: Bluetooth stack; required by bluedevil
+        "kimageformats",        # extra QImage plugins (karchive, kcoreaddons)
         # Tier 1 — depend on Tier 0
         "kconfig", "kdoctools",   # kdoctools: docbook/man page generator; required by plasma-desktop
+        "kcontacts",            # KF6Contacts: vCard/address-book data model (kcodecs, kconfig)
+        "kuserfeedback",        # KF6UserFeedback: opt-in telemetry framework (kconfig, kitemmodels)
         # Tier 2 — depend on kconfig
         "kcolorscheme", "kauth",
+        "kpeople",              # KF6People: contact aggregation (kcontacts, kitemmodels)
         # Tier 3 — depend on kauth/kcolorscheme
         "kconfigwidgets",
         # Tier 4 — knotifications must precede kjobwidgets
@@ -1716,14 +2195,23 @@ def phase_kde(target):
         "breeze-icons", "kiconthemes", "kxmlgui", "solid",
         # Tier 6
         "kbookmarks", "kio", "kfilemetadata",
+        "baloo",                # KF6Baloo: file indexer/desktop search (kfilemetadata, kio, kservice)
+        "kdav",                 # KF6DAV: WebDAV client library (kio)
+        "syndication",          # KF6Syndication: RSS/Atom parsing (kcodecs, kcoreaddons, kio)
         # Tier 7
         "ktextwidgets", "knotifyconfig", "kparts", "kwallet",
         # Tier 8 — kirigami must precede ksvg (KirigamiPlatform dep)
         "kirigami", "kdeclarative", "ksvg",
-        "kstatusnotifieritem", "kidletime",
+        "kstatusnotifieritem",  # kidletime moved to Tier 0 above
         "qqc2-desktop-style",  # QQC2 desktop style; required by plasma-desktop
+        # frameworkintegration moved after knewstuff below: it hard-requires
+        # KF6NewStuffCore (find_package(KF6 ... COMPONENTS NewStuffCore)),
+        # which knewstuff wasn't providing yet at this position in the list --
+        # failed with "Could not find a package configuration file provided
+        # by KF6NewStuffCore".
         # Tier 9 — kcmutils required by kwin/plasma; kholidays required by knighttime; attica required by knewstuff
         "kcmutils", "kholidays", "attica", "knewstuff", "krunner",
+        "frameworkintegration", # Qt platform theme plugin: KDE file dialogs/theming in Qt apps (kiconthemes, kirigami, knotifications, knewstuff)
         # Tier 10 — required by plasma-workspace / plasma-nm
         "prison",              # KF6Prison: barcode/QR generator (required by plasma-workspace)
         "syntax-highlighting",  # KF6SyntaxHighlighting: required by ktexteditor
@@ -1732,6 +2220,7 @@ def phase_kde(target):
         "kpty",                # KF6Pty: pseudo-terminal support. Hard requirement
                                # of konsole and kwrited -- no terminal emulator can
                                # be built without it.
+        "kdesu",                # KF6Su: framework-level privilege escalation (kpty, kservice, kiconthemes)
         "networkmanager-qt",   # KF6NetworkManagerQt: REQUIRED by plasma-workspace on Linux
         "modemmanager-qt",     # KF6ModemManagerQt: required by plasma-nm for mobile broadband
         "kquickcharts",        # KF6QuickCharts: required by plasma-pa (volume applet charts)
@@ -1739,6 +2228,30 @@ def phase_kde(target):
     ]
     for mod in kf6:
         _kde_pkg(mod, KF6_VER, KF6_URL, target, env)
+
+    # oxygen-icons — legacy icon theme shipped alongside breeze-icons, but
+    # unlike everything else in `kf6` it is not part of the Frameworks
+    # release train at all: it ships flat at its own dedicated download path
+    # with its own far-slower version numbering (still 6.2.0 as of the
+    # 6.24/6.6.6 LTS line) -- confirmed via the actual directory listing at
+    # download.kde.org/stable/oxygen-icons/, same pattern as kirigami-addons
+    # and pulseaudio-qt below.
+    _kde_pkg("oxygen-icons", "6.2.0",
+             "https://download.kde.org/stable/oxygen-icons",
+             target, env)
+
+    # kmime (KF6Mime: MIME/RFC822 message parsing) -- released via Gear
+    # (release-service), not Frameworks; see the comment left in the kf6
+    # list above. Depends only on kcodecs/kconfig, both already built above.
+    _kde_pkg("kmime", GEAR_VER, GEAR_URL, target, env)
+
+    # kquickimageeditor -- required by spectacle (screenshot tool) for its
+    # image-editing capability. Own release schedule, own dedicated flat
+    # download path, same pattern as kirigami-addons/oxygen-icons/kmime
+    # above -- currently at 0.6.2.1 regardless of the Plasma/KF6 line.
+    _kde_pkg("kquickimageeditor", "0.6.2.1",
+             "https://download.kde.org/stable/kquickimageeditor",
+             target, env)
 
     plasma = [
         # plasma-activities must precede libplasma
@@ -1750,19 +2263,28 @@ def phase_kde(target):
         # mandatory, not optional. Ships in the Plasma release alongside the
         # libs, and must stay version-matched to them.
         "kactivitymanagerd",
+        # libplasma (was plasma-framework in KF5) ships with Plasma release.
+        # Must precede milou below: milou's own CMakeLists find_package()s
+        # "Plasma" (provided by libplasma) directly, failed with "Could not
+        # find a package configuration file provided by Plasma" when milou
+        # was built first.
+        "libplasma",
         # milou provides the org.kde.milou QML module that KWin's Overview
         # effect imports. Without it the effect fails at runtime with
         # 'module "org.kde.milou" is not installed' -- a visible desktop
         # feature breaking, not an optional extra.
         "milou",
-        # libplasma (was plasma-framework in KF5) ships with Plasma release
-        "libplasma",
         # kdecoration provides KDecoration3; kwayland requires wayland >= 1.24 (now built)
         # libkscreen provides KF6Screen required by kscreenlocker; must come first
         # knighttime and kscreenlocker are required by kwin
         "kdecoration", "kwayland", "libkscreen",
-        # layer-shell-qt must be built from 6.7.2 source before kscreenlocker:
-        # system package 6.6.5 is ABI-incompatible with Qt 6.10.3 private API
+        # layer-shell-qt must be built from source (via this same loop, at
+        # PLASMA_VER) before kscreenlocker: the apt/system package build
+        # (was 6.6.5) is ABI-incompatible with our self-built Qt 6.10.3's
+        # private API. The fix is building from source against our own Qt,
+        # not any particular version number -- confirmed layer-shell-qt-
+        # {PLASMA_VER}.tar.xz is published for every Plasma point release,
+        # so this stays correct across the 6.7.2 -> 6.6.6 LTS pin.
         "layer-shell-qt",
         "knighttime", "kscreenlocker",
         "libksysguard",        # KSysGuard libs: required by ksystemstats and optional in plasma-workspace
@@ -1770,6 +2292,71 @@ def phase_kde(target):
         "plasma-nm", "plasma-pa", "powerdevil", "breeze",
         "systemsettings", "plasma-integration", "kdeplasma-addons",
         "ksystemstats", "kscreen",
+        # --- Tier 11: standalone apps/KCMs that plug into an already-built
+        # plasma-workspace/systemsettings. Order among these mostly does not
+        # matter -- their real dependencies (kio, kcmutils, kwallet, ...) are
+        # all Tier 0-10 above -- except where noted.
+        "kde-cli-tools",        # kdesu, kioclient6, KDE URL/mime helpers
+        "polkit-kde-agent-1",   # PolicyKit auth agent; no prompts at all without it
+        "kwrited",              # writes to ptys (kpty); "wall"-style message daemon
+        "kwallet-pam",          # unlocks kwallet automatically at login (PAM module)
+        "ksshaskpass",          # SSH passphrase prompt via kwallet
+        "kmenuedit",            # application-menu editor
+        "kinfocenter",          # "About this System" page in System Settings (#8)
+        "plasma-systemmonitor", # system monitor (needs libksysguard/ksystemstats above)
+        "drkonqi",              # crash handler; crashes are currently silent
+        "print-manager",        # printing configuration (needs libcups2-dev)
+        "bluedevil",            # Bluetooth applet/KCM (needs bluez-qt above)
+        "xdg-desktop-portal-kde",  # portal backend; fixes portal errors + screen sharing (#11)
+        # kwayland-integration deliberately NOT built: it's an unported
+        # KF5/Qt5-only legacy package -- its CMakeLists.txt hard-requires
+        # find_package(Qt5 ...) with no Qt6 option at all, confirmed true
+        # even in upstream's current master branch (checked invent.kde.org
+        # directly), not just our 6.6.6 pin. Plasma 6's own Qt6/QtWayland
+        # stack plus layer-shell-qt (already built above) supersede what
+        # this plugin did for Qt5-based apps; SmechOS never builds Qt5 at
+        # all, so this package simply cannot be built here, by design.
+        "qqc2-breeze-style",    # Breeze QQC2 style (needs kirigami/kiconthemes above)
+        "plasma-browser-integration",  # native-messaging host for the KDE browser extension
+        "plasma-welcome", "plasma-setup",  # first-run onboarding
+        "plasma-workspace-wallpapers",     # extra wallpaper set, data-only
+        "kgamma",               # gamma-correction KCM
+        "plasma-firewall", "plasma-disks", "plasma-vault", "plasma-thunderbolt",
+        "sddm-kcm", "plymouth-kcm",
+        # Theme/decoration assets -- effectively data-only, safe this late
+        "aurorae", "oxygen", "oxygen-sounds", "ocean-sound-theme",
+        # breeze-grub deliberately NOT built: unlike every other package in
+        # this list it ships no CMakeLists.txt at all -- it's just static
+        # assets (background images, a font, mkfont.sh) meant to be copied
+        # into place directly, not built. _kde_pkg()'s cmake_install() path
+        # can't handle that, and it's a purely cosmetic GRUB boot-splash
+        # theme (not required for a working desktop), so it's skipped
+        # rather than writing one-off copy logic for it.
+        "breeze-gtk", "breeze-plymouth",
+        "plasma-sdk",           # developer tools (cuttlefish, kwin scripting console, ...)
+        # --- Known to need system deps this container does not currently
+        # provide -- listed for completeness (audit #14 Tier 3) but expect
+        # the build to fail until Dockerfile.build grows the matching -dev
+        # package. Not blockers for RC3; tracked as follow-up.
+        "kpipewire",            # needs libpipewire-0.3-dev, libdrm-dev
+        "krdp",                 # needs kpipewire above
+        "kde-gtk-config",       # needs libgtk-3-dev + gsettings-desktop-schemas
+                                # (GTK4 was never actually required, despite this
+                                # comment's old claim -- checked its CMakeLists directly)
+        "flatpak-kcm",          # needs libflatpak-dev
+        "wacomtablet",          # needs libwacom-dev
+        # union deliberately NOT built: no release tarball exists for it
+        # anywhere in KDE's stable download infrastructure -- checked
+        # frameworks/6.24, release-service (Gear), the top-level stable/
+        # tree, and even unstable/plasma/, all empty. It's git-only on
+        # invent.kde.org, a developer-facing Plasma theme SDK base, not
+        # something a working desktop needs -- _kde_pkg() has no git-clone
+        # path anyway, only tarball download.
+        "spectacle",            # screenshot tool (#13): needs OpenCV >= 4.7,
+                                 # kpipewire above for screen-recording, and
+                                 # KF6Prison built with PrisonScanner (WITH_ZXING=ON
+                                 # + zxing-cpp) for the QR/barcode reader -- the
+                                 # prison entry above builds -DWITH_ZXING=OFF.
     ]
     # kirigami-addons has its own release schedule; tarballs sit flat in the dir
     _kde_pkg("kirigami-addons", "1.12.1",
@@ -1817,6 +2404,15 @@ def phase_kde(target):
 
     for mod in plasma:
         _kde_pkg(mod, PLASMA_VER, PLASMA_URL, target, env)
+
+    # KDE Gear apps -- separate version series from Plasma/KF6 (see GEAR_VER above)
+    gear = [
+        "konsole",   # terminal emulator (#9); needs kpty above, plus kdoctools
+                     # for its handbook -- see the kdoctools DocBook catalog
+                     # note on _kde_pkg's XDG_DATA_DIRS/XML_CATALOG_FILES handling.
+    ]
+    for mod in gear:
+        _kde_pkg(mod, GEAR_VER, GEAR_URL, target, env)
 
 def _pam_ensure_line(pam_file, marker_re, line):
     """Idempotently append `line` to a PAM service file unless a line already
@@ -2005,37 +2601,57 @@ def phase_xwayland_deps(target):
     this session with a Qt private-symbol rebuild.
     """
     log_phase("xwayland-deps", "Fetch Xwayland + xkbcomp + xkb-data (Ubuntu 24.04 ABI)")
-    if not shutil.which("podman"):
-        err("podman not found on build host -- required to fetch Xwayland/xkbcomp "
-            "from a matching-ABI Ubuntu 24.04 container. Install podman and re-run "
-            "this phase (--phase xwayland-deps).")
 
-    container = "spk-xwayland-build"
-    run(["podman", "rm", "-f", container], check=False)
-    run(["podman", "run", "-d", "--name", container, "ubuntu:24.04", "sleep", "infinity"])
-    try:
-        run(["podman", "exec", container, "bash", "-c",
-             "apt-get update -qq && apt-get install -y -qq xwayland x11-xkb-utils"])
+    extra_libs = ["libXfont2.so.2", "libfontenc.so.1", "libxkbfile.so.1"]
+    tmp = os.path.join(BUILD_TMP, "xwayland-import")
+    shutil.rmtree(tmp, ignore_errors=True)
+    ensure(tmp)
 
-        tmp = os.path.join(BUILD_TMP, "xwayland-import")
-        shutil.rmtree(tmp, ignore_errors=True)
-        ensure(tmp)
-        run(["podman", "cp", f"{container}:/usr/bin/Xwayland", tmp])
-        run(["podman", "cp", f"{container}:/usr/bin/xkbcomp", tmp])
-        run(["podman", "cp", f"{container}:/usr/share/X11/xkb", os.path.join(tmp, "xkb")])
-
-        # Only libs not already covered elsewhere in the pipeline (kwin-deps,
-        # qt-deps, mesa) -- checked against what those phases install.
-        extra_libs = ["libXfont2.so.2", "libfontenc.so.1", "libxkbfile.so.1"]
+    if _in_matching_build_image():
+        # Already running inside an Ubuntu-24.04-ABI-matched container (see
+        # _in_matching_build_image) -- no need to spin up a nested one just
+        # to apt-get install into it, install straight into this container.
+        run(["apt-get", "update", "-qq"])
+        run(["apt-get", "install", "-y", "-qq", "xwayland", "x11-xkb-utils"])
+        shutil.copy2("/usr/bin/Xwayland", tmp)
+        shutil.copy2("/usr/bin/xkbcomp", tmp)
+        shutil.copytree("/usr/share/X11/xkb", os.path.join(tmp, "xkb"), dirs_exist_ok=True)
         for lib in extra_libs:
-            proc = subprocess.run(
-                ["podman", "exec", container, "bash", "-c",
-                 f"readlink -f /lib/x86_64-linux-gnu/{lib}"],
-                capture_output=True, text=True, check=True)
-            real = proc.stdout.strip()
-            run(["podman", "cp", f"{container}:{real}", os.path.join(tmp, os.path.basename(real))])
-    finally:
+            real = os.path.realpath(f"/lib/x86_64-linux-gnu/{lib}")
+            shutil.copy2(real, os.path.join(tmp, os.path.basename(real)))
+    else:
+        # Not already in a matching container (e.g. running spk-compile.py
+        # directly on a bare host) -- pull from a throwaway one instead, so
+        # these binaries/libs are never copied from a host whose glibc/
+        # libstdc++ build might not match the Debian/Ubuntu ABI this
+        # pipeline's target rootfs expects (see build_env_glibc). That
+        # mismatch is exactly the class of bug this phase exists to avoid.
+        if not shutil.which("podman"):
+            err("podman not found on build host -- required to fetch Xwayland/xkbcomp "
+                "from a matching-ABI Ubuntu 24.04 container. Install podman and re-run "
+                "this phase (--phase xwayland-deps).")
+
+        container = "spk-xwayland-build"
         run(["podman", "rm", "-f", container], check=False)
+        run(["podman", "run", "-d", "--name", container, "ubuntu:24.04", "sleep", "infinity"])
+        try:
+            run(["podman", "exec", container, "bash", "-c",
+                 "apt-get update -qq && apt-get install -y -qq xwayland x11-xkb-utils"])
+            run(["podman", "cp", f"{container}:/usr/bin/Xwayland", tmp])
+            run(["podman", "cp", f"{container}:/usr/bin/xkbcomp", tmp])
+            run(["podman", "cp", f"{container}:/usr/share/X11/xkb", os.path.join(tmp, "xkb")])
+
+            # Only libs not already covered elsewhere in the pipeline
+            # (kwin-deps, qt-deps, mesa) -- checked against those phases.
+            for lib in extra_libs:
+                proc = subprocess.run(
+                    ["podman", "exec", container, "bash", "-c",
+                     f"readlink -f /lib/x86_64-linux-gnu/{lib}"],
+                    capture_output=True, text=True, check=True)
+                real = proc.stdout.strip()
+                run(["podman", "cp", f"{container}:{real}", os.path.join(tmp, os.path.basename(real))])
+        finally:
+            run(["podman", "rm", "-f", container], check=False)
 
     arch_libdir = os.path.join(target, "usr", "lib", "x86_64-linux-gnu")
     ensure(arch_libdir)
@@ -2151,9 +2767,12 @@ def _phase_fastfetch(target):
     download(FASTFETCH_URL, tarball)
     bd = os.path.join(BUILD_TMP, "fastfetch")
     shutil.rmtree(bd, ignore_errors=True)
+    # extract() already strips the tarball's own top-level directory
+    # (default strip=1), so the real source (CMakeLists.txt etc.) lands
+    # directly in bd -- there's no separate "fastfetch-{VER}" subdirectory
+    # to descend into on top of that.
     extract(tarball, bd)
-    bd_src = os.path.join(bd, f"fastfetch-{FASTFETCH_VER}")
-    cmake_install(bd_src, prefix)
+    cmake_install(bd, prefix)
 
     # System-wide default config: fastfetch checks /etc/xdg/fastfetch first
     # when no per-user config exists, so this is what a fresh SmechOS user
@@ -2245,6 +2864,26 @@ def phase_plasma_discover(target):
             env=env)
         _mark_done(_pf, pkqt_stamp)
 
+    # The real spk binary itself. Never previously downloaded by this
+    # pipeline at all -- whatever was at usr/bin/spk in the target was
+    # stale/pre-seeded cruft from before this session's work (a genuine
+    # v1-era build: `spk help` showed only system-install/userland-install/
+    # entire-system-upgrade/about/help, no `packagekit-backend` subcommand
+    # at all). That matters because pk-backend-spk.py below execs
+    # `spk packagekit-backend` -- with the stale binary that call fails
+    # outright ("Unknown command"), meaning Discover could never actually
+    # install or update anything on this build. Confirmed the real v2.0.1
+    # release genuinely has `packagekit-backend` (and `install`/
+    # `system-upgrade`/`compile`/deploy commands) before wiring this in.
+    spk_bin_url = "https://github.com/Smech-Labs/spk/releases/download/v2.0.1/spk"
+    spk_bin_dst = os.path.join(target, "usr", "bin", "spk")
+    spk_bin_tmp = os.path.join(src, "spk-v2.0.1")
+    download(spk_bin_url, spk_bin_tmp)
+    ensure(os.path.dirname(spk_bin_dst))
+    shutil.copy2(spk_bin_tmp, spk_bin_dst)
+    os.chmod(spk_bin_dst, 0o755)
+    log("Installed real spk v2.0.1 binary to usr/bin/spk.", color=GREEN)
+
     # SPK PackageKit script backend
     backend_dir = os.path.join(target, "usr", "lib", "packagekit-backend")
     ensure(backend_dir)
@@ -2285,7 +2924,15 @@ def phase_plasma_discover(target):
 def phase_bundle_packages(target):
     """Bundle compiled output into .tar.xz packages consumable by spk install."""
     log_phase("bundle", "Bundle compiled output into spk-installable .tar.xz packages")
-    out = "/tmp/smechos-packages"
+    # NOT /tmp: this build always runs inside an ephemeral `podman run --rm`
+    # container (see the whole session's workflow) whose /tmp is the
+    # container's own writable layer, discarded the instant it exits --
+    # only /mnt (bind-mounted from the host) survives. A prior run
+    # confirmed this the hard way: the bundle step logged real non-zero
+    # .tar.xz sizes and sha256 hashes, but /tmp/smechos-packages was
+    # completely gone moments after the container exited -- every package
+    # silently lost despite "BUILD COMPLETE".
+    out = "/mnt/smechos-packages"
     shutil.rmtree(out, ignore_errors=True)
     ensure(out)
 
@@ -2346,30 +2993,67 @@ def phase_bundle_packages(target):
         "usr/lib/qt6", "usr/plugins", "usr/qml",
     ])
 
+    # dri/gallium-pipe are only installed under the arch-qualified dir --
+    # confirmed via find, unlike the individual libGL/libEGL/etc SONAMEs
+    # above which _symlink_arch_libs() mirrors to bare usr/lib/ too.
     tar_paths("mesa-graphics", [
         "usr/lib/libGL.so.1", "usr/lib/libEGL.so.1",
         "usr/lib/libgbm.so.1", "usr/lib/libglapi.so.0",
         "usr/lib/libvulkan.so.1",
-        "usr/lib/dri", "usr/lib/gallium-pipe",
+        "usr/lib/x86_64-linux-gnu/dri", "usr/lib/x86_64-linux-gnu/gallium-pipe",
         "usr/share/vulkan", "usr/share/glvnd",
     ])
 
+    # Real names verified directly against actual build output (not the
+    # approximate/guessed names this manifest originally had -- e.g. there
+    # is no "KF6Core", KDE Frameworks names each split module explicitly:
+    # KF6CoreAddons, KF6ConfigCore/ConfigGui, KF6KIOCore/KIOWidgets/etc.
     tar_paths("kde-frameworks", [
-        "usr/lib/libKF6Core.so.6", "usr/lib/libKF6Config.so.6",
+        "usr/lib/libKF6CoreAddons.so.6", "usr/lib/libKF6ConfigCore.so.6",
+        "usr/lib/libKF6ConfigGui.so.6",
         "usr/lib/libKF6ConfigWidgets.so.6", "usr/lib/libKF6I18n.so.6",
-        "usr/lib/libKF6IconThemes.so.6", "usr/lib/libKF6KIO.so.6",
+        "usr/lib/libKF6IconThemes.so.6", "usr/lib/libKF6KIOCore.so.6",
+        "usr/lib/libKF6KIOWidgets.so.6", "usr/lib/libKF6KIOGui.so.6",
+        "usr/lib/libKF6KIOFileWidgets.so.6",
         "usr/lib/libKF6Parts.so.6", "usr/lib/libKF6Service.so.6",
         "usr/lib/libKF6Solid.so.6", "usr/lib/libKF6WindowSystem.so.6",
         "usr/lib/libKF6XmlGui.so.6",
         "usr/share/kf6", "usr/share/locale",
     ])
 
+    # kwin_x11 deliberately not listed: SmechOS is Wayland-only by design
+    # (see project memory on the Plasma 6.6 LTS pivot -- X11 *session*
+    # support doesn't matter here, only XWayland app compatibility does,
+    # handled separately by phase_xwayland_deps). libPlasma/libPlasmaQuick
+    # are capitalized this way in the real build output.
+    #
+    # Re-verified against actual build output post-BUILD-COMPLETE (the
+    # previous version of this manifest silently skipped 3 of 11 paths --
+    # never caught because a skip only logs a warning, not a hard error):
+    #   - libPlasma's real current SONAME is .so.7 (confirmed via
+    #     usr/lib/x86_64-linux-gnu/libPlasma.so.7 -> libPlasma.so.6.6.6,
+    #     the real, root-owned, freshly-built symlink) -- ".so.6" doesn't
+    #     exist as a bare SONAME file at all, only full point-release
+    #     filenames like libPlasma.so.6.6.6 do. A STALE, wrongly-versioned
+    #     bare usr/lib/libPlasma.so.7 -> libPlasma.so.6.7.2 symlink also
+    #     exists (smech-owned, older, from earlier session cruft) --
+    #     deliberately using the arch-qualified path here to bypass it.
+    #   - kwin has no usr/lib/kwin at all; its real plugin dir is
+    #     usr/lib/x86_64-linux-gnu/plugins/kwin.
+    #   - plasma-desktop is not a literal directory/binary in modern
+    #     Plasma 6 -- its functionality is plasmashell plus a long list of
+    #     individually-named plasma-apply-*/plasma-open-settings/etc.
+    #     binaries (already living in usr/bin, not separately bundled
+    #     here) and KCM .so's scattered directly under
+    #     usr/lib/x86_64-linux-gnu/ by name -- no single path to include,
+    #     so the entry is dropped rather than pointing at something fake.
     tar_paths("plasma", [
-        "usr/bin/plasmashell", "usr/bin/kwin_wayland", "usr/bin/kwin_x11",
+        "usr/bin/plasmashell", "usr/bin/kwin_wayland",
         "usr/bin/sddm", "usr/bin/startplasma-wayland",
         "usr/bin/krunner", "usr/bin/kscreen-doctor",
-        "usr/lib/libplasma.so.6", "usr/lib/libplasmaquick.so.6",
-        "usr/lib/plasma-desktop", "usr/lib/kwin",
+        "usr/lib/x86_64-linux-gnu/libPlasma.so.7",
+        "usr/lib/libPlasmaQuick.so.7",
+        "usr/lib/x86_64-linux-gnu/plugins/kwin",
         "usr/share/plasma", "usr/share/sddm",
         "usr/share/applications/org.kde.plasmashell.desktop",
         "etc/sddm.conf.d",
@@ -2381,9 +3065,23 @@ def phase_bundle_packages(target):
         "usr/share/applications/org.kde.discover.desktop",
     ])
 
+    # packagekitd installs to usr/libexec, not usr/bin (confirmed via find --
+    # meson's default libexecdir). usr/lib/x86_64-linux-gnu/packagekit-backend
+    # holds PackageKit's own compiled stub/test backends (dummy, apt, test_*)
+    # -- irrelevant to SmechOS (the "apt" one would try to exec apt-get,
+    # which doesn't exist on target) but harmless to leave in place.
+    # usr/lib/packagekit-backend (bare, NOT arch-qualified -- a genuinely
+    # different directory) is where the actual pk-backend-spk.py script
+    # backend lives, confirmed via DefaultBackend=spk in PackageKit.conf --
+    # this manifest previously omitted it entirely, meaning the one backend
+    # that actually matters was never shipped. usr/bin/spk is the real spk
+    # binary that pk-backend-spk.py execs into ("spk packagekit-backend") --
+    # without it the script backend fails immediately at runtime.
     tar_paths("packagekit-spk", [
-        "usr/bin/packagekitd",
+        "usr/libexec/packagekitd",
+        "usr/lib/x86_64-linux-gnu/packagekit-backend",
         "usr/lib/packagekit-backend",
+        "usr/bin/spk",
         "usr/share/dbus-1/system-services/org.freedesktop.PackageKit.service",
         "etc/PackageKit",
     ])
@@ -2534,7 +3232,7 @@ def phase_systemd(target):
             "-Dqrencode=disabled",
             "-Dpolkit=disabled",
             "-Delfutils=disabled",
-            "-Dkmod=disabled",
+            "-Dkmod=enabled",
             "-Dukify=disabled",
             "-Dbootloader=disabled",
             "-Ddns-over-tls=false",
@@ -2544,6 +3242,84 @@ def phase_systemd(target):
         ],
         env=env, build_dir=os.path.join(BUILD_TMP, "systemd-build"))
     log(f"systemd {systemd_ver} installed.", color=GREEN)
+
+    # liblz4-dev (see Dockerfile.build) satisfies the build-time header
+    # need, but systemd links a real NEEDED liblz4.so.1 once HAVE_LZ4=1 --
+    # the resulting binaries can't even start without it present in the
+    # shipped rootfs. Copy the container's real runtime .so in, same
+    # pattern as the libical/libhunspell/etc. seeds in phase_kde -- this
+    # one has to live here instead since systemd builds far earlier.
+    arch_libdir = os.path.join(target, "usr", "lib", "x86_64-linux-gnu")
+    ensure(arch_libdir)
+    # A re-run of this phase after a later step fails (the normal case while
+    # iterating on the build) re-enters here from the top -- these dest
+    # files from the previous attempt are already in place, so copy2 must
+    # overwrite rather than crash on FileExistsError for the symlinks.
+    lz4_copied = 0
+    for f in glob.glob("/usr/lib/x86_64-linux-gnu/liblz4.so*"):
+        dst = os.path.join(arch_libdir, os.path.basename(f))
+        if os.path.lexists(dst):
+            os.remove(dst)
+        shutil.copy2(f, dst, follow_symlinks=False)
+        lz4_copied += 1
+    if lz4_copied == 0:
+        err("No liblz4.so* found in the build container -- is liblz4-dev "
+            "installed? (see Dockerfile.build)")
+    log(f"Copied {lz4_copied} liblz4 runtime file(s) into target rootfs", color=GREEN)
+
+    # libkmod-dev (see Dockerfile.build): -Dkmod=enabled links a real NEEDED
+    # libkmod.so.2 into systemd-udevd. Without it (and without this copy,
+    # same pattern as liblz4 above), udev has no way to auto-load any
+    # module-only (=m) driver for hotplugged/PCI-probed hardware -- confirmed
+    # via boot-test as the reason virtio_gpu, and by extension any real GPU/
+    # NIC/storage driver built as a module, never loads on a live boot.
+    kmod_copied = 0
+    for f in glob.glob("/usr/lib/x86_64-linux-gnu/libkmod.so*"):
+        dst = os.path.join(arch_libdir, os.path.basename(f))
+        if os.path.lexists(dst):
+            os.remove(dst)
+        shutil.copy2(f, dst, follow_symlinks=False)
+        kmod_copied += 1
+    if kmod_copied == 0:
+        err("No libkmod.so* found in the build container -- is libkmod-dev "
+            "installed? (see Dockerfile.build)")
+    log(f"Copied {kmod_copied} libkmod runtime file(s) into target rootfs", color=GREEN)
+
+    acl_copied = 0
+    for f in glob.glob("/usr/lib/x86_64-linux-gnu/libacl.so*"):
+        dst = os.path.join(arch_libdir, os.path.basename(f))
+        if os.path.lexists(dst):
+            os.remove(dst)
+        shutil.copy2(f, dst, follow_symlinks=False)
+        acl_copied += 1
+    if acl_copied == 0:
+        err("No libacl.so* found in the build container -- is libacl1-dev "
+            "installed? (see Dockerfile.build)")
+    log(f"Copied {acl_copied} libacl runtime file(s) into target rootfs", color=GREEN)
+
+    seccomp_copied = 0
+    for f in glob.glob("/usr/lib/x86_64-linux-gnu/libseccomp.so*"):
+        dst = os.path.join(arch_libdir, os.path.basename(f))
+        if os.path.lexists(dst):
+            os.remove(dst)
+        shutil.copy2(f, dst, follow_symlinks=False)
+        seccomp_copied += 1
+    if seccomp_copied == 0:
+        err("No libseccomp.so* found in the build container -- is libseccomp-dev "
+            "installed? (see Dockerfile.build)")
+    log(f"Copied {seccomp_copied} libseccomp runtime file(s) into target rootfs", color=GREEN)
+
+    archive_copied = 0
+    for f in glob.glob("/usr/lib/x86_64-linux-gnu/libarchive.so*"):
+        dst = os.path.join(arch_libdir, os.path.basename(f))
+        if os.path.lexists(dst):
+            os.remove(dst)
+        shutil.copy2(f, dst, follow_symlinks=False)
+        archive_copied += 1
+    if archive_copied == 0:
+        err("No libarchive.so* found in the build container -- is libarchive-dev "
+            "installed? (see Dockerfile.build)")
+    log(f"Copied {archive_copied} libarchive runtime file(s) into target rootfs", color=GREEN)
 
 def phase_systemd_configure(target):
     """Configure baseline systemd state (graphical target, machine-id, hostname).
@@ -2564,6 +3340,46 @@ def phase_systemd_configure(target):
     if not os.path.lexists(default_link):
         symlink(graphical, default_link)
 
+    # Explicit GPU module load, independent of udev's own module auto-loading.
+    # This systemd build compiles with -Dkmod=enabled (meson confirms
+    # "Run-time dependency libkmod found"), but readelf shows no binary in the
+    # final install actually links libkmod.so -- systemd 261's udev "kmod"
+    # builtin apparently isn't wired the way older systemd versions were
+    # (a stale libsystemd-shared-255.so left over from an earlier build DOES
+    # link libkmod, 261 does not), so udev's own MODALIAS-triggered autoload
+    # can't be trusted here. depmod (see phase_kernel) still populates a real
+    # modules.dep/modules.alias, and standalone /usr/sbin/modprobe reads that
+    # directly with zero dependency on systemd's own kmod linkage -- so call
+    # it explicitly instead of relying on an auto-load path that may be inert.
+    #
+    # This is a drop-in on plasmalogin.service itself, NOT a standalone unit.
+    # Three different standalone-unit strategies (DefaultDependencies=no +
+    # Before=sysinit.target; the same with WantedBy=graphical.target +
+    # Before=display-manager.service; both with output forced to console)
+    # all passed `systemctl is-enabled`/`systemd-analyze verify` cleanly yet
+    # produced zero trace in a real boot log across many boot-tested
+    # rebuilds -- no Starting/Finished status line, not even a raw `echo
+    # >/dev/console` from inside the unit's own ExecStart. Root cause never
+    # isolated. plasmalogin.service is proven to run every single boot
+    # (visible "Starting/Started Plasma Login Manager" every time), so
+    # piggybacking on its own ExecStartPre via a drop-in sidesteps whatever
+    # was silently dropping the standalone unit's job from the transaction.
+    plasmalogin_dropin_dir = os.path.join(target, "etc", "systemd", "system",
+                                           "plasmalogin.service.d")
+    ensure(plasmalogin_dropin_dir)
+    with open(os.path.join(plasmalogin_dropin_dir, "10-smechos-gpu-modules.conf"), "w") as f:
+        f.write(textwrap.dedent("""\
+            [Service]
+            ExecStartPre=/bin/sh -c '\
+                /usr/sbin/modprobe -v virtio_pci; \
+                /usr/sbin/modprobe -v virtio_gpu; \
+                /usr/sbin/modprobe -v amdgpu; \
+                /usr/sbin/modprobe -v i915; \
+                /usr/sbin/modprobe -v nouveau; \
+                /usr/sbin/modprobe -v radeon; \
+                true'
+        """))
+
     # machine-id placeholder
     mid = os.path.join(target, "etc", "machine-id")
     if not os.path.exists(mid):
@@ -2577,6 +3393,75 @@ def phase_systemd_configure(target):
             f.write("smechos\n")
 
     log("Baseline systemd config applied.", color=GREEN)
+
+def phase_locale(target):
+    """Generate a real en_US.UTF-8 locale and install it into the rootfs.
+
+    /etc/locale.conf has always correctly said LANG=en_US.UTF-8 (see
+    phase_write_etc), but that locale was never actually *compiled* --
+    /usr/share/i18n (locale source data) and /usr/lib/locale (the compiled
+    archive) didn't exist at all, so every Qt/KDE process fell back to the
+    "C" locale (issue #5: "No UTF-8 locale generated"). glibc's setlocale()
+    doesn't error loudly on this -- callers get "C" silently -- but Qt
+    checks explicitly and logs "Qt depends on a UTF-8 locale, but has
+    failed to switch to one." QML/Kirigami text rendering doesn't route
+    through the affected codepath and looks fine either way, which is why
+    this was easy to miss: KWin's own window-decoration text (drawn via
+    classic QPainter, not QML) is the one place it visibly breaks, as
+    tofu-box glyphs in every window titlebar.
+
+    en_US.UTF-8 (not just C.UTF-8) specifically because C.UTF-8 has no X11
+    Compose file in any distro, so it doesn't actually establish Compose
+    file lookups don't fail -- see "couldn't find a Compose file for locale
+    C.UTF-8" in the same issue's downstream symptom.
+
+    Locale data has no source in this pipeline the way KF6/Plasma do
+    (there's no "locale-6.27.0.tar.xz" to download) -- it comes from the
+    real Ubuntu 24.04 locales + libx11-data packages, matching how systemd
+    itself is sourced in phase_systemd. Verify with a real chroot, not an
+    LD_LIBRARY_PATH-substituted container run: glibc's locale loader treats
+    /usr/lib/locale/locale-archive as an absolute host path via a plain
+    openat(), so without an actual chroot it silently resolves against the
+    container's own root instead of target's, and looks broken when it
+    isn't (or vice versa).
+    """
+    log_phase("locale", "Generate en_US.UTF-8 locale")
+    if os.path.exists(os.path.join(target, "usr/lib/locale/locale-archive")):
+        log("locale already generated -- skipping", color=YELLOW)
+        return
+
+    dirs = (("/usr/share/i18n",       "usr/share/i18n"),
+            ("/usr/share/X11/locale", "usr/share/X11/locale"),
+            ("/usr/lib/locale",       "usr/lib/locale"))
+
+    if _in_matching_build_image():
+        # Already running inside an Ubuntu-24.04-ABI-matched container --
+        # generate straight into it and copy out, no nested container needed.
+        run(["apt-get", "update", "-qq"])
+        run(["apt-get", "install", "-y", "-qq", "--no-install-recommends", "locales", "libx11-data"])
+        run(["locale-gen", "en_US.UTF-8"])
+        for src, dst in dirs:
+            dst_path = os.path.join(target, dst)
+            shutil.rmtree(dst_path, ignore_errors=True)
+            ensure(os.path.dirname(dst_path))
+            shutil.copytree(src, dst_path, dirs_exist_ok=True)
+    else:
+        cid = subprocess.run(
+            ["sudo", "podman", "run", "-d", "ubuntu:24.04", "sleep", "300"],
+            capture_output=True, text=True, check=True).stdout.strip()
+        try:
+            run(["sudo", "podman", "exec", cid, "bash", "-c",
+                 "apt-get update -qq && "
+                 "apt-get install -y -qq --no-install-recommends locales libx11-data && "
+                 "locale-gen en_US.UTF-8"])
+            for src, dst in dirs:
+                dst_path = os.path.join(target, dst)
+                shutil.rmtree(dst_path, ignore_errors=True)
+                ensure(os.path.dirname(dst_path))
+                run(["sudo", "podman", "cp", f"{cid}:{src}", dst_path])
+        finally:
+            run(["sudo", "podman", "stop", "-t", "0", cid])
+    log("en_US.UTF-8 locale installed.", color=GREEN)
 
 def phase_calamares(target):
     """Build Calamares graphical installer and its deps (yaml-cpp, kpmcore)."""
@@ -2599,8 +3484,12 @@ def phase_calamares(target):
         env=env, build_dir=os.path.join(BUILD_TMP, "yaml-cpp-build"))
 
     # extra-cmake-modules (ECM) — needed by kpmcore + calamares
+    # (already built once in phase_kde too; rebuilt here since this phase
+    # can run standalone. Uses KF6_URL rather than a second hardcoded
+    # frameworks path -- that was stale at the old "6.27" bleeding-edge
+    # line and would 404 against the LTS-pinned 6.24 line.)
     ecm_ver = KF6_VER
-    ecm_url = f"https://download.kde.org/stable/frameworks/6.27/extra-cmake-modules-{ecm_ver}.tar.xz"
+    ecm_url = f"{KF6_URL}/extra-cmake-modules-{ecm_ver}.tar.xz"
     tarball = os.path.join(src, f"extra-cmake-modules-{ecm_ver}.tar.xz")
     download(ecm_url, tarball)
     bd = os.path.join(BUILD_TMP, "ecm")
@@ -2672,6 +3561,58 @@ def phase_calamares(target):
             dont-chroot: false
         """))
 
+    # Per-module Calamares configuration.
+    #
+    # settings.conf's `sequence:` names 15 modules, but building Calamares
+    # itself installs none of their .conf files: CMakeAddModuleSubdirectory's
+    # config-file install() only fires for the *module.desc* (job-module)
+    # branch, gated on -DINSTALL_CONFIG, and even then it installs to
+    # /usr/share/calamares/modules -- for CMakeLists.txt (C++/Qt-plugin)
+    # modules, which is what welcome/locale/keyboard/partition/users/summary
+    # are, the glob'd .conf is synced only into the *build directory* (for
+    # `calamares -d`), never installed anywhere at all. Every real distro's
+    # Calamares packaging supplies its own /etc/calamares/modules/*.conf --
+    # upstream's tarball is not meant to be usable un-configured. Without
+    # these, the ModuleManager fails to instantiate the modules named in
+    # `sequence:` and Calamares does not present a working UI when launched.
+    #
+    # Copied from the still-on-disk extracted source (`bd`) rather than
+    # hand-written, since these are exactly the same stock per-module
+    # defaults every Calamares-based distro ships unless it has a reason to
+    # deviate -- verified sane for SmechOS specifically: users.conf's
+    # `sudoersGroup: wheel` matches the "wheel" (not Debian's "sudo") group
+    # SmechOS's own rootfs already uses; bootloader.conf's grubInstall/
+    # grubMkconfig/grubCfg defaults match our self-built GRUB 2.12 at
+    # /boot/grub/grub.cfg; efi.mountPoint "/boot/efi" matches our grub-efi
+    # build. summary/localecfg/networkcfg ship no .conf upstream either --
+    # they're genuinely configless, not another instance of this gap.
+    modules_etc = os.path.join(cal_etc, "modules")
+    ensure(modules_etc)
+    for mod in ("welcome", "locale", "keyboard", "partition", "users", "mount",
+                "unpackfs", "machineid", "fstab", "grubcfg", "bootloader", "umount",
+                "finished"):
+        src_conf = os.path.join(bd, "src", "modules", mod, f"{mod}.conf")
+        if os.path.isfile(src_conf):
+            shutil.copy2(src_conf, os.path.join(modules_etc, f"{mod}.conf"))
+        else:
+            log(f"No stock {mod}.conf found in Calamares source — skipping", color=YELLOW)
+
+    # unpackfs.conf's stock content is a dummy example (copies CHANGES and a
+    # slideshow dir) -- point it at what phase_live_iso() actually produces:
+    # a single squashfs holding the whole target rootfs, unsquashed to /.
+    # Source path matches the live-initramfs init script (phase_live_initramfs),
+    # which now bind-persists /mnt/cdrom into the switched-to root at the
+    # same path specifically so this is still readable once the live desktop
+    # session (and thus Calamares) is running.
+    with open(os.path.join(modules_etc, "unpackfs.conf"), "w") as f:
+        f.write(textwrap.dedent("""\
+            ---
+            unpack:
+                -   source: "/mnt/cdrom/live/filesystem.squashfs"
+                    sourcefs: "squashfs"
+                    destination: ""
+        """))
+
     # SmechOS branding for Calamares
     brand_dir = os.path.join(target, "usr", "share", "calamares", "branding", "smechos")
     ensure(brand_dir)
@@ -2699,25 +3640,107 @@ def phase_calamares(target):
               sidebarText: "#cdd6f4"
               sidebarTextHighlight: "#89b4fa"
         """))
+
+    # branding.desc references smechos.png/show.png/show.qml, but nothing
+    # ever created them -- confirmed via a real boot test: `calamares` binary
+    # itself launches fine (dbus/render-node/messagebus fixes all hold), but
+    # immediately bails FATAL: "Slideshow file .../show.qml does not exist or
+    # is not a valid QML file." Real SmechOS branding art doesn't exist yet,
+    # so generate minimal placeholders (pure Python stdlib PNG writer, no new
+    # build dependency) rather than block the installer on branding assets.
+    def _write_minimal_png(path, size=256, rgb=(30, 30, 46)):
+        w = h = size
+        raw = bytearray()
+        for _ in range(h):
+            raw.append(0)
+            raw.extend(bytes(rgb) * w)
+        def chunk(tag, data):
+            c = tag + data
+            return struct.pack(">I", len(data)) + c + struct.pack(">I", zlib.crc32(c))
+        png = b"\x89PNG\r\n\x1a\n"
+        png += chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+        png += chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+        png += chunk(b"IEND", b"")
+        with open(path, "wb") as f:
+            f.write(png)
+    _write_minimal_png(os.path.join(brand_dir, "smechos.png"), rgb=(137, 180, 250))
+    _write_minimal_png(os.path.join(brand_dir, "show.png"), rgb=(30, 30, 46))
+    with open(os.path.join(brand_dir, "show.qml"), "w") as f:
+        f.write(textwrap.dedent("""\
+            import QtQuick 2.0
+            Item {
+                id: presentation
+                function activate() {}
+                function deactivate() {}
+            }
+        """))
+
+    # Auto-launch Calamares when booted from the "Install SmechOS
+    # (Calamares)" GRUB entry. That menuentry has always passed
+    # calamares=1 on the kernel command line, but nothing anywhere in this
+    # codebase ever read it -- confirmed via a real boot test: selecting
+    # that entry just landed on the normal live desktop with no installer
+    # in sight. Standard live-CD pattern: an XDG autostart entry that
+    # unconditionally runs every Plasma session, gated by a plain
+    # /proc/cmdline grep so it's a no-op on the regular "Live" entries.
+    autostart_dir = os.path.join(target, "etc", "xdg", "autostart")
+    ensure(autostart_dir)
+    with open(os.path.join(autostart_dir, "smechos-calamares-autostart.desktop"), "w") as f:
+        f.write(textwrap.dedent("""\
+            [Desktop Entry]
+            Type=Application
+            Name=SmechOS Installer
+            Exec=/bin/sh -c 'grep -qw calamares=1 /proc/cmdline && exec calamares'
+            NoDisplay=true
+            X-KDE-autostart-phase=1
+        """))
     log("Calamares installed.", color=GREEN)
 
-def phase_google_chrome(target):
-    """Download and extract the Google Chrome stable .deb into target."""
-    log_phase("chrome", "Install Google Chrome stable")
+def phase_firefox(target):
+    """Download and extract the official Mozilla Firefox linux64 tarball
+    into /opt/firefox. Unlike Chrome's Debian-repackaged .deb, upstream
+    Firefox ships no system .desktop entry or apt/cron artifacts to strip --
+    confirmed via the real tarball listing (firefox-154.0.tar.xz): a single
+    top-level firefox/ dir containing the `firefox` binary directly, plus
+    browser/chrome/icons/default/default{16,32,48,64,128}.png icons. Both
+    facts (binary location, icon paths) drive the symlink/.desktop below."""
+    log_phase("firefox", "Install Mozilla Firefox stable")
     src = sources(target)
-    url = "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
-    deb = os.path.join(src, "google-chrome-stable_current_amd64.deb")
-    download(url, deb)
-    log("Extracting Chrome .deb...")
-    _extract_deb(deb, target)
-    # Strip Debian-specific cron/apt artifacts that don't apply on SmechOS
-    for unwanted in [
-        os.path.join(target, "etc", "cron.daily", "google-chrome"),
-        os.path.join(target, "etc", "apt", "sources.list.d", "google-chrome.list"),
-    ]:
-        if os.path.exists(unwanted):
-            os.remove(unwanted)
-    log("Google Chrome installed.", color=GREEN)
+    # download.mozilla.org 302-redirects to the real versioned tarball --
+    # urlretrieve follows redirects automatically, and extract()'s `tar -xf`
+    # auto-detects the compression format, so the exact upstream extension
+    # (tar.xz today) doesn't need to be hardcoded here.
+    url = "https://download.mozilla.org/?product=firefox-latest&os=linux64&lang=en-US"
+    tarball = os.path.join(src, "firefox-latest-linux64.tar.xz")
+    download(url, tarball)
+    log("Extracting Firefox tarball...")
+    opt_dir = os.path.join(target, "opt", "firefox")
+    shutil.rmtree(opt_dir, ignore_errors=True)
+    extract(tarball, opt_dir)  # strip=1 drops the tarball's own firefox/ top dir
+
+    bin_link = os.path.join(target, "usr", "bin", "firefox")
+    ensure(os.path.dirname(bin_link))
+    if os.path.lexists(bin_link):
+        os.remove(bin_link)
+    symlink("/opt/firefox/firefox", bin_link)
+
+    desktop_dir = os.path.join(target, "usr", "share", "applications")
+    ensure(desktop_dir)
+    with open(os.path.join(desktop_dir, "firefox.desktop"), "w") as f:
+        f.write(textwrap.dedent("""\
+            [Desktop Entry]
+            Type=Application
+            Name=Firefox
+            GenericName=Web Browser
+            Comment=Browse the World Wide Web
+            Exec=/usr/bin/firefox %u
+            Icon=/opt/firefox/browser/chrome/icons/default/default128.png
+            Terminal=false
+            MimeType=text/html;text/xml;application/xhtml+xml;application/xml;application/rss+xml;application/rdf+xml;image/gif;image/jpeg;image/png;x-scheme-handler/http;x-scheme-handler/https;
+            StartupNotify=true
+            Categories=Network;WebBrowser;
+            """))
+    log("Mozilla Firefox installed.", color=GREEN)
 
 def phase_live_initramfs(target):
     """Build a static busybox initramfs for live boot (squashfs + overlayfs)."""
@@ -2738,9 +3761,25 @@ def phase_live_initramfs(target):
     cfg = os.path.join(bd, ".config")
     with open(cfg) as f: cfg_text = f.read()
     cfg_text = cfg_text.replace("CONFIG_TC=y", "# CONFIG_TC is not set")
-    cfg_text += "\nCONFIG_STATIC=y\n"
+    # In-place substitution of the real "not set" line, not a blind append:
+    # appending a second, duplicate CONFIG_STATIC=y entry while the original
+    # "# CONFIG_STATIC is not set" line was still present got silently
+    # dropped by `make oldconfig` (verified directly -- confirmed by
+    # `ldd busybox` reporting real shared-lib dependencies afterward,
+    # tracing back to the actual kernel panic "No working init found": the
+    # dynamically-linked busybox couldn't find its interpreter inside the
+    # initrd's own minimal filesystem, so /init could never exec at all).
+    # No explicit config-sync step needed at all: unlike Linux's kbuild,
+    # busybox 1.36.1's Makefile has no `olddefconfig` target (confirmed --
+    # "No rule to make target"), and `oldconfig` is interactive-only and
+    # unreliable fed EOF stdin under a non-interactive container run. Going
+    # straight from the sed-fixed .config to `make` works: busybox's build
+    # system regenerates/validates the config internally as part of the
+    # normal build dependency chain. Re-verified end to end -- the build
+    # log itself prints "Static linking against glibc..." and the resulting
+    # `busybox` binary is confirmed by `ldd` to be "not a dynamic executable".
+    cfg_text = cfg_text.replace("# CONFIG_STATIC is not set", "CONFIG_STATIC=y")
     with open(cfg, "w") as f: f.write(cfg_text)
-    run(["make", "oldconfig"], cwd=bd, env=env, check=False)
     run(["make", "-j", nproc()], cwd=bd, env=env)
 
     # Assemble initramfs tree
@@ -2752,7 +3791,7 @@ def phase_live_initramfs(target):
 
     shutil.copy2(os.path.join(bd, "busybox"), os.path.join(init_tree, "bin", "busybox"))
     os.chmod(os.path.join(init_tree, "bin", "busybox"), 0o755)
-    for applet in ["sh", "mount", "mkdir", "ln", "switch_root", "mdev"]:
+    for applet in ["sh", "mount", "mkdir", "ln", "switch_root", "mdev", "chroot", "sleep", "chmod"]:
         link = os.path.join(init_tree, "bin", applet)
         if not os.path.lexists(link):
             symlink("busybox", link)
@@ -2786,6 +3825,97 @@ def phase_live_initramfs(target):
             mount --move /dev  /mnt/rootfs/dev
             mount --move /proc /mnt/rootfs/proc
             mount --move /sys  /mnt/rootfs/sys
+
+            # Load GPU modules here, in the initramfs, before switch_root --
+            # not via a systemd unit. Every systemd-based attempt (a
+            # standalone unit under several different orderings, then a
+            # plasmalogin.service.d ExecStartPre drop-in piggybacked on a
+            # unit proven to run every boot) reported success via
+            # `systemctl is-enabled`/real "Started" boot-status lines yet
+            # produced zero evidence the modprobe calls inside ever actually
+            # ran (no console output via any redirect method, no resulting
+            # [drm] kernel printk). Root cause never isolated. This runs as
+            # real root with no systemd/sandboxing involved at all, and a
+            # loaded kernel module's state isn't tied to which userspace
+            # root is active, so it persists across switch_root regardless.
+            chroot /mnt/rootfs /usr/sbin/modprobe -v virtio_pci
+            chroot /mnt/rootfs /usr/sbin/modprobe -v virtio_gpu
+            chroot /mnt/rootfs /usr/sbin/modprobe -v amdgpu
+            chroot /mnt/rootfs /usr/sbin/modprobe -v i915
+            chroot /mnt/rootfs /usr/sbin/modprobe -v nouveau
+            chroot /mnt/rootfs /usr/sbin/modprobe -v radeon
+
+            # 60-drm.rules ships GROUP="render" MODE="0666" for renderD*,
+            # but a real boot confirmed via a delayed diagnostic that this
+            # never actually applies -- the device stays root:root 600
+            # regardless (adding a "render" group to /etc/group made no
+            # difference either, since the rule's own MODE=0666 would have
+            # made group membership irrelevant anyway had the rule run at
+            # all). udev's own rule application isn't functioning for this
+            # device in this build for reasons not otherwise isolated, so
+            # fix permissions directly here instead of relying on it --
+            # this is what caused kwin_wayland_wr to immediately dump core
+            # on every boot despite virtio_gpu itself loading correctly.
+            chroot /mnt/rootfs /bin/chmod 666 /dev/dri/renderD128
+            chroot /mnt/rootfs /bin/chmod 666 /dev/dri/card0
+
+            # Also persist the boot medium itself at the same path post-switch:
+            # switch_root discards every mount left in the old root except
+            # ones explicitly moved first, and Calamares' unpackfs module
+            # (running later, inside the live desktop session) needs to read
+            # /mnt/cdrom/live/filesystem.squashfs to actually install --
+            # without this move it would find nothing there at all.
+            mkdir -p /mnt/rootfs/mnt/cdrom
+            mount --move /mnt/cdrom /mnt/rootfs/mnt/cdrom
+
+            # Delayed background diagnostic, forked BEFORE switch_root so it
+            # survives as an orphan process outside PID 1's own image
+            # (switch_root replaces PID 1 via exec + deletes the old root's
+            # files, but doesn't SIGKILL unrelated sibling processes). Every
+            # systemd-side attempt to get real diagnostic output post-boot
+            # (a standalone unit under 3 different orderings, a
+            # plasmalogin.service.d ExecStartPre drop-in, then an
+            # ExecStartPost drop-in writing straight to /dev/ttyS0) produced
+            # zero visible trace despite plasmalogin.service reliably
+            # reporting "Started" -- this sidesteps the whole unit-execution
+            # mystery by never going through systemd's job/unit machinery
+            # for the diagnostic at all.
+            #
+            # chroot immediately (while the initramfs's own busybox, holding
+            # the chroot applet, still exists) rather than after sleeping:
+            # a first attempt slept 40s *then* chrooted and hit "chroot: not
+            # found" -- switch_root's cleanup of the old initramfs root had
+            # already deleted the busybox binary out from under this
+            # already-running background process by then. Sleeping *inside*
+            # the chroot instead uses the target rootfs's own persistent
+            # /bin/sh + sleep, unaffected by the old root's deletion.
+            chroot /mnt/rootfs /bin/sh -c '\
+                sleep 40; \
+                echo "=== SMECHOS DELAYED DIAG ===" >/dev/ttyS0; \
+                systemctl status plasmalogin.service --no-pager -l >>/dev/ttyS0 2>&1; \
+                echo "=== JOURNAL ===" >>/dev/ttyS0; \
+                journalctl -u plasmalogin --no-pager -n 100 >>/dev/ttyS0 2>&1; \
+                echo "=== KWIN JOURNAL ===" >>/dev/ttyS0; \
+                journalctl _COMM=kwin_wayland_wr --no-pager -n 100 >>/dev/ttyS0 2>&1; \
+                echo "=== COREDUMP ===" >>/dev/ttyS0; \
+                coredumpctl info --no-pager -1 >>/dev/ttyS0 2>&1; \
+                echo "=== CMDLINE ===" >>/dev/ttyS0; \
+                cat /proc/cmdline >>/dev/ttyS0 2>&1; \
+                echo "" >>/dev/ttyS0; \
+                echo "=== CALAMARES PROC ===" >>/dev/ttyS0; \
+                ps aux | grep calamares.bin >>/dev/ttyS0 2>&1; \
+                echo "=== AUTOSTART EXEC TEST ===" >>/dev/ttyS0; \
+                grep -qw calamares=1 /proc/cmdline; echo "grep exit: $?" >>/dev/ttyS0; \
+                echo "=== CALAMARES DIRECT LAUNCH TEST (5s) ===" >>/dev/ttyS0; \
+                su smech -c "DISPLAY=:0 WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/1000 timeout 5 calamares" >>/dev/ttyS0 2>&1; \
+                echo "calamares direct exit: $?" >>/dev/ttyS0; \
+                echo "=== DBUS STATUS ===" >>/dev/ttyS0; \
+                systemctl status dbus-daemon.service dbus-broker.service --no-pager -l >>/dev/ttyS0 2>&1; \
+                echo "=== DBUS JOURNAL ===" >>/dev/ttyS0; \
+                journalctl -u dbus-daemon -u dbus-broker --no-pager -n 60 >>/dev/ttyS0 2>&1; \
+                echo "=== DRI ===" >>/dev/ttyS0; \
+                ls -la /dev/dri >>/dev/ttyS0 2>&1; \
+                echo "=== DIAG END ===" >>/dev/ttyS0' &
 
             exec switch_root /mnt/rootfs /sbin/init
         """))
@@ -3180,8 +4310,13 @@ def phase_iso_shim(target):
 def phase_iso_live_smechos(target):
     """Build a SmechOS KDE Plasma live ISO (squashfs + overlayfs + Calamares)."""
     log_phase("iso-live", "Build SmechOS KDE Plasma live ISO")
-    squashfs_path = "/tmp/smechos-filesystem.squashfs"
-    iso_path      = "/tmp/smechos-plasma-live.iso"
+    # NOT /tmp: this build always runs inside an ephemeral `podman run --rm`
+    # container whose /tmp is discarded the instant it exits -- same bug
+    # class already fixed once for phase_bundle_packages's output path.
+    iso_out = os.path.join(os.path.dirname(target.rstrip("/")), "smechos-iso-output")
+    ensure(iso_out)
+    squashfs_path = os.path.join(iso_out, "smechos-filesystem.squashfs")
+    iso_path      = os.path.join(iso_out, "smechos-plasma-live.iso")
     work          = os.path.join(BUILD_TMP, "iso-live")
     shutil.rmtree(work, ignore_errors=True)
 
@@ -3195,8 +4330,19 @@ def phase_iso_live_smechos(target):
     mksquashfs = shutil.which("mksquashfs")
     if not mksquashfs:
         err("mksquashfs not found. Install squashfs-tools.")
+    # -Xdict-size 100% (once used for maximum XZ compression) silently
+    # corrupts small-file content on this ~1.8GB rootfs -- confirmed directly:
+    # rebuilding identical content with plain "-comp xz" (squashfs-tools'
+    # sane default dict size) or "-comp gzip" both correctly captured
+    # /etc/passwd edits (474 bytes, verified via mount+cat+wc), while
+    # "-Xdict-size 100%" reproducibly wrote back a stale 3-line/~150-byte
+    # version every single time across many rebuilds. Root cause not
+    # isolated further (likely a squashfs-tools bug or resource limit at
+    # that extreme a dictionary size for a filesystem this large), but the
+    # fix is simply not to use it -- default XZ dict sizing still compresses
+    # well and doesn't corrupt data.
     run([mksquashfs, target, squashfs_path,
-         "-comp", "xz", "-Xdict-size", "100%",
+         "-comp", "xz",
          "-e", os.path.join(target, "boot"),
          "-noappend"])
     shutil.copy2(squashfs_path, os.path.join(live_dir, "filesystem.squashfs"))
@@ -3215,6 +4361,10 @@ def phase_iso_live_smechos(target):
         }
         menuentry "Install SmechOS (Calamares)" {
             linux  /boot/vmlinuz boot=live calamares=1 quiet loglevel=3
+            initrd /boot/live-initrd.img
+        }
+        menuentry "SmechOS KDE Plasma (Live, debug console)" {
+            linux  /boot/vmlinuz boot=live console=ttyS0,115200n8 console=tty0 loglevel=7 systemd.log_level=debug
             initrd /boot/live-initrd.img
         }
     """)
@@ -3265,6 +4415,7 @@ SMECHOS_PLASMA_LIVE_PHASES = [
     ("etc",             phase_write_etc,                 "Write /etc skeleton"),
     ("systemd",         phase_systemd,                   "Install systemd from Debian packages"),
     ("systemd-config",  phase_systemd_configure,         "Configure baseline systemd state"),
+    ("locale",          phase_locale,                    "Generate en_US.UTF-8 locale"),
     ("grub",            phase_grub,                      "Compile GRUB 2.12 EFI + BIOS"),
     ("qt-deps",         phase_qt_deps,                   "Compile Qt6 modules"),
     ("mesa",            phase_mesa,                      "Compile Mesa stack"),
@@ -3283,7 +4434,7 @@ SMECHOS_PLASMA_LIVE_PHASES = [
     ("patch-metadata",  phase_patch_metadata,            "Patch metadata for SmechOS branding"),
     ("discover",        phase_plasma_discover,           "Compile Plasma Discover + PackageKit"),
     ("calamares",       phase_calamares,                 "Build Calamares graphical installer"),
-    ("chrome",          phase_google_chrome,             "Install Google Chrome stable"),
+    ("firefox",         phase_firefox,                   "Install Mozilla Firefox stable"),
     ("live-initramfs",  phase_live_initramfs,            "Build busybox live initramfs"),
     ("bundle",          phase_bundle_packages,           "Bundle output into spk-installable .tar.xz packages"),
 ]
