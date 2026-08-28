@@ -77,6 +77,21 @@ sudo test -d "$ROOT/usr/lib/x86_64-linux-gnu" \
     || { echo "ERROR: '$ROOT' does not look like a SmechOS rootfs"; exit 1; }
 command -v podman >/dev/null || { echo "ERROR: podman is required"; exit 1; }
 
+# kdoctools ships its own DocBook catalog (entity declarations for author
+# names, GPL/FDL boilerplate, per-language strings) at
+# usr/share/kf6/kdoctools/customization/catalog.xml, but the system catalog
+# at etc/xml/catalog never delegates to it -- so any package that builds a
+# handbook fails xmllint validation with "Entity 'underFDL' not defined" and
+# similar, even though the entities are present on disk. One-time, idempotent
+# fix, applied to the rootfs itself so it only needs doing once ever.
+KDOCTOOLS_CATALOG_REL="../../usr/share/kf6/kdoctools/customization/catalog.xml"
+if [ -f "$ROOT/usr/share/kf6/kdoctools/customization/catalog.xml" ] \
+   && [ -f "$ROOT/etc/xml/catalog" ] \
+   && ! sudo grep -q "kdoctools/customization/catalog.xml" "$ROOT/etc/xml/catalog"; then
+    echo "=== wiring kdoctools DocBook catalog into $ROOT/etc/xml/catalog ==="
+    sudo sed -i "s#</catalog>#  <nextCatalog catalog=\"$KDOCTOOLS_CATALOG_REL\"/>\n</catalog>#" "$ROOT/etc/xml/catalog"
+fi
+
 sudo mkdir -p "$WORK"
 TARBALL="$WORK/$PKG-$VER.tar.xz"
 if [ ! -f "$TARBALL" ]; then
@@ -88,6 +103,16 @@ fi
 sudo rm -rf "$SRC" "$BD"
 sudo mkdir -p "$SRC"
 sudo tar --strip-components 1 -xf "$TARBALL" -C "$SRC"
+
+# xdg-desktop-portal-kde's top-level CMakeLists.txt does
+# add_subdirectory(autotests) with no BUILD_TESTING guard -- an upstream
+# oversight -- so -DBUILD_TESTING=OFF does not stop it configuring tests
+# that link Qt::Test, which was never find_package()'d because nothing else
+# in the project needs it. Fails with "target Qt::Test ... was not found"
+# even though Qt6Test itself is present in the rootfs.
+if [ "$PKG" = "xdg-desktop-portal-kde" ] && [ -f "$SRC/CMakeLists.txt" ]; then
+    sudo sed -i 's/^add_subdirectory(autotests)$/if(BUILD_TESTING)\n  add_subdirectory(autotests)\nendif()/' "$SRC/CMakeLists.txt"
+fi
 
 cat > "$WORK/one-build-inner.sh" <<'INNER'
 set -euo pipefail
@@ -103,12 +128,18 @@ else
     apt-get update -qq
     apt-get install -y -qq --no-install-recommends \
         build-essential cmake ninja-build pkg-config patchelf gettext \
-        libboost-dev libx11-dev libvulkan-dev libxkbcommon-dev libwayland-dev >/dev/null
+        libboost-dev libx11-dev libvulkan-dev libxkbcommon-dev libwayland-dev \
+        libicu-dev libcups2-dev zlib1g-dev liblmdb-dev libdrm-dev docbook-xml docbook-xsl python3-pip libpam0g-dev libgcrypt20-dev >/dev/null
 fi
 
 # The rootfs is the same glibc as this container, so pointing the loader at
 # it is safe here (and is what lets its qtpaths/moc/msgfmt run natively).
-export LD_LIBRARY_PATH="$ROOT/usr/lib/x86_64-linux-gnu:$ROOT/usr/lib"
+# The pulseaudio/ subdir holds libpulsecommon-*.so, a private versioned
+# library libpulse.so.0 needs at link time (DT_NEEDED, not just dlopen) --
+# without it, anything pulling in libpulse (Konsole, via KNotifications
+# sound playback) fails with "undefined reference to pa_*" even though
+# libpulse.so.0 itself resolves fine.
+export LD_LIBRARY_PATH="$ROOT/usr/lib/x86_64-linux-gnu:$ROOT/usr/lib:$ROOT/usr/lib/x86_64-linux-gnu/pulseaudio"
 # Rootfs bin goes LAST. Putting it first makes the rootfs's own cmake win
 # over the container's, and it then looks for its modules under a version
 # directory that does not exist there:
@@ -125,16 +156,34 @@ export XDG_DATA_DIRS="$ROOT/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/sha
 # DocBook entity resolution for packages that build handbooks.
 [ -f "$ROOT/etc/xml/catalog" ] && export XML_CATALOG_FILES="$ROOT/etc/xml/catalog"
 
+# CMake Find modules that go through pkg-config (e.g. the WaylandProtocols
+# lookup used by kwin/kwayland/xdg-desktop-portal-kde) resolve data-file
+# paths using the .pc file's own hardcoded "prefix=/usr", producing an
+# absolute container path like /usr/share/wayland-protocols/... rather than
+# anything under $ROOT -- even though pkg-config correctly found the
+# rootfs's .pc file in the first place. That path only actually exists in
+# the rootfs's own build. Make the container's view of it agree.
+if [ -d "$ROOT/usr/share/wayland-protocols" ] && [ ! -e /usr/share/wayland-protocols ]; then
+    ln -s "$ROOT/usr/share/wayland-protocols" /usr/share/wayland-protocols
+fi
+
 echo "=== sanity: rootfs tools run natively ==="
 "$ROOT/usr/bin/qtpaths" --query QT_INSTALL_PREFIX
 
 rm -rf "$BD"; mkdir -p "$BD"; cd "$BD"
+# -DKDE_INSTALL_PLUGINDIR=/usr/plugins: this rootfs's Qt6 was built with
+# QT_INSTALL_PLUGINS=/usr/plugins (non-multiarch), not the lib/<triplet>/
+# plugins path KDE's ECM/KDECMakeSettings computes by default. Without this,
+# a package's Qt plugins (KCMs, kpart, applets, ...) build and install fine
+# but land somewhere Qt's plugin loader never scans -- e.g. a KCM that
+# builds cleanly and simply never appears in System Settings.
 /usr/bin/cmake "$SRC" -G Ninja \
     -DCMAKE_INSTALL_PREFIX=/usr \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_PREFIX_PATH="$ROOT/usr" \
     -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=FALSE \
     -DCMAKE_INSTALL_RPATH=/usr/lib/x86_64-linux-gnu \
+    -DKDE_INSTALL_PLUGINDIR=/usr/plugins \
     -DBUILD_TESTING=OFF -DBUILD_QCH=OFF -DBUILD_PYTHON_BINDINGS=OFF
 
 /usr/bin/ninja -j"$(nproc)"
