@@ -30,6 +30,7 @@ Usage:
 
 import argparse
 import glob
+import gzip
 import json
 import os
 import sys
@@ -80,6 +81,13 @@ PACKAGEKITQT_VER  = "1.1.4"
 SYSTEMD_VER    = "256.7"
 CALAMARES_VER  = "3.3.10"
 BUSYBOX_VER    = "1.36.1"
+# Pinned upstream release tag at git.kernel.org/.../linux-firmware.git --
+# NOT the Ubuntu-repackaged linux-firmware .deb. See phase_firmware().
+LINUX_FIRMWARE_VER = "20260910"
+# GNU Unifont, straight from ftp.gnu.org -- used to generate grub-mkrescue's
+# unicode.pf2 menu font ourselves (see phase_grub()) instead of relying on
+# the one Debian/Ubuntu's grub-common package ships pre-built.
+UNIFONT_VER = "17.0.05"
 WAYLAND_PROTO_VER = "1.48"
 WAYLAND_VER       = "1.24.0"
 LIBINPUT_VER      = "1.28.0"
@@ -1028,34 +1036,44 @@ def _decompress_firmware_dir(fw_dir):
         f"{len(broken)} dangling)", color=GREEN)
 
 def phase_firmware(target):
-    """Bundle the entire linux-firmware tree from the build container.
+    """Bundle the entire linux-firmware tree from its real upstream source.
 
-    Previously cherry-picked only amdgpu/i915/radeon on the assumption that
-    "GPU firmware" covered the hardware that would silently break without
-    it. That assumption was wrong for a general-purpose live/install ISO:
-    USB controllers, Wi-Fi (iwlwifi, ath10k/ath11k, rtw88/rtw89, brcm),
-    Bluetooth, NVIDIA (nouveau + the GSP firmware the proprietary driver
-    needs), and audio DSP topology (sof-audio) all load blobs from this
-    same tree and none of them live under those three directories. A live
-    ISO that boots on unknown hardware doesn't get to guess which of those
-    someone needs -- it bundles all of it. This costs real disk space
-    (linux-firmware is ~650-700MB uncompressed) but that's the deliberate
-    trade: broken Wi-Fi/USB/GPU on real hardware is worse than a bigger
-    ISO, and it's still XZ-compressed like everything else in the squashfs.
+    Deliberately NOT copied from the build container's own linux-firmware
+    package: that package (Ubuntu's, in our container) is a faithful
+    repackage of the same upstream content, but SmechOS shipping it that
+    way meant every firmware blob's actual provenance traced through
+    Canonical's packaging pipeline rather than the firmware project itself
+    -- a real, checkable claim for anyone who reads this build script, not
+    a cosmetic one. Cloning git.kernel.org's own tree at a pinned tag (see
+    LINUX_FIRMWARE_VER) means the bytes in the final image come straight
+    from the project that actually maintains them.
+
+    Bundled wholesale (not filtered to one chip family) for the same
+    reason as before: USB controllers, Wi-Fi (iwlwifi, ath10k/ath11k,
+    rtw88/rtw89, brcm), Bluetooth, NVIDIA (nouveau + the GSP firmware the
+    proprietary driver needs), and audio DSP topology (sof-audio) all load
+    blobs from this tree, and a live ISO booting on unknown hardware
+    doesn't get to guess which of those someone needs. Costs real disk
+    space (~650-700MB uncompressed) but that's the deliberate trade, and
+    it's still XZ-compressed like everything else in the squashfs.
     """
-    log_phase("firmware", "Bundle the full linux-firmware tree from the build container")
-    fw_root = "/usr/lib/firmware"
-    dst_root = os.path.join(target, "usr", "lib", "firmware")
+    log_phase("firmware", f"Clone upstream linux-firmware {LINUX_FIRMWARE_VER} (git.kernel.org)")
+    src = sources(target)
+    fw_root = os.path.join(src, f"linux-firmware-{LINUX_FIRMWARE_VER}")
     if not os.path.isdir(fw_root):
-        err(f"{fw_root} not found on the build container -- install linux-firmware "
-            f"in the Dockerfile (this phase needs the FULL tree, not a curated subset)")
+        run(["git", "clone", "--depth", "1", "--branch", LINUX_FIRMWARE_VER,
+             "https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git",
+             fw_root])
+    dst_root = os.path.join(target, "usr", "lib", "firmware")
     if os.path.isdir(dst_root):
         shutil.rmtree(dst_root)
-    shutil.copytree(fw_root, dst_root, symlinks=True)
+    shutil.copytree(fw_root, dst_root, symlinks=True,
+                     ignore=shutil.ignore_patterns(".git"))
     for dirpath, _dirnames, filenames in os.walk(dst_root):
         if any(f.endswith(ext) for ext in _FW_COMPRESSED_EXTS for f in filenames):
             _decompress_firmware_dir(dirpath)
-    log(f"linux-firmware bundled wholesale ({dst_root}).", color=GREEN)
+    log(f"linux-firmware {LINUX_FIRMWARE_VER} bundled from upstream ({dst_root}).",
+        color=GREEN)
 
 def phase_grub(target):
     log_phase("grub", f"Compile GRUB {GRUB_VER} EFI + BIOS")
@@ -1084,6 +1102,28 @@ def phase_grub(target):
         run(["make", "-j", nproc()], cwd=bd, env=env)
         run(["make", "install"], cwd=bd, env=env, sudo=(os.geteuid() != 0))
     log(f"GRUB {GRUB_VER} installed.", color=GREEN)
+
+    # grub-mkrescue hard-requires {prefix}/share/grub/unicode.pf2 (the boot
+    # menu's font) and errors out entirely without it -- confirmed the hard
+    # way: a plain from-source configure/make/install never produces this
+    # file, upstream GRUB only generates it from a system font as part of a
+    # packager's own build recipe (that's how Debian/Ubuntu's grub-common
+    # ships a pre-built one). Generate it ourselves from GNU Unifont's own
+    # upstream release using our own from-source grub-mkfont, rather than
+    # reach for the Debian-packaged copy.
+    unifont_url = (f"https://ftp.gnu.org/gnu/unifont/unifont-{UNIFONT_VER}/"
+                   f"unifont-{UNIFONT_VER}.bdf.gz")
+    bdf_gz = os.path.join(src, f"unifont-{UNIFONT_VER}.bdf.gz")
+    download(unifont_url, bdf_gz)
+    bdf = os.path.join(BUILD_TMP, f"unifont-{UNIFONT_VER}.bdf")
+    with gzip.open(bdf_gz, "rb") as fin, open(bdf, "wb") as fout:
+        shutil.copyfileobj(fin, fout)
+    font_dir = os.path.join(prefix, "share", "grub")
+    ensure(font_dir)
+    run([os.path.join(prefix, "bin", "grub-mkfont"),
+         "-o", os.path.join(font_dir, "unicode.pf2"), bdf],
+        env=env, sudo=(os.geteuid() != 0))
+    log(f"unicode.pf2 generated from GNU Unifont {UNIFONT_VER}.", color=GREEN)
 
 def phase_qt_deps(target):
     log_phase("qt-deps", f"Compile Qt6 {QT6_VER} modules")
@@ -4467,7 +4507,7 @@ def phase_bitcoin_services(target):
 
 # ── ISO builders ──────────────────────────────────────────────────────────────
 
-def _grub_mkrescue(iso_path, work_dir, grub_cfg, files, label):
+def _grub_mkrescue(iso_path, work_dir, grub_cfg, files, label, target):
     ensure(work_dir)
     grub_dir = os.path.join(work_dir, "boot", "grub")
     ensure(grub_dir)
@@ -4483,9 +4523,30 @@ def _grub_mkrescue(iso_path, work_dir, grub_cfg, files, label):
         else:
             log(f"Warning: {src_path} not found, skipping from ISO", color=YELLOW)
 
-    mkrescue = shutil.which("grub-mkrescue") or shutil.which("grub2-mkrescue")
+    # Prefer the GRUB phase_grub() built from real upstream source into the
+    # target rootfs, over the container's own distro-packaged grub-mkrescue.
+    # Using the system binary here was a real bug, not a style choice: it
+    # meant every boot ISO's actual bootloader (bootx64.efi, core.img, every
+    # .mod file) was verbatim Debian/Ubuntu grub-pc-bin/grub-efi-amd64-bin
+    # content, while phase_grub's from-source build sat unused in
+    # {target}/usr doing nothing except serving the *installed* system's own
+    # update-grub later. This script was configured with --prefix={target}/usr
+    # for both the "pc" and "efi" platforms into the SAME prefix, so its
+    # baked-in pkglibdir already resolves to {target}/usr/lib/grub/{i386-pc,
+    # x86_64-efi} with no extra -d/--directory flag needed.
+    source_built = os.path.join(target, "usr", "bin", "grub-mkrescue")
+    if os.path.isfile(source_built):
+        mkrescue = source_built
+    else:
+        mkrescue = shutil.which("grub-mkrescue") or shutil.which("grub2-mkrescue")
+        if mkrescue:
+            log(f"WARNING: {source_built} not found -- falling back to the "
+                f"distro-packaged {mkrescue}. The resulting ISO's bootloader "
+                f"will be Debian/Ubuntu binaries, not SmechOS's own build.",
+                color=YELLOW)
     if not mkrescue:
-        err("grub-mkrescue not found. Install grub-pc-bin.")
+        err("grub-mkrescue not found (neither the from-source build nor a "
+            "system fallback). Run phase_grub first, or install grub-pc-bin.")
     run([mkrescue, "-o", iso_path, work_dir, "--", "-volid", label])
 
     import hashlib
@@ -4511,7 +4572,7 @@ def phase_iso_install_smechos(target):
             }
         """),
         [(os.path.join(target, "boot", "vmlinuz"), "boot/vmlinuz")],
-        "SMECHOS_INSTALL")
+        "SMECHOS_INSTALL", target)
 
 def phase_iso_install_smechvisor(target):
     log_phase("iso-smechvisor", "Build SmechVisor install ISO")
@@ -4527,7 +4588,7 @@ def phase_iso_install_smechvisor(target):
             }
         """),
         [(os.path.join(target, "boot", "vmlinuz"), "boot/vmlinuz")],
-        "SMECHVISOR_INSTALL")
+        "SMECHVISOR_INSTALL", target)
 
 def phase_iso_shim(target):
     log_phase("iso-shim", "Build SmechVisor deploy shim ISO")
@@ -4573,7 +4634,7 @@ def phase_iso_shim(target):
             (os.path.join(target, "boot", "vmlinuz"), "boot/vmlinuz"),
             (shim_bin, "shim/smechvisor-shim"),
         ],
-        "SMECHVISOR_SHIM")
+        "SMECHVISOR_SHIM", target)
 
 def phase_iso_live_smechos(target):
     """Build a SmechOS KDE Plasma live ISO (squashfs + overlayfs + Calamares)."""
@@ -4642,7 +4703,7 @@ def phase_iso_live_smechos(target):
             (os.path.join(target, "boot", "vmlinuz"),       "boot/vmlinuz"),
             (os.path.join(target, "boot", "live-initrd.img"), "boot/live-initrd.img"),
         ],
-        "SMECHOS_LIVE")
+        "SMECHOS_LIVE", target)
     log(f"SmechOS Plasma Live ISO ready: {iso_path}", color=GREEN)
 
 # ── Build profiles ────────────────────────────────────────────────────────────

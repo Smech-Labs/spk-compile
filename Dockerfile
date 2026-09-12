@@ -36,7 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcups2-dev libplymouth-dev sassc python3-cairo-dev \
     gsettings-desktop-schemas libgtk-3-dev xserver-xorg-input-wacom \
     bc libyaml-dev libgirepository1.0-dev libstemmer-dev itstool xsltproc \
-    libxmlb-dev valac bash-completion cpio grub-pc-bin \
+    libxmlb-dev valac bash-completion cpio grub-pc-bin grub-efi-amd64-bin \
     libsqlite3-dev \
     libxss-dev libxtst-dev libxcomposite-dev libxdamage-dev \
     libxcb1-dev libxcb-glx0-dev libxcb-keysyms1-dev \
@@ -203,12 +203,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends hwdata && \
 RUN apt-get update && apt-get install -y --no-install-recommends libepoxy-dev liblcms2-dev && \
     rm -rf /var/lib/apt/lists/*
 
-# phase_firmware() copies amdgpu/i915/radeon blobs from THIS container's
-# /usr/lib/firmware into the target rootfs -- without linux-firmware
-# installed here, the container has none of those dirs and the phase
-# silently skips all three (empty firmware dir in every produced image).
-RUN apt-get update && apt-get install -y --no-install-recommends linux-firmware && \
-    rm -rf /var/lib/apt/lists/*
+# phase_firmware() clones linux-firmware straight from git.kernel.org at a
+# pinned tag rather than installing the container's own Ubuntu-repackaged
+# linux-firmware .deb -- deliberate, see that phase's docstring. git is
+# already present in this image; nothing to install here.
 
 # Sanity marker so spk-compile.py's _in_matching_build_image() check
 # knows this IS an Ubuntu-24.04-ABI-matched build container -- lets
