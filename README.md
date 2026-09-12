@@ -201,12 +201,34 @@ anything already fetched), and `smechos_build_root` is the actual rootfs
 being assembled — it's what eventually gets squashed into the ISO. Losing
 either one means starting that phase over, not the whole build.
 
-The finished ISO lands in a sibling directory named
-`smechos-iso-output/smechos-plasma-live.iso`, next to wherever
-`smechos_build_root` was mounted.
+**This only builds and bundles the rootfs — it does not produce an ISO.**
+Packing is a genuinely separate `spk-compile.py` invocation
+(`cmd_iso()`, triggered by `--iso live`, runs *instead of* the phase list,
+not after it). Phase completion is stamp-file-persisted, so this second
+run doesn't redo any of the first one's work — it only assembles the ISO
+from the already-built rootfs:
 
 ```bash
-cd smechos-iso-output
+mkdir -p /path/to/smechos-iso-output
+docker run --rm --privileged --cgroupns=host \
+    -v /path/to/spk-compile-sources:/mnt/spk-compile-sources \
+    -v /path/to/smechos_build_root:/mnt/smechos_build_root \
+    -v /tmp/smechos_build:/tmp/smechos_build \
+    -v /path/to/smechos-iso-output:/mnt/smechos-iso-output \
+    ghcr.io/smech-labs/smechos-build:latest smechos-plasma-live --iso live
+```
+
+The finished ISO lands at `smechos-iso-output/smechos-plasma-live.iso`.
+
+**The container runs as root, so the ISO output directory ends up
+root-owned on the host.** If you hash/sign it as a regular user afterward,
+`chown` the directory first — otherwise `sha256sum ... | tee` and `gpg`
+fail to write their output files silently (no `set -e` catches it, and the
+script prints its final success line regardless):
+
+```bash
+sudo chown -R $(whoami):$(whoami) /path/to/smechos-iso-output
+cd /path/to/smechos-iso-output
 sha256sum smechos-plasma-live.iso > smechos-plasma-live.iso.sha256
 gpg --detach-sign --armor smechos-plasma-live.iso
 ```
