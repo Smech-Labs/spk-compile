@@ -92,7 +92,9 @@ LINUX_URL    = f"https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-{LINUX_VER}.
 GRUB_URL     = f"https://ftp.gnu.org/gnu/grub/grub-{GRUB_VER}.tar.xz"
 MUSL_URL     = f"https://musl.libc.org/releases/musl-{MUSL_VER}.tar.gz"
 QT6_MINOR    = ".".join(QT6_VER.split(".")[:2])
-QT6_BASE_URL = f"https://download.qt.io/official_releases/qt/{QT6_MINOR}/{QT6_VER}/submodules"
+# download.qt.io is IPv4-only with no reachable NAT64 path from the build
+# host; ftp.fau.de mirrors the same tree over genuine dual-stack IPv6.
+QT6_BASE_URL = f"https://ftp.fau.de/qtproject/official_releases/qt/{QT6_MINOR}/{QT6_VER}/submodules"
 MESA_URL     = f"https://mesa.freedesktop.org/archive/mesa-{MESA_VER}.tar.xz"
 WAYLAND_PROTO_URL = f"https://gitlab.freedesktop.org/wayland/wayland-protocols/-/archive/{WAYLAND_PROTO_VER}/wayland-protocols-{WAYLAND_PROTO_VER}.tar.gz"
 WAYLAND_URL       = f"https://gitlab.freedesktop.org/wayland/wayland/-/archive/{WAYLAND_VER}/wayland-{WAYLAND_VER}.tar.gz"
@@ -281,15 +283,38 @@ def run(cmd, cwd=None, env=None, sudo=False, check=True):
         err(f"Command failed (exit {result.returncode}): {' '.join(str(c) for c in cmd)}")
     return result
 
-def download(url, dest):
+def download(url, dest, retries=5, backoff=(5, 15, 30, 60, 60)):
     if os.path.exists(dest):
         log(f"Cached: {os.path.basename(dest)}")
         return
     ensure(os.path.dirname(dest))
-    log(f"Downloading {os.path.basename(dest)}...")
-    urllib.request.urlretrieve(url, dest + ".part")
-    os.rename(dest + ".part", dest)
-    log(f"Saved: {dest}", color=GREEN)
+    # KDE's download.kde.org (and similar Mirrorbits-fronted hosts) 302s to
+    # a randomly geo/load-selected mirror per request -- most are fine, but
+    # an occasional pick is unreachable from this specific IPv6-only host
+    # and hangs until the OS-level TCP timeout (seen consistently as a
+    # ~110s "Connection timed out"). A bare retry of the *same* URL often
+    # lands on a different mirror next time (no URL rewriting needed), so
+    # retry with backoff rather than failing the whole multi-hour build
+    # over one bad mirror pick.
+    part = dest + ".part"
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            log(f"Downloading {os.path.basename(dest)}"
+                + (f" (attempt {attempt}/{retries})" if attempt > 1 else "") + "...")
+            urllib.request.urlretrieve(url, part)
+            os.rename(part, dest)
+            log(f"Saved: {dest}", color=GREEN)
+            return
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+            last_err = e
+            if os.path.exists(part):
+                os.remove(part)
+            if attempt < retries:
+                delay = backoff[min(attempt - 1, len(backoff) - 1)]
+                log(f"Download failed ({e}) -- retrying in {delay}s", color=YELLOW)
+                time.sleep(delay)
+    err(f"download failed after {retries} attempts: {url} ({last_err})")
 
 def extract(tarball, dest, strip=1):
     ensure(dest)
@@ -470,6 +495,16 @@ def cmake_install(src_dir, prefix, extra_args=None, env=None, build_dir=None):
          # never scans -- they build and link fine, and are simply invisible
          # at runtime (e.g. a KCM that never appears in System Settings).
          "-DKDE_INSTALL_PLUGINDIR=/usr/plugins",
+         # Same mismatch, same fix, for QML modules: this Qt6 expects its
+         # standard non-multiarch QT_INSTALL_QML=/usr/qml (confirmed by
+         # ecm_find_qmlmodule()/find_package(...-QMLModule) searching
+         # exactly {prefix}/qml -- not the lib/<triplet>/qml path ECM's
+         # KDECMakeSettings computes by default from CMAKE_INSTALL_LIBDIR).
+         # Without this, Kirigami (and every other KF6 package shipping
+         # QML, e.g. kdeclarative/ksvg/plasma-framework) installs its QML
+         # files somewhere Qt's own module lookup never checks, so every
+         # later find_package(Foo-QMLModule) for it fails outright.
+         "-DKDE_INSTALL_QMLDIR=/usr/qml",
          ] + (extra_args or []), cwd=bd, env=build_env)
     run([ninja_bin, "-j", nproc(), "-k", "0"], cwd=bd, env=build_env, check=False)
     install_env = dict(build_env)
@@ -916,73 +951,111 @@ def phase_kernel(target):
         cwd=bd, env=env, sudo=(os.geteuid() != 0))
     log(f"Linux {LINUX_VER} installed.", color=GREEN)
 
-def _decompress_firmware_dir(fw_dir):
-    """Decompress every .xz file in a firmware dir in place.
+_FW_COMPRESSED_EXTS = {".xz": "unxz -f", ".zst": "unzstd -f --rm"}
 
-    linux-firmware ships most blobs as .xz, but this kernel's config has
-    CONFIG_FW_LOADER_COMPRESS unverified end-to-end (added defensively above,
-    never build-tested this session) -- decompressing here guarantees the
-    firmware loads regardless. Many blobs are symlinks to a sibling .xz file
-    (dedup for chip variants sharing microcode); plain unxz refuses to follow
-    those, so regular files are decompressed first, then symlinks are
-    repointed at the now-decompressed target name.
+def _decompress_firmware_dir(fw_dir):
+    """Decompress every compressed firmware blob in a dir in place.
+
+    linux-firmware ships blobs compressed, but which codec depends on the
+    package version -- Ubuntu 24.04's ships them as .zst (verified: all
+    675 files under amdgpu/ this run), older releases used .xz. This
+    kernel's config has CONFIG_FW_LOADER_COMPRESS unverified end-to-end
+    (added defensively elsewhere, never build-tested this session) --
+    decompressing here guarantees the firmware loads regardless of that.
+    Many blobs are symlinks to a sibling compressed file (dedup for chip
+    variants sharing microcode); plain unxz/unzstd refuse to follow those,
+    so regular files are decompressed first, then symlinks are repointed
+    at the now-decompressed target name. `shopt -s nullglob` is required
+    here -- without it, a glob with zero matches (e.g. *.xz in a dir that
+    turned out to be all .zst) stays literal, `[ -f "*.xz" ]` fails, and
+    that failure becomes the whole command's exit status. The trailing
+    `; true` matters for the same reason from the other end: the `&&`
+    chain inside the loop body means the LAST glob match's test result
+    is what the whole script exits with -- and the last file alphabetically
+    is routinely a dedup symlink (intentionally skipped, not an error),
+    which would otherwise report success as a false failure.
     """
     need_sudo = (os.geteuid() != 0)
-    run(["bash", "-c",
-         f'cd "{fw_dir}" && '
-         f'for f in *.xz; do [ -f "$f" ] && [ ! -L "$f" ] && unxz "$f"; done'],
+    loop = " ".join(
+        f'for f in *{ext}; do [ -f "$f" ] && [ ! -L "$f" ] && {tool} "$f"; done;'
+        for ext, tool in _FW_COMPRESSED_EXTS.items()
+    )
+    run(["bash", "-c", f'cd "{fw_dir}" && shopt -s nullglob && {loop} true'],
         sudo=need_sudo)
-    fixed, broken = 0, []
-    for link in glob.glob(os.path.join(fw_dir, "*.xz")):
-        if not os.path.islink(link):
-            continue
-        tgt = os.readlink(link)
-        newname = link[:-3]     # strip .xz
-        newtgt  = tgt[:-3] if tgt.endswith(".xz") else tgt
-        if os.path.exists(os.path.join(fw_dir, newtgt)):
-            run(["ln", "-sf", newtgt, newname], sudo=need_sudo)
-            run(["rm", "-f", link], sudo=need_sudo)
-            fixed += 1
-        else:
-            broken.append(link)
+    # Multi-pass symlink repointing: linux-firmware ships alias chains
+    # (bare-name -> versioned-name -> another versioned name, seen on
+    # iwlwifi especially) where a symlink's target is itself still an
+    # unresolved compressed symlink on the first pass. Keep repointing
+    # until a full pass makes no further progress, then whatever's left
+    # is genuinely dangling (a superseded/alternate name the packaged
+    # tree never shipped a real target for) rather than a chain we gave
+    # up on too early.
+    fixed = 0
+    while True:
+        progressed = False
+        for ext in _FW_COMPRESSED_EXTS:
+            for link in glob.glob(os.path.join(fw_dir, f"*{ext}")):
+                if not os.path.islink(link):
+                    continue
+                tgt = os.readlink(link)
+                newname = link[:-len(ext)]
+                newtgt  = tgt[:-len(ext)] if tgt.endswith(ext) else tgt
+                if os.path.exists(os.path.join(fw_dir, newtgt)):
+                    run(["ln", "-sf", newtgt, newname], sudo=need_sudo)
+                    run(["rm", "-f", link], sudo=need_sudo)
+                    fixed += 1
+                    progressed = True
+        if not progressed:
+            break
+    broken = [p for ext in _FW_COMPRESSED_EXTS
+              for p in glob.glob(os.path.join(fw_dir, f"*{ext}")) if os.path.islink(p)]
     if broken:
-        err(f"{fw_dir}: {len(broken)} firmware symlink(s) point at missing "
-            f"targets after decompression: {broken[:5]}")
-    remaining = glob.glob(os.path.join(fw_dir, "*.xz"))
+        # Non-fatal: these are dangling aliases already present in the
+        # upstream/Ubuntu-packaged tree (e.g. a superseded chip-revision
+        # name), not something this pipeline caused. Failing the whole
+        # build over a handful of alternate-name symlinks for hardware
+        # nobody's targeting would be disproportionate.
+        log(f"{fw_dir}: {len(broken)} firmware symlink(s) still point at missing "
+            f"targets (upstream alias for unshipped variant, not fatal): "
+            f"{broken[:5]}", color=YELLOW)
+    remaining = [p for ext in _FW_COMPRESSED_EXTS
+                 for p in glob.glob(os.path.join(fw_dir, f"*{ext}"))
+                 if not os.path.islink(p)]
     if remaining:
-        err(f"{fw_dir}: {len(remaining)} .xz file(s) left undecompressed: {remaining[:5]}")
-    log(f"{fw_dir}: firmware decompressed ({fixed} symlinks repointed)", color=GREEN)
+        err(f"{fw_dir}: {len(remaining)} compressed file(s) left undecompressed: "
+            f"{remaining[:5]}")
+    log(f"{fw_dir}: firmware decompressed ({fixed} symlinks repointed, "
+        f"{len(broken)} dangling)", color=GREEN)
 
 def phase_firmware(target):
-    """Bundle GPU firmware from the host's linux-firmware into the target.
+    """Bundle the entire linux-firmware tree from the build container.
 
-    /usr/lib/firmware/{amdgpu,i915} were found completely absent from a
-    built image this session -- amdgpu is firmware-dependent even for basic
-    3D (GFX/compute ring bring-up silently hangs forever without it, not a
-    clean crash), and i915 needs DMC/GuC/HuC for full display power
-    management on Gemini Lake and newer. radeon covers pre-GCN2 cards (the
-    classic `radeon` kernel driver, distinct from amdgpu) for the
-    smechos-bitcoin profile's OpenCL mining target. All three are copied
-    wholesale (not filtered to one chip family) since extra unused chip
-    files are harmless and this pipeline has no reliable way to know the
-    target's exact GPU.
+    Previously cherry-picked only amdgpu/i915/radeon on the assumption that
+    "GPU firmware" covered the hardware that would silently break without
+    it. That assumption was wrong for a general-purpose live/install ISO:
+    USB controllers, Wi-Fi (iwlwifi, ath10k/ath11k, rtw88/rtw89, brcm),
+    Bluetooth, NVIDIA (nouveau + the GSP firmware the proprietary driver
+    needs), and audio DSP topology (sof-audio) all load blobs from this
+    same tree and none of them live under those three directories. A live
+    ISO that boots on unknown hardware doesn't get to guess which of those
+    someone needs -- it bundles all of it. This costs real disk space
+    (linux-firmware is ~650-700MB uncompressed) but that's the deliberate
+    trade: broken Wi-Fi/USB/GPU on real hardware is worse than a bigger
+    ISO, and it's still XZ-compressed like everything else in the squashfs.
     """
-    log_phase("firmware", "Bundle GPU firmware (amdgpu + i915 + radeon) from host")
+    log_phase("firmware", "Bundle the full linux-firmware tree from the build container")
     fw_root = "/usr/lib/firmware"
     dst_root = os.path.join(target, "usr", "lib", "firmware")
-    ensure(dst_root)
-    for family in ("amdgpu", "i915", "radeon"):
-        src = os.path.join(fw_root, family)
-        dst = os.path.join(dst_root, family)
-        if not os.path.isdir(src):
-            log(f"Host has no {src} -- skipping (install linux-firmware on the "
-                f"build host to include {family} GPU firmware)", color=YELLOW)
-            continue
-        if os.path.isdir(dst):
-            shutil.rmtree(dst)
-        shutil.copytree(src, dst, symlinks=True)
-        _decompress_firmware_dir(dst)
-        log(f"{family} firmware bundled.", color=GREEN)
+    if not os.path.isdir(fw_root):
+        err(f"{fw_root} not found on the build container -- install linux-firmware "
+            f"in the Dockerfile (this phase needs the FULL tree, not a curated subset)")
+    if os.path.isdir(dst_root):
+        shutil.rmtree(dst_root)
+    shutil.copytree(fw_root, dst_root, symlinks=True)
+    for dirpath, _dirnames, filenames in os.walk(dst_root):
+        if any(f.endswith(ext) for ext in _FW_COMPRESSED_EXTS for f in filenames):
+            _decompress_firmware_dir(dirpath)
+    log(f"linux-firmware bundled wholesale ({dst_root}).", color=GREEN)
 
 def phase_grub(target):
     log_phase("grub", f"Compile GRUB {GRUB_VER} EFI + BIOS")
@@ -1166,11 +1239,21 @@ def phase_mesa(target):
         log(f"Skipping LLVM-22.x-specific mesa patches (llvm-config reports "
             f"major version {_llvm_major or 'unknown'})", color=YELLOW)
     # Unlike the three call sites above (genuinely still fine at LLVM 20,
-    # confirmed against real llvmorg-20.1.2 headers), this one breaks even
-    # at 20 -- CompilerInstance::createDiagnostics(DiagnosticConsumer*) was
-    # already removed by then. Applies unconditionally, independent of the
-    # >=22 gate above.
-    _patch_mesa_clc_create_diagnostics(bd)
+    # confirmed against real llvmorg-20.1.2 headers), this one breaks
+    # starting at 20 -- CompilerInstance::createDiagnostics(DiagnosticConsumer*)
+    # was removed by then. But it is NOT gone yet at 18/19 -- confirmed
+    # directly against the real Ubuntu 24.04 libclang-18-dev and
+    # libclang-19-dev headers, both still carry the single-arg overload
+    # unpatched Mesa 24.3.4 already calls. Applying this patch below that
+    # threshold breaks the build the other way (no matching overload for
+    # the FileSystem-taking call this patch introduces), so gate it the
+    # same as the >=22 patches above rather than applying unconditionally.
+    if _llvm_major >= 20:
+        _patch_mesa_clc_create_diagnostics(bd)
+    else:
+        log(f"Skipping LLVM-20+ clc_helpers.cpp createDiagnostics patch "
+            f"(llvm-config reports major version {_llvm_major or 'unknown'})",
+            color=YELLOW)
     _patch_mesa_loader_wayland_timespec(bd)
     # Mesa doesn't depend on anything from target/usr -- it's built early
     # (before Wayland/KDE, which DO need to link against target-installed
@@ -1833,6 +1916,54 @@ def _patch_xdg_desktop_portal_kde(bd):
     if old in txt:
         with open(cmake, "w") as f:
             f.write(txt.replace(old, new))
+    # print.cpp includes QtPrintSupport/private/qcups_p.h -- a Qt private
+    # header only generated when qtbase's own PrintSupport module was
+    # built with CUPS available. Our qtbase was built during phase_qt_deps,
+    # long before cups (only added to the container for print-manager,
+    # much later in the package list) ever existed here, so the header
+    # was never generated -- not a bug in this package, a real gap
+    # upstream in ours. Rebuilding qtbase now to pick up CUPS would cost
+    # another full Qt6 pass (~70+ minutes) for one non-essential portal
+    # (print-dialog integration for sandboxed/Flatpak apps, not core
+    # desktop function) -- drop the print portal instead. Contained to
+    # exactly 3 files: source list, one include + one member in
+    # desktopportal.{h,cpp}.
+    src_cmake = os.path.join(bd, "src", "CMakeLists.txt")
+    if os.path.exists(src_cmake):
+        with open(src_cmake) as f:
+            s = f.read()
+        s = s.replace("    print.cpp\n", "")
+        s = s.replace("    print.h\n", "")
+        with open(src_cmake, "w") as f:
+            f.write(s)
+    # Removing print.cpp from the sources list alone isn't enough: CMake's
+    # AUTOMOC scans every header under the source dir for Q_OBJECT
+    # regardless of whether its .cpp is actually compiled, so print.h's
+    # PrintPortal class still got moc'd into mocs_compilation.cpp -- with
+    # print.cpp excluded, that generated qt_static_metacall() referenced
+    # PrintPortal::Print()/PreparePrint() with no implementation anywhere,
+    # failing the final link with "undefined reference". Delete both files
+    # outright so AUTOMOC never sees the class at all.
+    for fname in ("print.cpp", "print.h"):
+        fpath = os.path.join(bd, "src", fname)
+        if os.path.exists(fpath):
+            os.remove(fpath)
+    dp_h = os.path.join(bd, "src", "desktopportal.h")
+    if os.path.exists(dp_h):
+        with open(dp_h) as f:
+            h = f.read()
+        h = h.replace("class PrintPortal;\n", "")
+        h = h.replace("    PrintPortal *const m_print;\n", "")
+        with open(dp_h, "w") as f:
+            f.write(h)
+    dp_cpp = os.path.join(bd, "src", "desktopportal.cpp")
+    if os.path.exists(dp_cpp):
+        with open(dp_cpp) as f:
+            c = f.read()
+        c = c.replace('#include "print.h"\n', "")
+        c = c.replace(", m_print(new PrintPortal(this))", "")
+        with open(dp_cpp, "w") as f:
+            f.write(c)
 
 def _patch_spectacle_opencv(bd):
     """spectacle's CMakeLists.txt hard-requires OpenCV >= 4.7, but
@@ -2098,9 +2229,37 @@ def phase_kde(target):
         log(f"Copied {copied} {libname} runtime file(s) into target rootfs", color=GREEN)
         _mark_done(_profile, stamp)
 
-    # qca-qt6 (pre-existing in the target rootfs -- not built by this
-    # pipeline, most likely inherited from whatever seeded the rootfs
-    # before this session's LTS work) exports a Qca-qt6Targets.cmake that,
+    # qca-qt6 2.3.12 -- kwallet's crypto backend. The mirroring workaround
+    # just below assumes this is already built into the target rootfs (a
+    # leftover assumption from whatever seeded an earlier dev machine's
+    # rootfs); a genuinely from-scratch target has nothing here yet, so
+    # build it first, same cmake_install() pattern as qtkeychain/
+    # pulseaudio-qt above. QCA's own CMakeLists picks the Qt6 flavor
+    # (libqca-qt6.so, Qca-qt6/ headers) automatically once it finds our
+    # target's Qt6 via CMAKE_PREFIX_PATH.
+    _qca_stamp = "qca-2.3.12"
+    if not _phase_done(_profile, _qca_stamp):
+        env = active_env(target)
+        _qca_ver = "2.3.12"
+        _qca_url = f"https://download.kde.org/stable/qca/{_qca_ver}/qca-{_qca_ver}.tar.xz"
+        _qca_tb  = os.path.join(sources(target), f"qca-{_qca_ver}.tar.xz")
+        download(_qca_url, _qca_tb)
+        _qca_bd  = os.path.join(BUILD_TMP, "qca")
+        shutil.rmtree(_qca_bd, ignore_errors=True)
+        extract(_qca_tb, _qca_bd)
+        cmake_install(_qca_bd, f"{target}/usr",
+            extra_args=[f"-DCMAKE_PREFIX_PATH={target}/usr",
+                        "-DBUILD_WITH_QT6=ON",
+                        "-DBUILD_TESTS=OFF", "-DBUILD_TESTING=OFF",
+                        "-DBUILD_TOOLS=OFF"],
+            env=env)
+        _mark_done(_profile, _qca_stamp)
+        log(f"qca-qt6 {_qca_ver} done.", color=GREEN)
+    else:
+        log("qca-qt6 already built — skipping", color=YELLOW)
+
+    # qca-qt6 (built just above, or pre-existing in the target rootfs from
+    # some earlier seeding) exports a Qca-qt6Targets.cmake that,
     # unlike every ECM-based KF6 package, hardcodes an absolute non-
     # relocatable `_IMPORT_PREFIX "/usr"` for both its .so
     # (IMPORTED_LOCATION) and its headers (INTERFACE_INCLUDE_DIRECTORIES),
@@ -2153,6 +2312,31 @@ def phase_kde(target):
             log("Purged stale KF6/KDE cmake configs from multiarch path", color=YELLOW)
         _mark_done(_profile, "kde-cmake-purge")
     env = active_env(target)
+
+    # kguiaddons (Tier 0, built via the kf6 loop below) hard-requires
+    # PlasmaWaylandProtocols >= 1.15.0 via find_package(), which is neither
+    # an apt package nor built anywhere else in this pipeline -- just XML
+    # Wayland protocol definitions + a CMake export, no C++ compilation.
+    # Needs extra-cmake-modules already installed to configure, so build
+    # that first (idempotent -- _kde_pkg skips it via its own stamp when
+    # the kf6 loop below reaches it again).
+    _kde_pkg("extra-cmake-modules", KF6_VER, KF6_URL, target, env)
+    _pwp_stamp = "plasma-wayland-protocols-1.22.0"
+    if not _phase_done(_profile, _pwp_stamp):
+        _pwp_ver = "1.22.0"
+        _pwp_url = f"https://download.kde.org/stable/plasma-wayland-protocols/plasma-wayland-protocols-{_pwp_ver}.tar.xz"
+        _pwp_tb  = os.path.join(sources(target), f"plasma-wayland-protocols-{_pwp_ver}.tar.xz")
+        download(_pwp_url, _pwp_tb)
+        _pwp_bd  = os.path.join(BUILD_TMP, "plasma-wayland-protocols")
+        shutil.rmtree(_pwp_bd, ignore_errors=True)
+        extract(_pwp_tb, _pwp_bd)
+        cmake_install(_pwp_bd, f"{target}/usr",
+            extra_args=[f"-DCMAKE_PREFIX_PATH={target}/usr"],
+            env=env)
+        _mark_done(_profile, _pwp_stamp)
+        log(f"plasma-wayland-protocols {_pwp_ver} done.", color=GREEN)
+    else:
+        log("plasma-wayland-protocols already built — skipping", color=YELLOW)
 
     kf6 = [
         # Tier 0 — no KF6 deps
@@ -2253,6 +2437,82 @@ def phase_kde(target):
              "https://download.kde.org/stable/kquickimageeditor",
              target, env)
 
+    # libdisplay-info 0.3.0 -- kwin hard-requires >= 0.2.0 via pkg-config;
+    # Ubuntu 24.04 only packages 0.1.1 (too old), so build from source like
+    # layer-shell-qt above. Not a KDE project (freedesktop.org/emersion),
+    # plain meson, no Qt dependency -- installs straight into the target
+    # since kwin (built into the target) links against it at runtime.
+    _ldi_stamp = "libdisplay-info-0.3.0"
+    if not _phase_done(_profile, _ldi_stamp):
+        _ldi_ver = "0.3.0"
+        _ldi_url = (f"https://gitlab.freedesktop.org/emersion/libdisplay-info/"
+                    f"-/archive/{_ldi_ver}/libdisplay-info-{_ldi_ver}.tar.gz")
+        _ldi_tb  = os.path.join(sources(target), f"libdisplay-info-{_ldi_ver}.tar.gz")
+        download(_ldi_url, _ldi_tb)
+        _ldi_bd  = os.path.join(BUILD_TMP, "libdisplay-info")
+        shutil.rmtree(_ldi_bd, ignore_errors=True)
+        extract(_ldi_tb, _ldi_bd)
+        meson_install(_ldi_bd, f"{target}/usr", env=env)
+        _mark_done(_profile, _ldi_stamp)
+        log(f"libdisplay-info {_ldi_ver} done.", color=GREEN)
+    else:
+        log("libdisplay-info already built — skipping", color=YELLOW)
+
+    # QCoro6 -- plasma-workspace hard-requires it (find_package(QCoro6)) for
+    # C++20 coroutine support wrapping Qt's async APIs. Not a KDE project
+    # (github.com/qcoro/qcoro, formerly danvratil/qcoro), not in apt at
+    # all. Its own qcoro_find_qt() macro auto-detects Qt6 over Qt5, no
+    # explicit flag needed -- only trims examples/tests to keep it lean.
+    _qcoro_stamp = "qcoro-0.13.0"
+    if not _phase_done(_profile, _qcoro_stamp):
+        _qcoro_ver = "0.13.0"
+        _qcoro_url = f"https://github.com/qcoro/qcoro/archive/refs/tags/v{_qcoro_ver}.tar.gz"
+        _qcoro_tb  = os.path.join(sources(target), f"qcoro-{_qcoro_ver}.tar.gz")
+        download(_qcoro_url, _qcoro_tb)
+        _qcoro_bd  = os.path.join(BUILD_TMP, "qcoro")
+        shutil.rmtree(_qcoro_bd, ignore_errors=True)
+        extract(_qcoro_tb, _qcoro_bd)
+        cmake_install(_qcoro_bd, f"{target}/usr",
+            extra_args=[f"-DCMAKE_PREFIX_PATH={target}/usr",
+                        "-DQCORO_BUILD_EXAMPLES=OFF",
+                        "-DQCORO_BUILD_TESTING=OFF",
+                        # Qt6WebSockets was never built as part of our
+                        # custom Qt6 (not needed by anything else in this
+                        # pipeline) -- QCoro defaults this component ON,
+                        # which then hard-fails Qt6's own find_package()
+                        # for a component that plain doesn't exist here.
+                        "-DQCORO_WITH_QTWEBSOCKETS=OFF"],
+            env=env)
+        _mark_done(_profile, _qcoro_stamp)
+        log(f"QCoro {_qcoro_ver} done.", color=GREEN)
+    else:
+        log("QCoro already built — skipping", color=YELLOW)
+
+    # polkit-qt-1 (PolkitQt6-1) -- plasma-workspace's region/language KCM
+    # talks to its localegen helper over this. KDE project, own release
+    # schedule (download.kde.org/stable/polkit-qt-1/), defaults to Qt5
+    # unless QT_MAJOR_VERSION=6 is passed explicitly -- Ubuntu only
+    # packages the Qt5 build (libpolkit-qt5-1-dev), no Qt6 apt package
+    # exists at all.
+    _pqt_stamp = "polkit-qt-1-0.201.1"
+    if not _phase_done(_profile, _pqt_stamp):
+        _pqt_ver = "0.201.1"
+        _pqt_url = f"https://download.kde.org/stable/polkit-qt-1/polkit-qt-1-{_pqt_ver}.tar.xz"
+        _pqt_tb  = os.path.join(sources(target), f"polkit-qt-1-{_pqt_ver}.tar.xz")
+        download(_pqt_url, _pqt_tb)
+        _pqt_bd  = os.path.join(BUILD_TMP, "polkit-qt-1")
+        shutil.rmtree(_pqt_bd, ignore_errors=True)
+        extract(_pqt_tb, _pqt_bd)
+        cmake_install(_pqt_bd, f"{target}/usr",
+            extra_args=[f"-DCMAKE_PREFIX_PATH={target}/usr",
+                        "-DQT_MAJOR_VERSION=6",
+                        "-DBUILD_EXAMPLES=OFF", "-DBUILD_TEST=OFF"],
+            env=env)
+        _mark_done(_profile, _pqt_stamp)
+        log(f"polkit-qt-1 {_pqt_ver} done.", color=GREEN)
+    else:
+        log("polkit-qt-1 already built — skipping", color=YELLOW)
+
     plasma = [
         # plasma-activities must precede libplasma
         "plasma-activities", "plasma-activities-stats",
@@ -2288,6 +2548,13 @@ def phase_kde(target):
         "layer-shell-qt",
         "knighttime", "kscreenlocker",
         "libksysguard",        # KSysGuard libs: required by ksystemstats and optional in plasma-workspace
+        # kglobalacceld: separate repo/package from the KF6 kglobalaccel
+        # library built above (KDE/kglobalacceld on GitHub, released with
+        # Plasma at PLASMA_VER, not with Frameworks) -- it's the actual
+        # global-shortcut daemon binary. kwin hard-requires it via
+        # find_package(KGlobalAccelD), which the kglobalaccel library alone
+        # never provides.
+        "kglobalacceld",
         "kwin", "plasma-workspace", "plasma5support", "plasma-desktop",
         "plasma-nm", "plasma-pa", "powerdevil", "breeze",
         "systemsettings", "plasma-integration", "kdeplasma-addons",
@@ -4431,7 +4698,7 @@ SMECHOS_PLASMA_LIVE_PHASES = [
     ("xwayland-deps",   phase_xwayland_deps,             "Fetch Xwayland + xkbcomp + xkb-data"),
     ("qt6uitools",      phase_qt6uitools,                "Ensure Qt6UITools present"),
     ("kernel",          phase_kernel,                    "Compile Linux 6.12.16"),
-    ("firmware",        phase_firmware,                  "Bundle GPU firmware (amdgpu + i915 + radeon)"),
+    ("firmware",        phase_firmware,                  "Bundle full linux-firmware tree"),
     ("patch-metadata",  phase_patch_metadata,            "Patch metadata for SmechOS branding"),
     ("discover",        phase_plasma_discover,           "Compile Plasma Discover + PackageKit"),
     ("calamares",       phase_calamares,                 "Build Calamares graphical installer"),
@@ -4452,7 +4719,7 @@ SMECHOS_BITCOIN_PHASES = [
     ("inittab",             phase_inittab,                  "Write inittab"),
     ("kernel",              phase_kernel,                   "Compile Linux 6.12.16 (CONFIG_DRM_RADEON)"),
     ("grub",                phase_grub,                     "Compile GRUB 2.12 EFI + BIOS"),
-    ("firmware",            phase_firmware,                 "Bundle GPU firmware (amdgpu + i915 + radeon)"),
+    ("firmware",            phase_firmware,                 "Bundle full linux-firmware tree"),
     ("mesa-cl",             phase_mesa_cl,                  f"Compile Mesa {MESA_VER} (Clover/OpenCL + r600 only)"),
     ("bitcoind",            phase_bitcoind,                 f"Compile Bitcoin Core {BITCOIN_VER} (headless)"),
     ("gpu-miner",           phase_gpu_miner,                f"Compile sgminer {SGMINER_VER} (OpenCL)"),
