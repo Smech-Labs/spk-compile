@@ -3399,9 +3399,158 @@ def phase_bundle_packages(target):
 
 # ── Plasma Live phases ────────────────────────────────────────────────────────
 
+def _bootstrap_glibc_runtime(target):
+    """Copy the build container's own glibc runtime + dynamic linker into the
+    target rootfs, and lay down the FHS/usrmerge compatibility symlinks.
+
+    Root cause of a real, boot-blocking bug: every phase in this profile
+    builds its own tools with --prefix={target}/usr, which puts real
+    content under {target}/usr/{bin,sbin,lib} -- but nothing ever created
+    the top-level {target}/{bin,sbin,lib,lib64} compatibility symlinks
+    Debian/Ubuntu's usrmerge layout requires, and nothing ever copied
+    glibc's own runtime (ld-linux-x86-64.so.2, libc.so.6) into the target
+    at all. Every phase up to now ran its build tools UN-chrooted, using
+    the container's own real /lib64/ld-linux-x86-64.so.2 to execute
+    intermediate tools, so this was completely invisible until the first
+    actual boot attempt: chroot/switch_root failed on EVERY binary with
+    "No such file or directory" -- not because the files were missing, but
+    because /bin, /sbin didn't exist as paths at all, and every
+    dynamically-linked ELF's hardcoded interpreter path
+    (/lib64/ld-linux-x86-64.so.2) resolved to nothing, which is fatal for
+    PID 1 and panics the kernel ("Attempted to kill init!").
+
+    Fixed by matching the container's own real layout exactly (verified via
+    `readelf -l` on target-built binaries: they expect
+    /lib64/ld-linux-x86-64.so.2, which the container's own ld-linux
+    resolves via /lib64/ld-linux-x86-64.so.2 -> ../lib/x86_64-linux-gnu/...
+    and /lib -> usr/lib): the same relative symlink chain is recreated
+    here, and every file from the container's own /usr/lib/x86_64-linux-gnu
+    is copied in with existing files preserved -- KDE/Qt6/etc already
+    populate parts of that same multiarch directory, and none of that
+    should be clobbered by this base-runtime fill-in.
+
+    This is a deliberate, already-documented project decision, not a new
+    independence gap: phase_bootstrap_userland_glibc's own docstring says
+    "against host glibc", and building glibc itself from source remains
+    explicitly out of scope for now (see the SABI/SAPI notes) -- every
+    from-scratch-style distro bootstraps from *some* host toolchain's
+    libc. What was missing was just actually copying it into the image.
+    """
+    # {target}/lib is routinely a real, already-populated directory by this
+    # point (phase_kernel drops modules at lib/modules, phase_firmware at
+    # lib/firmware) rather than empty -- merge its content into usr/lib
+    # first so the eventual symlink doesn't silently orphan it, matching
+    # the container's own real layout where /lib/modules and /lib/firmware
+    # both resolve through /lib -> usr/lib to usr/lib/modules and
+    # usr/lib/firmware.
+    def _merge_dir_into(src_dir, dst_dir):
+        """Recursively move src_dir's content into dst_dir. A directory on
+        both sides merges (recurse); a file/symlink on both sides is a real
+        conflict worth stopping for, not silently picking a winner."""
+        ensure(dst_dir)
+        for name in os.listdir(src_dir):
+            src_path = os.path.join(src_dir, name)
+            dst_path = os.path.join(dst_dir, name)
+            if os.path.isdir(src_path) and not os.path.islink(src_path) and \
+               os.path.isdir(dst_path) and not os.path.islink(dst_path):
+                _merge_dir_into(src_path, dst_path)
+                os.rmdir(src_path)
+            elif os.path.exists(dst_path) or os.path.islink(dst_path):
+                err(f"_bootstrap_glibc_runtime: {dst_path} already exists -- "
+                    f"refusing to silently clobber it by merging {src_path}")
+            else:
+                shutil.move(src_path, dst_path)
+
+    real_lib = os.path.join(target, "lib")
+    usr_lib = os.path.join(target, "usr", "lib")
+    if os.path.isdir(real_lib) and not os.path.islink(real_lib):
+        # {target}/lib is routinely a real, already-populated directory by
+        # this point (phase_kernel drops modules at lib/modules,
+        # phase_firmware historically touched lib/firmware) rather than
+        # empty -- merge its content into usr/lib first so the eventual
+        # symlink doesn't silently orphan it, matching the container's own
+        # real layout where /lib/modules and /lib/firmware both resolve
+        # through /lib -> usr/lib to usr/lib/modules and usr/lib/firmware.
+        _merge_dir_into(real_lib, usr_lib)
+        os.rmdir(real_lib)
+
+    for link_name, link_target in (("bin", "usr/bin"), ("sbin", "usr/sbin"),
+                                    ("lib", "usr/lib")):
+        link_path = os.path.join(target, link_name)
+        if not os.path.islink(link_path) and not os.path.exists(link_path):
+            symlink(link_target, link_path)
+    lib64_dir = os.path.join(target, "lib64")
+    ensure(lib64_dir)
+    interp_link = os.path.join(lib64_dir, "ld-linux-x86-64.so.2")
+    if not os.path.islink(interp_link) and not os.path.exists(interp_link):
+        symlink("../lib/x86_64-linux-gnu/ld-linux-x86-64.so.2", interp_link)
+
+    host_multiarch = "/usr/lib/x86_64-linux-gnu"
+    dst_multiarch = os.path.join(target, "usr", "lib", "x86_64-linux-gnu")
+    ensure(dst_multiarch)
+    copied = 0
+    for name in os.listdir(host_multiarch):
+        src_path = os.path.join(host_multiarch, name)
+        dst_path = os.path.join(dst_multiarch, name)
+        if os.path.exists(dst_path) or os.path.islink(dst_path):
+            continue
+        if os.path.islink(src_path):
+            symlink(os.readlink(src_path), dst_path)
+            copied += 1
+        elif os.path.isfile(src_path):
+            shutil.copy2(src_path, dst_path)
+            copied += 1
+    log(f"glibc runtime bootstrapped from host container ({copied} files/links "
+        f"added to {dst_multiarch}, existing target-built libs preserved).",
+        color=GREEN)
+
+    # modprobe/insmod/rmmod/depmod/lsmod are all the same kmod multi-call
+    # binary on the container -- copy that one file and recreate the same
+    # symlinks, rather than build kmod from source. Same "host runtime,
+    # documented" category as glibc itself above: this is a low-level
+    # system tool, not something SmechOS differentiates on, and its
+    # complete absence (not just missing symlinks -- the binary itself was
+    # never installed anywhere in the target) is what left every
+    # modprobe-invoking chroot call and every modprobe@*.service unit
+    # failing with "No such file or directory" even after the FHS symlinks
+    # were fixed.
+    kmod_dst = os.path.join(target, "usr", "bin", "kmod")
+    if not os.path.exists(kmod_dst):
+        shutil.copy2("/usr/bin/kmod", kmod_dst)
+        shutil.copystat("/usr/bin/kmod", kmod_dst)
+        for applet in ("modprobe", "insmod", "rmmod", "depmod", "lsmod"):
+            link_path = os.path.join(target, "usr", "sbin", applet)
+            if not os.path.islink(link_path) and not os.path.exists(link_path):
+                symlink("../bin/kmod", link_path)
+        log("kmod (modprobe/insmod/rmmod/depmod/lsmod) copied from host.",
+            color=GREEN)
+
+    # ldconfig: Ubuntu ships /usr/sbin/ldconfig as a dpkg-trigger wrapper
+    # script around the real binary at /sbin/ldconfig.real -- the wrapper's
+    # entire purpose is deferring to dpkg's trigger queue, which doesn't
+    # exist in this target at all, so take the real binary directly under
+    # the plain name instead of reproducing dpkg-specific wrapper logic.
+    ldconfig_dst = os.path.join(target, "usr", "sbin", "ldconfig")
+    if not os.path.exists(ldconfig_dst):
+        shutil.copy2("/sbin/ldconfig.real", ldconfig_dst)
+        shutil.copystat("/sbin/ldconfig.real", ldconfig_dst)
+        log("ldconfig copied from host (real binary, not the dpkg wrapper).",
+            color=GREEN)
+
+    # /bin/sh: nothing in this profile ever builds a POSIX sh or symlinks
+    # bash as one. Pulling in dash (Ubuntu's /bin/sh) as a whole separate
+    # from-source package just for this is disproportionate -- bash's own
+    # POSIX/sh compatibility mode (activated automatically when invoked as
+    # "sh") is sufficient for every #!/bin/sh script and chroot/switch_root
+    # call this system actually makes.
+    sh_link = os.path.join(target, "usr", "bin", "sh")
+    if not os.path.islink(sh_link) and not os.path.exists(sh_link):
+        symlink("bash", sh_link)
+
 def phase_bootstrap_userland_glibc(target):
     """Bootstrap GNU userland against host glibc (used by the plasma-live profile)."""
     log_phase("userland-glibc", "Bootstrap GNU userland against host glibc")
+    _bootstrap_glibc_runtime(target)
     src  = sources(target)
     env  = build_env_glibc(target)
     pfix = f"{target}/usr"
@@ -3506,14 +3655,24 @@ def phase_systemd(target):
     bd = os.path.join(BUILD_TMP, "util-linux")
     shutil.rmtree(bd, ignore_errors=True)
     extract(tarball, bd)
+    # NOTE: this used to pass --disable-all-programs, built only for the
+    # libmount/libblkid/libuuid libraries systemd links against at build
+    # time. That silently left mount/umount/losetup/etc entirely absent
+    # from the target -- invisible until the first real boot, where
+    # systemd's own generated .mount units (dev-hugepages.mount, tmp.mount,
+    # proc-sys-fs-binfmt_misc.mount, ...) failed with "Unable to locate
+    # executable '/usr/bin/mount'". Building the full default program set
+    # instead of hand-picking flags (util-linux has ~30 of them) is the
+    # safer choice here: worth the extra build time to not silently miss
+    # another one.
     run(["./configure", f"--prefix={prefix}",
-         "--disable-all-programs",
          "--enable-libmount", "--enable-libblkid",
          "--enable-libuuid",
          "--without-python", "--disable-nls"], cwd=bd, env=env)
     run(["make", "-j", nproc()], cwd=bd, env=env)
     run(["make", "install"], cwd=bd, env=env, sudo=(os.geteuid() != 0))
-    log("util-linux (libmount + libblkid) installed.", color=GREEN)
+    log("util-linux (full program set + libmount/libblkid/libuuid) installed.",
+        color=GREEN)
 
     # ── systemd ───────────────────────────────────────────────────────────────
     sd_url  = (f"https://github.com/systemd/systemd/archive/refs/tags/"
