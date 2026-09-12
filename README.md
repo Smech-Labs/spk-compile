@@ -171,6 +171,115 @@ are fixed by adding one string to one of these lists.**
 
 ---
 
+## Building the full ISO in a container
+
+`build-one.sh` (above) is for verifying a single package. Building the
+**whole** ISO — all 24 phases, several hours end to end — needs a much
+larger set of exact host packages (a specific GCC version, matching Qt6/KDE
+build deps, kernel build tools…), and the only way to get that set reliably
+is inside the same `ubuntu:24.04` container `build-one.sh` already uses,
+built once from the `Dockerfile` in this repo.
+
+```bash
+# Build the compile image (a few minutes; cached after the first run)
+podman build -t ghcr.io/smech-labs/smechos-build:latest -f Dockerfile .
+# (docker build works identically if you have Docker instead of podman)
+
+# Run the full build. Requires --privileged (kernel build needs it) and
+# --cgroupns=host if your container runtime nests cgroups for podman-in-
+# docker use elsewhere in the pipeline.
+docker run --rm --privileged --cgroupns=host \
+    -v /path/to/spk-compile-sources:/mnt/spk-compile-sources \
+    -v /path/to/smechos_build_root:/mnt/smechos_build_root \
+    -v /tmp/smechos_build:/tmp/smechos_build \
+    ghcr.io/smech-labs/smechos-build:latest smechos-plasma-live
+```
+
+The two persistent volumes matter: `spk-compile-sources` caches every
+downloaded tarball (so a re-run after a failure doesn't re-download
+anything already fetched), and `smechos_build_root` is the actual rootfs
+being assembled — it's what eventually gets squashed into the ISO. Losing
+either one means starting that phase over, not the whole build.
+
+The finished ISO lands in a sibling directory named
+`smechos-iso-output/smechos-plasma-live.iso`, next to wherever
+`smechos_build_root` was mounted.
+
+```bash
+cd smechos-iso-output
+sha256sum smechos-plasma-live.iso > smechos-plasma-live.iso.sha256
+gpg --detach-sign --armor smechos-plasma-live.iso
+```
+
+### If a phase fails on a missing package
+
+This is the normal way this build breaks, and it's a one-line fix, not a
+real bug: `spk-compile.py` targets exact upstream CMake/Meson dependency
+names, and mapping "CMake couldn't find `Foo`" to the actual Ubuntu
+`-dev` package that provides it is manual. When it happens:
+
+1. Read the actual error (`Could NOT find X` / `Dependency "y" not found` /
+   `undefined reference to Z`) — not just "it failed."
+2. Find the Ubuntu package: `apt-cache search <name>` or
+   `apt-cache policy <guessed-package-name>` inside a `docker run` shell
+   into the image (`--entrypoint bash`).
+3. Add it to the relevant `apt-get install` block in `Dockerfile` — a new
+   `RUN apt-get install ...` line near the bottom keeps the big base layer
+   cached and only invalidates a small layer, so the rebuild is seconds,
+   not minutes.
+4. Rebuild the image and re-run. Already-completed phases and packages are
+   skipped via stamp files under `spk-compile-sources/.stamps/` — you only
+   pay for the phase that just failed, not the whole build again.
+
+A small number of dependencies aren't in apt at all (KDE-adjacent projects
+with their own release schedule, e.g. `polkit-qt-1`, or third-party
+libraries like `QCoro6`, `libdisplay-info`). For those, `spk-compile.py`
+builds them from source directly — see the small inline build blocks near
+the top of `phase_kde()` for the existing pattern to copy if you hit a new
+one.
+
+### Current phase list (`smechos-plasma-live`, 24 phases)
+
+| # | Phase | What it does |
+|---|---|---|
+| 1 | `userland-glibc` | Bootstrap GNU userland against host glibc |
+| 2 | `etc` | Write `/etc` skeleton |
+| 3 | `systemd` | Install systemd from Debian packages |
+| 4 | `systemd-config` | Configure baseline systemd state |
+| 5 | `locale` | Generate `en_US.UTF-8` locale |
+| 6 | `grub` | Compile GRUB 2.12 EFI + BIOS |
+| 7 | `qt-deps` | Compile Qt6 modules |
+| 8 | `mesa` | Compile Mesa stack |
+| 9 | `cmake-bootstrap` | Bootstrap CMake |
+| 10 | `wayland` | Build Wayland |
+| 11 | `wayland-protocols` | Build wayland-protocols |
+| 12 | `libinput` | Build libinput |
+| 13 | `kde` | Compile KDE Frameworks + Plasma |
+| 14 | `plasma-configure` | Configure display manager (autologin fallback SDDM) |
+| 15 | `kwin-deps` | Copy KWin runtime dependencies |
+| 16 | `xwayland-deps` | Fetch Xwayland + xkbcomp + xkb-data |
+| 17 | `qt6uitools` | Ensure Qt6UITools is present |
+| 18 | `kernel` | Compile Linux 6.12.16 |
+| 19 | `firmware` | Bundle GPU firmware (amdgpu + i915 + radeon) |
+| 20 | `patch-metadata` | Patch metadata for SmechOS branding |
+| 21 | `discover` | Compile Plasma Discover + PackageKit |
+| 22 | `calamares` | Build the Calamares graphical installer |
+| 23 | `firefox` | Install Mozilla Firefox stable |
+| 24 | `live-initramfs` | Build the busybox live initramfs |
+| — | `bundle` | Bundle output into spk-installable `.tar.xz` packages |
+
+Run one phase in isolation the same way as on bare metal, just via
+`docker run` instead of `sudo python3`:
+
+```bash
+docker run --rm --privileged --cgroupns=host \
+    -v /path/to/spk-compile-sources:/mnt/spk-compile-sources \
+    -v /path/to/smechos_build_root:/mnt/smechos_build_root \
+    ghcr.io/smech-labs/smechos-build:latest smechos-plasma-live --phase kde
+```
+
+---
+
 ## Contributing
 
 See [CONTRIBUTING.md](https://github.com/Smech-Labs/.github/blob/main/CONTRIBUTING.md).
