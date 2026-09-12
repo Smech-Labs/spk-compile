@@ -1,6 +1,6 @@
 # SmechOS single-package build environment.
 #
-# Published as ghcr.io/smech-labs/smechos-build. Used by build-one.sh to
+# Published as ghcr.io/smech-labs/smechos-single-pkg-build. Used by build-one.sh to
 # compile one KDE/Plasma package against an existing SmechOS rootfs.
 #
 # WHY ubuntu:24.04 SPECIFICALLY -- this is not an arbitrary base choice:
@@ -514,15 +514,20 @@ RUN ln -sf /usr/bin/llvm-config-20 /usr/bin/llvm-config
 # Pinned to 3.31.x deliberately: it satisfies KF6's floor, while CMake 4.x
 # drops compatibility with projects declaring minimums below 3.5 and would
 # break other packages in the tree.
-ARG CMAKE_VERSION=3.31.6
-RUN curl -fsSL -o /tmp/cmake.tar.gz \
-        "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz" && \
-    tar -xzf /tmp/cmake.tar.gz -C /opt && \
-    rm /tmp/cmake.tar.gz && \
-    ln -sf "/opt/cmake-${CMAKE_VERSION}-linux-x86_64/bin/cmake" /usr/local/bin/cmake && \
-    ln -sf "/opt/cmake-${CMAKE_VERSION}-linux-x86_64/bin/ctest" /usr/local/bin/ctest && \
-    ln -sf "/opt/cmake-${CMAKE_VERSION}-linux-x86_64/bin/cmake" /usr/bin/cmake && \
-    cmake --version | head -1
+# CMake 3.31.6 is now a real, dpkg-tracked package built from actual
+# upstream source via debhelper + dpkg-buildpackage (not a hand-placed
+# tarball, not an equivs placeholder) and published to Smech Labs' own
+# apt repo -- see cmake-deb-builder and apt.smech.xyz. Installing it the
+# normal apt way means dpkg's view of the system and what's actually on
+# disk finally agree, with zero manual symlinking or dummy packages.
+COPY smech-labs-archive-keyring.gpg /usr/share/keyrings/smech-labs-archive-keyring.gpg
+RUN echo "deb [signed-by=/usr/share/keyrings/smech-labs-archive-keyring.gpg] https://apt.smech.xyz smech-noble main" \
+        > /etc/apt/sources.list.d/smech-labs.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends cmake && \
+    rm -rf /var/lib/apt/lists/* && \
+    cmake --version | head -1 && \
+    dpkg -l cmake | tail -1
 
 # Force gawk as the `awk` alternative -- see the gawk comment above.
 RUN update-alternatives --set awk /usr/bin/gawk
