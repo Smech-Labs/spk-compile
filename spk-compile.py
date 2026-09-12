@@ -456,7 +456,45 @@ def _split_staging_prefix(prefix):
         raise ValueError(f"expected prefix ending in /usr, got: {prefix}")
     return prefix[: -len("/usr")]  # staging root ("target"), real prefix is always "/usr"
 
-def cmake_install(src_dir, prefix, extra_args=None, env=None, build_dir=None):
+SPKG_MANIFEST_DIRNAME = ".spkg-manifests"
+
+def _record_component_manifest(target, pkg_name, root, since_ts, pkg_version="0.0.0"):
+    """Record every file under `root` written since `since_ts` as
+    belonging to `pkg_name`, for later per-component .spkg packaging.
+
+    Deliberately a single post-install walk filtering by mtime, not a
+    before/after full-tree snapshot diff: the target rootfs grows to
+    100k+ files by the time late KDE/Plasma packages install, and this
+    same helper runs once per component (roughly 150+ times across the
+    KF6/Plasma/Qt6 loops) -- a before-AND-after walk would double that
+    cost for no real benefit over one walk with an mtime cutoff. The `-1`
+    second buffer covers filesystems with 1-second mtime resolution.
+    """
+    manifest_dir = os.path.join(sources(target), SPKG_MANIFEST_DIRNAME)
+    ensure(manifest_dir)
+    cutoff = since_ts - 1
+    files = []
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for fn in filenames:
+            p = os.path.join(dirpath, fn)
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            if st.st_mtime >= cutoff:
+                files.append(os.path.relpath(p, root))
+    # First line is "version: X" (parsed by the .spkg packaging phase),
+    # rest is the sorted file list -- avoids a second lookup/guess at
+    # packaging time for which KF6_VER/PLASMA_VER/QT6_VER a given
+    # component's manifest corresponds to.
+    manifest_path = os.path.join(manifest_dir, f"{pkg_name}.filelist")
+    with open(manifest_path, "w") as f:
+        f.write(f"version: {pkg_version}\n")
+        f.write("\n".join(sorted(files)) + ("\n" if files else ""))
+    log(f"  manifest: {pkg_name} {pkg_version} -> {len(files)} files", color=CYAN)
+    return len(files)
+
+def cmake_install(src_dir, prefix, extra_args=None, env=None, build_dir=None, pkg_name=None, pkg_version="0.0.0"):
     bd = build_dir or os.path.join(src_dir, "build")
     ensure(bd)
     # Always resolve cmake/ninja from the host system PATH, never from the
@@ -517,9 +555,12 @@ def cmake_install(src_dir, prefix, extra_args=None, env=None, build_dir=None):
     run([ninja_bin, "-j", nproc(), "-k", "0"], cwd=bd, env=build_env, check=False)
     install_env = dict(build_env)
     install_env["DESTDIR"] = target_root
+    _install_t0 = time.time()
     run([cmake_bin, "--install", bd], env=install_env, sudo=(os.geteuid() != 0))
+    if pkg_name:
+        _record_component_manifest(target_root, pkg_name, target_root, _install_t0, pkg_version)
 
-def meson_install(src_dir, prefix, extra_args=None, env=None, build_dir=None):
+def meson_install(src_dir, prefix, extra_args=None, env=None, build_dir=None, pkg_name=None, pkg_version="0.0.0"):
     bd = build_dir or os.path.join(src_dir, "build")
     if os.path.exists(bd):
         shutil.rmtree(bd)
@@ -592,7 +633,10 @@ def meson_install(src_dir, prefix, extra_args=None, env=None, build_dir=None):
     run(["ninja", "-C", bd, "-j", nproc()], env=host_env)
     install_env = dict(host_env)
     install_env["DESTDIR"] = target_root
+    _install_t0 = time.time()
     run(["ninja", "-C", bd, "install"], env=install_env, sudo=(os.geteuid() != 0))
+    if pkg_name:
+        _record_component_manifest(target_root, pkg_name, target_root, _install_t0, pkg_version)
 
 def _fix_target_pc_prefix(target):
     """Rewrite `prefix=/usr` to `prefix={target}/usr`, but ONLY in .pc
@@ -1184,7 +1228,8 @@ def phase_qt_deps(target):
                         "-DQT_BUILD_TESTS=OFF",
                         "-DQT_BUILD_EXAMPLES=OFF"] + extra,
             env=env,
-            build_dir=os.path.join(BUILD_TMP, f"qt6-{name}-build"))
+            build_dir=os.path.join(BUILD_TMP, f"qt6-{name}-build"),
+            pkg_name=f"qt6-{name}", pkg_version=QT6_VER)
         log(f"Qt6/{name} done.", color=GREEN)
 
         if name == "qtbase":
@@ -2084,7 +2129,8 @@ def _kde_pkg(name, version, base_url, target, env, profile="smechos-plasma-live"
                     "-DBUILD_TESTING=OFF", "-DBUILD_QCH=OFF",
                     "-DBUILD_PYTHON_BINDINGS=OFF"] + pkg_extra.get(name, []),
         env=env,
-        build_dir=bd_build)
+        build_dir=bd_build,
+        pkg_name=name, pkg_version=version)
     _mark_done(profile, stamp)
     log(f"{name} {version} done.", color=GREEN)
 
@@ -3182,14 +3228,17 @@ def phase_plasma_discover(target):
     # install or update anything on this build. Confirmed the real v2.0.1
     # release genuinely has `packagekit-backend` (and `install`/
     # `system-upgrade`/`compile`/deploy commands) before wiring this in.
-    spk_bin_url = "https://github.com/Smech-Labs/spk/releases/download/v2.0.1/spk"
+    # v2.2.0: adds .spkg support (control.tar.xz+data.tar.xz per-component
+    # packages), `install --local-package`, and `local-package-repo` --
+    # see Smech-Labs/spk's README.md and phase_bundle_spkg_packages below.
+    spk_bin_url = "https://github.com/Smech-Labs/spk/releases/download/v2.2.0/spk"
     spk_bin_dst = os.path.join(target, "usr", "bin", "spk")
-    spk_bin_tmp = os.path.join(src, "spk-v2.0.1")
+    spk_bin_tmp = os.path.join(src, "spk-v2.2.0")
     download(spk_bin_url, spk_bin_tmp)
     ensure(os.path.dirname(spk_bin_dst))
     shutil.copy2(spk_bin_tmp, spk_bin_dst)
     os.chmod(spk_bin_dst, 0o755)
-    log("Installed real spk v2.0.1 binary to usr/bin/spk.", color=GREEN)
+    log("Installed real spk v2.2.0 binary to usr/bin/spk.", color=GREEN)
 
     # SPK PackageKit script backend
     backend_dir = os.path.join(target, "usr", "lib", "packagekit-backend")
@@ -3396,6 +3445,108 @@ def phase_bundle_packages(target):
 
     log(f"All packages written to {out}", color=GREEN)
     log("Upload these to the GitHub Release and set RELEASE_BASE_URL in spk.", color=YELLOW)
+
+def phase_bundle_spkg_packages(target):
+    """Emit one real .spkg (control.tar.xz + data.tar.xz, the format
+    Smech-Labs/spk v2.2.0+ understands) per component recorded by
+    _record_component_manifest -- currently every KF6 module, Plasma
+    app, and Qt6 module, since those are the loops cmake_install() got
+    pkg_name=/pkg_version= wired into.
+
+    This is the first real slice of per-package atomization, not a claim
+    the whole system is atomized: kernel, firmware, GRUB, systemd, Mesa,
+    Wayland, and the handful of hand-written cmake_install() calls
+    outside the KF6/Plasma/Qt6 loops have no manifests yet and stay on
+    phase_bundle_packages()'s category-level .tar.xz bundles above.
+    Extending pkg_name=/pkg_version= to those remaining call sites is the
+    same mechanical pattern, just not done everywhere yet.
+
+    Manifest attribution is by install mtime window (see
+    _record_component_manifest), not real dependency tracking -- a file
+    whose mtime happens to fall inside two components' install windows
+    (rare, but possible for something touched again by a later step)
+    could in principle land in both manifests. Good enough for real,
+    working per-component packages today; a stronger guarantee would
+    need syscall-level file tracking (strace/fanotify), which is real
+    future work, not attempted here.
+    """
+    log_phase("bundle-spkg", "Emit per-component .spkg packages from recorded manifests")
+    manifest_dir = os.path.join(sources(target), SPKG_MANIFEST_DIRNAME)
+    if not os.path.isdir(manifest_dir):
+        err(f"No manifests found at {manifest_dir} -- the kde/qt-deps phases must "
+            f"run (not just be skipped via an existing stamp) to record any "
+            f"per-component manifests.")
+
+    # /mnt, not /tmp -- this build runs inside an ephemeral `podman run --rm`
+    # container whose /tmp is discarded on exit (see phase_bundle_packages's
+    # comment above, learned the hard way).
+    out = "/mnt/smechos-packages-spkg"
+    ensure(out)
+
+    count, skipped = 0, 0
+    for fname in sorted(os.listdir(manifest_dir)):
+        if not fname.endswith(".filelist"):
+            continue
+        pkg_name = fname[: -len(".filelist")]
+        with open(os.path.join(manifest_dir, fname)) as f:
+            lines = f.read().splitlines()
+        if not lines or not lines[0].startswith("version:"):
+            log(f"Skipping {pkg_name}: manifest missing version header", color=YELLOW)
+            skipped += 1
+            continue
+        version = lines[0].split(":", 1)[1].strip()
+        files = [l for l in lines[1:] if l]
+        if not files:
+            log(f"Skipping {pkg_name}: manifest recorded zero files", color=YELLOW)
+            skipped += 1
+            continue
+
+        stage = os.path.join(BUILD_TMP, f"spkg-stage-{pkg_name}")
+        shutil.rmtree(stage, ignore_errors=True)
+        control_dir = os.path.join(stage, "control")
+        payload_dir = os.path.join(stage, "payload")
+        ensure(control_dir)
+        ensure(payload_dir)
+
+        with open(os.path.join(control_dir, "control"), "w") as f:
+            f.write(f"name: {pkg_name}\n")
+            f.write(f"version: {version}\n")
+            f.write("architecture: x86_64\n")
+            f.write("depends: \n")
+            f.write(f"description: SmechOS component: {pkg_name}\n")
+
+        missing = 0
+        for rel in files:
+            src_path = os.path.join(target, rel)
+            dst_path = os.path.join(payload_dir, rel)
+            if not os.path.exists(src_path) and not os.path.islink(src_path):
+                missing += 1
+                continue
+            ensure(os.path.dirname(dst_path))
+            if os.path.islink(src_path):
+                symlink(os.readlink(src_path), dst_path)
+            else:
+                shutil.copy2(src_path, dst_path)
+        if missing:
+            log(f"{pkg_name}: {missing} manifest file(s) no longer exist on disk "
+                f"(overwritten/removed by a later phase) -- packaged anyway, "
+                f"skipping those entries.", color=YELLOW)
+
+        run(["tar", "-cJf", os.path.join(stage, "control.tar.xz"), "-C", control_dir, "."])
+        run(["tar", "-cJf", os.path.join(stage, "data.tar.xz"), "-C", payload_dir, "."])
+        spkg_path = os.path.join(out, f"{pkg_name}.spkg")
+        run(["tar", "-cf", spkg_path, "-C", stage, "control.tar.xz", "data.tar.xz"])
+        shutil.rmtree(stage, ignore_errors=True)
+
+        size_kb = os.path.getsize(spkg_path) / 1024
+        log(f"  {pkg_name}.spkg  {version}  {size_kb:.0f} KB  ({len(files)} files)",
+            color=GREEN)
+        count += 1
+
+    log(f"{count} .spkg packages written to {out} ({skipped} manifest(s) skipped).",
+        color=GREEN)
+    log("Upload these to pkg.smech.xyz (or a GitHub Release) for spk to fetch.",
+        color=YELLOW)
 
 # ── Plasma Live phases ────────────────────────────────────────────────────────
 
@@ -4925,6 +5076,7 @@ SMECHOS_PLASMA_LIVE_PHASES = [
     ("firefox",         phase_firefox,                   "Install Mozilla Firefox stable"),
     ("live-initramfs",  phase_live_initramfs,            "Build busybox live initramfs"),
     ("bundle",          phase_bundle_packages,           "Bundle output into spk-installable .tar.xz packages"),
+    ("bundle-spkg",     phase_bundle_spkg_packages,      "Emit per-component .spkg packages from recorded manifests"),
 ]
 
 # Headless, no desktop -- old LGA775 Pentium/Celeron (Core-derived, no
