@@ -458,31 +458,42 @@ def _split_staging_prefix(prefix):
 
 SPKG_MANIFEST_DIRNAME = ".spkg-manifests"
 
-def _record_component_manifest(target, pkg_name, root, since_ts, pkg_version="0.0.0"):
-    """Record every file under `root` written since `since_ts` as
-    belonging to `pkg_name`, for later per-component .spkg packaging.
+def _snapshot_tree(root):
+    """Set of every file's path (relative to `root`) that exists right now.
+    Just directory-entry listing (os.walk), no per-file stat() calls -- cheap
+    even against a rootfs with 100k+ files, since existence is all that's
+    needed for the diff in _record_component_manifest."""
+    paths = set()
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for fn in filenames:
+            paths.add(os.path.relpath(os.path.join(dirpath, fn), root))
+    return paths
 
-    Deliberately a single post-install walk filtering by mtime, not a
-    before/after full-tree snapshot diff: the target rootfs grows to
-    100k+ files by the time late KDE/Plasma packages install, and this
-    same helper runs once per component (roughly 150+ times across the
-    KF6/Plasma/Qt6 loops) -- a before-AND-after walk would double that
-    cost for no real benefit over one walk with an mtime cutoff. The `-1`
-    second buffer covers filesystems with 1-second mtime resolution.
+def _record_component_manifest(target, pkg_name, root, before_snapshot, pkg_version="0.0.0"):
+    """Record every file under `root` that exists now but didn't exist in
+    `before_snapshot` (a _snapshot_tree(root) taken right before this
+    component's install step ran) as belonging to `pkg_name`, for later
+    per-component .spkg packaging.
+
+    A real before/after diff, not an mtime-window guess -- an earlier
+    version of this function filtered by "mtime >= install_time - 1s",
+    which turned out to be badly wrong: CMake's install() step routinely
+    preserves a file's original build/tarball timestamp rather than
+    stamping "now" on it. Confirmed directly on a real build: a real,
+    fully-installed package's .upd config file carried a mtime from the
+    upstream tarball's original packaging date, months before this build
+    ever ran. The mtime filter silently missed it, and worse, silently
+    missed the package's own compiled .so file the same way in several
+    cases -- kwidgetsaddons.spkg came out of a real build containing only
+    a Designer plugin, not libKF6WidgetsAddons.so.6 itself, and 14 other
+    packages recorded zero files despite building successfully. Existence-
+    based diffing has no such blind spot: a path that's newly present
+    belongs to whatever just ran, whatever timestamp it happens to carry.
     """
     manifest_dir = os.path.join(sources(target), SPKG_MANIFEST_DIRNAME)
     ensure(manifest_dir)
-    cutoff = since_ts - 1
-    files = []
-    for dirpath, _dirnames, filenames in os.walk(root):
-        for fn in filenames:
-            p = os.path.join(dirpath, fn)
-            try:
-                st = os.lstat(p)
-            except OSError:
-                continue
-            if st.st_mtime >= cutoff:
-                files.append(os.path.relpath(p, root))
+    after = _snapshot_tree(root)
+    files = sorted(after - before_snapshot)
     # First line is "version: X" (parsed by the .spkg packaging phase),
     # rest is the sorted file list -- avoids a second lookup/guess at
     # packaging time for which KF6_VER/PLASMA_VER/QT6_VER a given
@@ -490,7 +501,7 @@ def _record_component_manifest(target, pkg_name, root, since_ts, pkg_version="0.
     manifest_path = os.path.join(manifest_dir, f"{pkg_name}.filelist")
     with open(manifest_path, "w") as f:
         f.write(f"version: {pkg_version}\n")
-        f.write("\n".join(sorted(files)) + ("\n" if files else ""))
+        f.write("\n".join(files) + ("\n" if files else ""))
     log(f"  manifest: {pkg_name} {pkg_version} -> {len(files)} files", color=CYAN)
     return len(files)
 
@@ -555,10 +566,10 @@ def cmake_install(src_dir, prefix, extra_args=None, env=None, build_dir=None, pk
     run([ninja_bin, "-j", nproc(), "-k", "0"], cwd=bd, env=build_env, check=False)
     install_env = dict(build_env)
     install_env["DESTDIR"] = target_root
-    _install_t0 = time.time()
+    _before = _snapshot_tree(target_root) if pkg_name else None
     run([cmake_bin, "--install", bd], env=install_env, sudo=(os.geteuid() != 0))
     if pkg_name:
-        _record_component_manifest(target_root, pkg_name, target_root, _install_t0, pkg_version)
+        _record_component_manifest(target_root, pkg_name, target_root, _before, pkg_version)
 
 def meson_install(src_dir, prefix, extra_args=None, env=None, build_dir=None, pkg_name=None, pkg_version="0.0.0"):
     bd = build_dir or os.path.join(src_dir, "build")
@@ -633,10 +644,10 @@ def meson_install(src_dir, prefix, extra_args=None, env=None, build_dir=None, pk
     run(["ninja", "-C", bd, "-j", nproc()], env=host_env)
     install_env = dict(host_env)
     install_env["DESTDIR"] = target_root
-    _install_t0 = time.time()
+    _before = _snapshot_tree(target_root) if pkg_name else None
     run(["ninja", "-C", bd, "install"], env=install_env, sudo=(os.geteuid() != 0))
     if pkg_name:
-        _record_component_manifest(target_root, pkg_name, target_root, _install_t0, pkg_version)
+        _record_component_manifest(target_root, pkg_name, target_root, _before, pkg_version)
 
 def _fix_target_pc_prefix(target):
     """Rewrite `prefix=/usr` to `prefix={target}/usr`, but ONLY in .pc
@@ -898,7 +909,7 @@ def phase_inittab(target):
 
 def phase_kernel(target):
     log_phase("kernel", f"Compile Linux {LINUX_VER}")
-    since_ts = time.time()
+    before_snapshot = _snapshot_tree(target)
     src     = sources(target)
     tarball = os.path.join(src, f"linux-{LINUX_VER}.tar.xz")
     download(LINUX_URL, tarball)
@@ -1002,7 +1013,7 @@ def phase_kernel(target):
     # permanently black QEMU framebuffer this session -- not a display-backend issue.
     run(["depmod", "-a", "-b", target, LINUX_VER],
         cwd=bd, env=env, sudo=(os.geteuid() != 0))
-    _record_component_manifest(target, "kernel", target, since_ts, pkg_version=LINUX_VER)
+    _record_component_manifest(target, "kernel", target, before_snapshot, pkg_version=LINUX_VER)
     log(f"Linux {LINUX_VER} installed.", color=GREEN)
 
 _FW_COMPRESSED_EXTS = {".xz": "unxz -f", ".zst": "unzstd -f --rm"}
@@ -1104,7 +1115,7 @@ def phase_firmware(target):
     it's still XZ-compressed like everything else in the squashfs.
     """
     log_phase("firmware", f"Clone upstream linux-firmware {LINUX_FIRMWARE_VER} (git.kernel.org)")
-    since_ts = time.time()
+    before_snapshot = _snapshot_tree(target)
     src = sources(target)
     fw_root = os.path.join(src, f"linux-firmware-{LINUX_FIRMWARE_VER}")
     if not os.path.isdir(fw_root):
@@ -1119,13 +1130,13 @@ def phase_firmware(target):
     for dirpath, _dirnames, filenames in os.walk(dst_root):
         if any(f.endswith(ext) for ext in _FW_COMPRESSED_EXTS for f in filenames):
             _decompress_firmware_dir(dirpath)
-    _record_component_manifest(target, "firmware", target, since_ts, pkg_version=LINUX_FIRMWARE_VER)
+    _record_component_manifest(target, "firmware", target, before_snapshot, pkg_version=LINUX_FIRMWARE_VER)
     log(f"linux-firmware {LINUX_FIRMWARE_VER} bundled from upstream ({dst_root}).",
         color=GREEN)
 
 def phase_grub(target):
     log_phase("grub", f"Compile GRUB {GRUB_VER} EFI + BIOS")
-    since_ts = time.time()
+    before_snapshot = _snapshot_tree(target)
     src     = sources(target)
     tarball = os.path.join(src, f"grub-{GRUB_VER}.tar.xz")
     download(GRUB_URL, tarball)
@@ -1173,7 +1184,7 @@ def phase_grub(target):
          "-o", os.path.join(font_dir, "unicode.pf2"), bdf],
         env=env, sudo=(os.geteuid() != 0))
     log(f"unicode.pf2 generated from GNU Unifont {UNIFONT_VER}.", color=GREEN)
-    _record_component_manifest(target, "grub", target, since_ts, pkg_version=GRUB_VER)
+    _record_component_manifest(target, "grub", target, before_snapshot, pkg_version=GRUB_VER)
 
 def phase_qt_deps(target):
     log_phase("qt-deps", f"Compile Qt6 {QT6_VER} modules")
@@ -2154,7 +2165,7 @@ def _kde_pkg(name, version, base_url, target, env, profile="smechos-plasma-live"
 
 def phase_wayland(target):
     log_phase("wayland", f"Build wayland {WAYLAND_VER}")
-    since_ts = time.time()
+    before_snapshot = _snapshot_tree(target)
     src     = sources(target)
     tarball = os.path.join(src, f"wayland-{WAYLAND_VER}.tar.gz")
     download(WAYLAND_URL, tarball)
@@ -2175,12 +2186,12 @@ def phase_wayland(target):
     run(["ninja", "-C", builddir], env=env)
     run(["ninja", "-C", builddir, "install"], env=env)
     result = subprocess.run(["wayland-scanner", "--version"], capture_output=True, text=True)
-    _record_component_manifest(target, "wayland", target, since_ts, pkg_version=WAYLAND_VER)
+    _record_component_manifest(target, "wayland", target, before_snapshot, pkg_version=WAYLAND_VER)
     log(f"wayland-scanner: {result.stderr.strip() or result.stdout.strip()}", color=GREEN)
 
 def phase_wayland_protocols(target):
     log_phase("wayland-protocols", f"Build wayland-protocols {WAYLAND_PROTO_VER}")
-    since_ts = time.time()
+    before_snapshot = _snapshot_tree(target)
     src     = sources(target)
     tarball = os.path.join(src, f"wayland-protocols-{WAYLAND_PROTO_VER}.tar.gz")
     download(WAYLAND_PROTO_URL, tarball)
@@ -2198,12 +2209,12 @@ def phase_wayland_protocols(target):
          "--buildtype=release"], env=env)
     run(["ninja", "-C", builddir], env=env)
     run(["ninja", "-C", builddir, "install"], env=env)
-    _record_component_manifest(target, "wayland-protocols", target, since_ts, pkg_version=WAYLAND_PROTO_VER)
+    _record_component_manifest(target, "wayland-protocols", target, before_snapshot, pkg_version=WAYLAND_PROTO_VER)
     log(f"wayland-protocols {WAYLAND_PROTO_VER} installed", color=GREEN)
 
 def phase_libinput(target):
     log_phase("libinput", f"Build libinput {LIBINPUT_VER}")
-    since_ts = time.time()
+    before_snapshot = _snapshot_tree(target)
     src     = sources(target)
     tarball = os.path.join(src, f"libinput-{LIBINPUT_VER}.tar.gz")
     download(LIBINPUT_URL, tarball)
@@ -2223,12 +2234,12 @@ def phase_libinput(target):
          "-Ddebug-gui=false"], env=env)
     run(["ninja", "-C", builddir], env=env)
     run(["ninja", "-C", builddir, "install"], env=env)
-    _record_component_manifest(target, "libinput", target, since_ts, pkg_version=LIBINPUT_VER)
+    _record_component_manifest(target, "libinput", target, before_snapshot, pkg_version=LIBINPUT_VER)
     log(f"libinput {LIBINPUT_VER} installed", color=GREEN)
 
 def phase_libeis(target):
     log_phase("libeis", f"Build libeis {LIBEIS_VER} (remote input emulation for kwin)")
-    since_ts = time.time()
+    before_snapshot = _snapshot_tree(target)
     src     = sources(target)
     tarball = os.path.join(src, f"libeis-{LIBEIS_VER}.tar.xz")
     download(LIBEIS_URL, tarball)
@@ -2246,7 +2257,7 @@ def phase_libeis(target):
          "-Ddocumentation=disabled"], env=env)
     run(["ninja", "-C", builddir], env=env)
     run(["ninja", "-C", builddir, "install"], env=env)
-    _record_component_manifest(target, "libeis", target, since_ts, pkg_version=LIBEIS_VER)
+    _record_component_manifest(target, "libeis", target, before_snapshot, pkg_version=LIBEIS_VER)
     log(f"libeis {LIBEIS_VER} installed", color=GREEN)
     log(f"wayland-protocols {WAYLAND_PROTO_VER} installed to {target}/usr", color=GREEN)
 
@@ -3663,7 +3674,7 @@ def _bootstrap_glibc_runtime(target):
     from-scratch-style distro bootstraps from *some* host toolchain's
     libc. What was missing was just actually copying it into the image.
     """
-    since_ts = time.time()
+    before_snapshot = _snapshot_tree(target)
     # {target}/lib is routinely a real, already-populated directory by this
     # point (phase_kernel drops modules at lib/modules, phase_firmware at
     # lib/firmware) rather than empty -- merge its content into usr/lib
@@ -3775,7 +3786,7 @@ def _bootstrap_glibc_runtime(target):
     if not os.path.islink(sh_link) and not os.path.exists(sh_link):
         symlink("bash", sh_link)
 
-    _record_component_manifest(target, "glibc-runtime", target, since_ts,
+    _record_component_manifest(target, "glibc-runtime", target, before_snapshot,
                                 pkg_version=_host_glibc_version())
 
 def phase_bootstrap_userland_glibc(target):
@@ -3808,7 +3819,7 @@ def phase_bootstrap_userland_glibc(target):
          ["--disable-xzdec", "--disable-lzmadec"]),
     ]
     for name, ver, url, flags in pkgs:
-        since_ts = time.time()
+        before_snapshot = _snapshot_tree(target)
         tarball = os.path.join(src, os.path.basename(url))
         download(url, tarball)
         bd = os.path.join(BUILD_TMP, name)
@@ -3819,7 +3830,7 @@ def phase_bootstrap_userland_glibc(target):
         run(["./configure", f"--prefix={pfix}"] + flags, cwd=bd, env=env)
         run(["make", "-j", nproc()], cwd=bd, env=env)
         run(["make", "install"], cwd=bd, env=env, sudo=(os.geteuid() != 0))
-        _record_component_manifest(target, name, target, since_ts, pkg_version=ver)
+        _record_component_manifest(target, name, target, before_snapshot, pkg_version=ver)
         log(f"{name} {ver} installed.", color=GREEN)
 
 def _resolve_systemd_version():
@@ -3849,7 +3860,7 @@ def phase_systemd(target):
     prefix = f"{target}/usr"
 
     # ── gperf (needed for systemd hash table generation) ──────────────────────
-    since_ts = time.time()
+    before_snapshot = _snapshot_tree(target)
     gperf_ver = "3.1"
     gperf_url = f"https://ftp.gnu.org/gnu/gperf/gperf-{gperf_ver}.tar.gz"
     tarball   = os.path.join(src, f"gperf-{gperf_ver}.tar.gz")
@@ -3860,11 +3871,11 @@ def phase_systemd(target):
     run(["./configure", f"--prefix={prefix}"], cwd=bd, env=env)
     run(["make", "-j", nproc()], cwd=bd, env=env)
     run(["make", "install"], cwd=bd, env=env, sudo=(os.geteuid() != 0))
-    _record_component_manifest(target, "gperf", target, since_ts, pkg_version=gperf_ver)
+    _record_component_manifest(target, "gperf", target, before_snapshot, pkg_version=gperf_ver)
     log("gperf installed.", color=GREEN)
 
     # ── libcap (POSIX capabilities library) ───────────────────────────────────
-    since_ts = time.time()
+    before_snapshot = _snapshot_tree(target)
     libcap_ver = "2.73"
     libcap_url = (f"https://mirrors.edge.kernel.org/pub/linux/libs/security/"
                   f"linux-privs/libcap2/libcap-{libcap_ver}.tar.xz")
@@ -3880,11 +3891,11 @@ def phase_systemd(target):
     run(["make", "install", f"prefix={prefix}", "lib=lib",
          "GOLANG=no", "PYTHON=no"], cwd=bd, env=cap_env,
         sudo=(os.geteuid() != 0))
-    _record_component_manifest(target, "libcap", target, since_ts, pkg_version=libcap_ver)
+    _record_component_manifest(target, "libcap", target, before_snapshot, pkg_version=libcap_ver)
     log("libcap installed.", color=GREEN)
 
     # ── util-linux (provides libmount + libblkid required by systemd) ─────────
-    since_ts = time.time()
+    before_snapshot = _snapshot_tree(target)
     ul_ver = "2.40.4"
     ul_url = (f"https://mirrors.edge.kernel.org/pub/linux/utils/util-linux/"
               f"v2.40/util-linux-{ul_ver}.tar.xz")
@@ -3909,7 +3920,7 @@ def phase_systemd(target):
          "--without-python", "--disable-nls"], cwd=bd, env=env)
     run(["make", "-j", nproc()], cwd=bd, env=env)
     run(["make", "install"], cwd=bd, env=env, sudo=(os.geteuid() != 0))
-    _record_component_manifest(target, "util-linux", target, since_ts, pkg_version=ul_ver)
+    _record_component_manifest(target, "util-linux", target, before_snapshot, pkg_version=ul_ver)
     log("util-linux (full program set + libmount/libblkid/libuuid) installed.",
         color=GREEN)
 
@@ -3949,7 +3960,7 @@ def phase_systemd(target):
         env=env, build_dir=os.path.join(BUILD_TMP, "systemd-build"),
         pkg_name="systemd", pkg_version=systemd_ver)
     log(f"systemd {systemd_ver} installed.", color=GREEN)
-    since_ts = time.time()
+    before_snapshot = _snapshot_tree(target)
 
     # liblz4-dev (see Dockerfile.build) satisfies the build-time header
     # need, but systemd links a real NEEDED liblz4.so.1 once HAVE_LZ4=1 --
@@ -4032,7 +4043,7 @@ def phase_systemd(target):
     # libacl/libseccomp/libarchive) -- their own small package, since they're
     # copied in after systemd's own meson_install() already closed out
     # systemd's manifest, same "kde-*-runtime" pattern used in phase_kde.
-    _record_component_manifest(target, "systemd-runtime-libs", target, since_ts)
+    _record_component_manifest(target, "systemd-runtime-libs", target, before_snapshot)
 
 def phase_systemd_configure(target):
     """Configure baseline systemd state (graphical target, machine-id, hostname).
@@ -4422,7 +4433,7 @@ def phase_firefox(target):
     browser/chrome/icons/default/default{16,32,48,64,128}.png icons. Both
     facts (binary location, icon paths) drive the symlink/.desktop below."""
     log_phase("firefox", "Install Mozilla Firefox stable")
-    since_ts = time.time()
+    before_snapshot = _snapshot_tree(target)
     src = sources(target)
     # download.mozilla.org 302-redirects to the real versioned tarball --
     # urlretrieve follows redirects automatically, and extract()'s `tar -xf`
@@ -4470,13 +4481,13 @@ def phase_firefox(target):
                 if line.startswith("Version="):
                     ff_version = line.strip().split("=", 1)[1]
                     break
-    _record_component_manifest(target, "firefox", target, since_ts, pkg_version=ff_version)
+    _record_component_manifest(target, "firefox", target, before_snapshot, pkg_version=ff_version)
     log(f"Mozilla Firefox {ff_version} installed.", color=GREEN)
 
 def phase_live_initramfs(target):
     """Build a static busybox initramfs for live boot (squashfs + overlayfs)."""
     log_phase("live-initramfs", f"Build busybox {BUSYBOX_VER} live initramfs")
-    since_ts = time.time()
+    before_snapshot = _snapshot_tree(target)
     src = sources(target)
 
     # Busybox static
@@ -4667,7 +4678,7 @@ def phase_live_initramfs(target):
         gzip_proc = subprocess.Popen(["gzip", "-9"], stdin=cpio_proc.stdout, stdout=out_f)
     cpio_proc.stdout.close()
     gzip_proc.wait(); find_proc.wait(); cpio_proc.wait()
-    _record_component_manifest(target, "live-initramfs", target, since_ts, pkg_version=BUSYBOX_VER)
+    _record_component_manifest(target, "live-initramfs", target, before_snapshot, pkg_version=BUSYBOX_VER)
     log(f"Live initramfs: {initrd_path}", color=GREEN)
 
 # ── SmechVisor phases ─────────────────────────────────────────────────────────
