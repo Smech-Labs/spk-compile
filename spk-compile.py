@@ -3471,17 +3471,25 @@ def phase_bundle_spkg_packages(target):
     """Emit one real .spkg (control.tar.xz + data.tar.xz, the format
     Smech-Labs/spk v2.2.0+ understands) per component recorded by
     _record_component_manifest -- currently every KF6 module, Plasma
-    app, and Qt6 module, since those are the loops cmake_install() got
-    pkg_name=/pkg_version= wired into. Also writes index.txt, which
-    spk v2.4.0+'s `create-live-image` fetches to discover what to install.
+    app, Qt6 module, and Firefox, since those are the call sites wired to
+    record a manifest (cmake_install()/meson_install()'s pkg_name=/
+    pkg_version= for the loops, a direct _record_component_manifest()
+    call for Firefox's plain download+extract). Also writes index.txt,
+    which spk v2.4.0+'s `create-live-image` fetches to discover what to
+    install.
 
-    This is the first real slice of per-package atomization, not a claim
-    the whole system is atomized: kernel, firmware, GRUB, systemd, Mesa,
+    This is a real slice of per-package atomization, not a claim the
+    whole system is atomized: kernel, firmware, GRUB, systemd, Mesa,
     Wayland, and the handful of hand-written cmake_install() calls
-    outside the KF6/Plasma/Qt6 loops have no manifests yet and stay on
+    outside the KF6/Plasma/Qt6 loops (qca, qcoro, polkit-qt-1,
+    pulseaudio-qt, qtkeychain, plasma-wayland-protocols,
+    libdisplay-info) have no manifests yet and stay on
     phase_bundle_packages()'s category-level .tar.xz bundles above.
-    Extending pkg_name=/pkg_version= to those remaining call sites is the
-    same mechanical pattern, just not done everywhere yet.
+    Extending pkg_name=/pkg_version= (or a direct
+    _record_component_manifest() call, for anything that doesn't go
+    through cmake_install()/meson_install() at all) to those remaining
+    call sites is the same mechanical pattern, just not done everywhere
+    yet.
 
     Manifest attribution is by install mtime window (see
     _record_component_manifest), not real dependency tracking -- a file
@@ -4359,6 +4367,7 @@ def phase_firefox(target):
     browser/chrome/icons/default/default{16,32,48,64,128}.png icons. Both
     facts (binary location, icon paths) drive the symlink/.desktop below."""
     log_phase("firefox", "Install Mozilla Firefox stable")
+    since_ts = time.time()
     src = sources(target)
     # download.mozilla.org 302-redirects to the real versioned tarball --
     # urlretrieve follows redirects automatically, and extract()'s `tar -xf`
@@ -4394,7 +4403,20 @@ def phase_firefox(target):
             StartupNotify=true
             Categories=Network;WebBrowser;
             """))
-    log("Mozilla Firefox installed.", color=GREEN)
+
+    # Firefox ships its real version in application.ini's [App] section --
+    # the download URL only ever says "latest", so this is the one place
+    # the actual version string (e.g. "131.0") is available at all.
+    ff_version = "0.0.0"
+    app_ini = os.path.join(opt_dir, "application.ini")
+    if os.path.isfile(app_ini):
+        with open(app_ini) as f:
+            for line in f:
+                if line.startswith("Version="):
+                    ff_version = line.strip().split("=", 1)[1]
+                    break
+    _record_component_manifest(target, "firefox", target, since_ts, pkg_version=ff_version)
+    log(f"Mozilla Firefox {ff_version} installed.", color=GREEN)
 
 def phase_live_initramfs(target):
     """Build a static busybox initramfs for live boot (squashfs + overlayfs)."""
