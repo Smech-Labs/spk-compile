@@ -3247,14 +3247,19 @@ def phase_plasma_discover(target):
     # v2.4.0 adds `create-live-image`, which builds a bootable image
     # straight from a repo's published .spkg packages (via index.txt,
     # written by phase_bundle_spkg_packages below) -- no compile step.
-    spk_bin_url = "https://github.com/Smech-Labs/spk/releases/download/v2.4.0/spk"
+    # v2.5.0 splits the old `compile` (which forwarded to THIS script) into
+    # a real pure-Rust single-package builder, and renames the old
+    # whole-image forwarding behavior to `build-image` -- `spk compile`
+    # now means "build one package's source into a .spkg", matching what
+    # a package manager's compile verb should mean.
+    spk_bin_url = "https://github.com/Smech-Labs/spk/releases/download/v2.5.0/spk"
     spk_bin_dst = os.path.join(target, "usr", "bin", "spk")
-    spk_bin_tmp = os.path.join(src, "spk-v2.4.0")
+    spk_bin_tmp = os.path.join(src, "spk-v2.5.0")
     download(spk_bin_url, spk_bin_tmp)
     ensure(os.path.dirname(spk_bin_dst))
     shutil.copy2(spk_bin_tmp, spk_bin_dst)
     os.chmod(spk_bin_dst, 0o755)
-    log("Installed real spk v2.4.0 binary to usr/bin/spk.", color=GREEN)
+    log("Installed real spk v2.5.0 binary to usr/bin/spk.", color=GREEN)
 
     # SPK PackageKit script backend
     backend_dir = os.path.join(target, "usr", "lib", "packagekit-backend")
