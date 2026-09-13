@@ -1199,8 +1199,19 @@ def phase_qt_deps(target):
         # with no BUILD_EXAMPLES/BUILD_TESTING gate at all -- forcing it OFF
         # here just means Qt6TestConfig.cmake never exists anywhere, breaking
         # every KF6 package structured that way.
+        # FEATURE_glib=OFF: qtbase's own glib detection misses
+        # glibconfig.h (a separate multiarch-subdir header from glib.h
+        # itself) even though `pkg-config --cflags glib-2.0` resolves it
+        # correctly on this exact container -- confirmed directly, so
+        # this is a real gap in Qt's own CMake glib-finding logic, not a
+        # missing package. Never surfaced before because qtbase was never
+        # rebuilt from a cleared stamp until this session's atomization
+        # pass. Not a real loss: this only affects Qt's optional GLib
+        # main-loop integration (GTK-interop event dispatching), which
+        # nothing in the Plasma/Wayland stack this profile builds
+        # actually needs.
         ("qtbase",        ["-DFEATURE_testlib=ON", "-DFEATURE_fontconfig=ON",
-                            "-DFEATURE_xcb=ON"]),
+                            "-DFEATURE_xcb=ON", "-DFEATURE_glib=OFF"]),
         ("qtshadertools", []),
         ("qtdeclarative", []),
         ("qtsvg",         []),
@@ -3228,17 +3239,22 @@ def phase_plasma_discover(target):
     # install or update anything on this build. Confirmed the real v2.0.1
     # release genuinely has `packagekit-backend` (and `install`/
     # `system-upgrade`/`compile`/deploy commands) before wiring this in.
-    # v2.2.0: adds .spkg support (control.tar.xz+data.tar.xz per-component
-    # packages), `install --local-package`, and `local-package-repo` --
-    # see Smech-Labs/spk's README.md and phase_bundle_spkg_packages below.
-    spk_bin_url = "https://github.com/Smech-Labs/spk/releases/download/v2.2.0/spk"
+    # v2.2.0 added .spkg support (control.tar.xz+data.tar.xz per-component
+    # packages), `install --local-package`, and `local-package-repo`.
+    # v2.3.0 adds the installed-package database, dependency resolution,
+    # and `remove`/`list`/`depends` -- see Smech-Labs/spk's README.md and
+    # phase_bundle_spkg_packages below.
+    # v2.4.0 adds `create-live-image`, which builds a bootable image
+    # straight from a repo's published .spkg packages (via index.txt,
+    # written by phase_bundle_spkg_packages below) -- no compile step.
+    spk_bin_url = "https://github.com/Smech-Labs/spk/releases/download/v2.4.0/spk"
     spk_bin_dst = os.path.join(target, "usr", "bin", "spk")
-    spk_bin_tmp = os.path.join(src, "spk-v2.2.0")
+    spk_bin_tmp = os.path.join(src, "spk-v2.4.0")
     download(spk_bin_url, spk_bin_tmp)
     ensure(os.path.dirname(spk_bin_dst))
     shutil.copy2(spk_bin_tmp, spk_bin_dst)
     os.chmod(spk_bin_dst, 0o755)
-    log("Installed real spk v2.2.0 binary to usr/bin/spk.", color=GREEN)
+    log("Installed real spk v2.4.0 binary to usr/bin/spk.", color=GREEN)
 
     # SPK PackageKit script backend
     backend_dir = os.path.join(target, "usr", "lib", "packagekit-backend")
@@ -3451,7 +3467,8 @@ def phase_bundle_spkg_packages(target):
     Smech-Labs/spk v2.2.0+ understands) per component recorded by
     _record_component_manifest -- currently every KF6 module, Plasma
     app, and Qt6 module, since those are the loops cmake_install() got
-    pkg_name=/pkg_version= wired into.
+    pkg_name=/pkg_version= wired into. Also writes index.txt, which
+    spk v2.4.0+'s `create-live-image` fetches to discover what to install.
 
     This is the first real slice of per-package atomization, not a claim
     the whole system is atomized: kernel, firmware, GRUB, systemd, Mesa,
@@ -3484,6 +3501,7 @@ def phase_bundle_spkg_packages(target):
     ensure(out)
 
     count, skipped = 0, 0
+    index_entries = []
     for fname in sorted(os.listdir(manifest_dir)):
         if not fname.endswith(".filelist"):
             continue
@@ -3542,6 +3560,19 @@ def phase_bundle_spkg_packages(target):
         log(f"  {pkg_name}.spkg  {version}  {size_kb:.0f} KB  ({len(files)} files)",
             color=GREEN)
         count += 1
+        index_entries.append((pkg_name, version))
+
+    # Package discovery didn't exist at all before this: spk could only
+    # ever fetch a name it was already told to look for (hardcoded into
+    # its own binary). `spk create-live-image` needs to know what a repo
+    # actually has without that hardcoding -- one line per package,
+    # "name version", is deliberately as close to the control file's own
+    # fields as possible rather than a new format to keep in sync.
+    index_path = os.path.join(out, "index.txt")
+    with open(index_path, "w") as f:
+        for name, version in sorted(index_entries):
+            f.write(f"{name} {version}\n")
+    log(f"Wrote index.txt ({len(index_entries)} entries) to {out}.", color=GREEN)
 
     log(f"{count} .spkg packages written to {out} ({skipped} manifest(s) skipped).",
         color=GREEN)
