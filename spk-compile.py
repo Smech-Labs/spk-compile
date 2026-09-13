@@ -505,6 +505,57 @@ def _record_component_manifest(target, pkg_name, root, before_snapshot, pkg_vers
     log(f"  manifest: {pkg_name} {pkg_version} -> {len(files)} files", color=CYAN)
     return len(files)
 
+def _record_per_binary_manifests(target, root, before_snapshot, pkg_prefix, pkg_version="0.0.0",
+                                  bindir="usr/bin"):
+    """Split one install's newly-installed files into one manifest per
+    binary under `bindir`, instead of one bundled manifest for the whole
+    upstream project.
+
+    Worth doing specifically for a project like coreutils: one tarball,
+    one ./configure && make install, but ~100 genuinely independent real
+    ELF binaries (ls, cp, mv, rm, cat, ...) -- not symlinks to each
+    other, not a busybox-style multicall binary. Bundling all of those
+    into one coreutils.spkg means a change to `ls` forces reinstalling
+    `cp`/`mv`/`rm`/everything else too; splitting them cuts that blast
+    radius down to the one binary that actually changed. NOT applied to
+    grep/sed/gawk/tar/gzip/xz elsewhere in this pipeline -- those really
+    are one real binary plus symlinks/wrappers pointing back at itself,
+    so splitting would just separate a binary from its own aliases for
+    no benefit.
+
+    Files outside `bindir` (man pages, a shared info manual covering
+    every utility, locale data) can't be reliably attributed to one
+    specific binary -- bucketed into a single "{pkg_prefix}-common"
+    manifest instead of guessing wrong.
+    """
+    manifest_dir = os.path.join(sources(target), SPKG_MANIFEST_DIRNAME)
+    ensure(manifest_dir)
+    after = _snapshot_tree(root)
+    new_files = after - before_snapshot
+    bindir_prefix = bindir.rstrip("/") + "/"
+    buckets = {}
+    common = []
+    for f in new_files:
+        if f.startswith(bindir_prefix) and "/" not in f[len(bindir_prefix):]:
+            buckets.setdefault(os.path.basename(f), []).append(f)
+        else:
+            common.append(f)
+    for binname, files in buckets.items():
+        pkg_name = f"{pkg_prefix}-{binname}"
+        with open(os.path.join(manifest_dir, f"{pkg_name}.filelist"), "w") as f_:
+            f_.write(f"version: {pkg_version}\n")
+            f_.write("\n".join(sorted(files)) + "\n")
+    if common:
+        pkg_name = f"{pkg_prefix}-common"
+        with open(os.path.join(manifest_dir, f"{pkg_name}.filelist"), "w") as f_:
+            f_.write(f"version: {pkg_version}\n")
+            f_.write("\n".join(sorted(common)) + "\n")
+    total_pkgs = len(buckets) + (1 if common else 0)
+    log(f"  manifest: {pkg_prefix} split into {len(buckets)} per-binary + "
+        f"{1 if common else 0} common package(s) -> {len(new_files)} files total",
+        color=CYAN)
+    return total_pkgs
+
 def cmake_install(src_dir, prefix, extra_args=None, env=None, build_dir=None, pkg_name=None, pkg_version="0.0.0"):
     bd = build_dir or os.path.join(src_dir, "build")
     ensure(bd)
@@ -3830,7 +3881,14 @@ def phase_bootstrap_userland_glibc(target):
         run(["./configure", f"--prefix={pfix}"] + flags, cwd=bd, env=env)
         run(["make", "-j", nproc()], cwd=bd, env=env)
         run(["make", "install"], cwd=bd, env=env, sudo=(os.geteuid() != 0))
-        _record_component_manifest(target, name, target, before_snapshot, pkg_version=ver)
+        if name in ("coreutils", "findutils"):
+            # Real independent binaries per tarball (~100 for coreutils,
+            # a handful for findutils) -- split per-binary instead of one
+            # bundled package, see _record_per_binary_manifests.
+            _record_per_binary_manifests(target, target, before_snapshot,
+                                          pkg_prefix=name, pkg_version=ver)
+        else:
+            _record_component_manifest(target, name, target, before_snapshot, pkg_version=ver)
         log(f"{name} {ver} installed.", color=GREEN)
 
 def _resolve_systemd_version():
