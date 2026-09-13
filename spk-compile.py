@@ -898,6 +898,7 @@ def phase_inittab(target):
 
 def phase_kernel(target):
     log_phase("kernel", f"Compile Linux {LINUX_VER}")
+    since_ts = time.time()
     src     = sources(target)
     tarball = os.path.join(src, f"linux-{LINUX_VER}.tar.xz")
     download(LINUX_URL, tarball)
@@ -1001,6 +1002,7 @@ def phase_kernel(target):
     # permanently black QEMU framebuffer this session -- not a display-backend issue.
     run(["depmod", "-a", "-b", target, LINUX_VER],
         cwd=bd, env=env, sudo=(os.geteuid() != 0))
+    _record_component_manifest(target, "kernel", target, since_ts, pkg_version=LINUX_VER)
     log(f"Linux {LINUX_VER} installed.", color=GREEN)
 
 _FW_COMPRESSED_EXTS = {".xz": "unxz -f", ".zst": "unzstd -f --rm"}
@@ -1102,6 +1104,7 @@ def phase_firmware(target):
     it's still XZ-compressed like everything else in the squashfs.
     """
     log_phase("firmware", f"Clone upstream linux-firmware {LINUX_FIRMWARE_VER} (git.kernel.org)")
+    since_ts = time.time()
     src = sources(target)
     fw_root = os.path.join(src, f"linux-firmware-{LINUX_FIRMWARE_VER}")
     if not os.path.isdir(fw_root):
@@ -1116,11 +1119,13 @@ def phase_firmware(target):
     for dirpath, _dirnames, filenames in os.walk(dst_root):
         if any(f.endswith(ext) for ext in _FW_COMPRESSED_EXTS for f in filenames):
             _decompress_firmware_dir(dirpath)
+    _record_component_manifest(target, "firmware", target, since_ts, pkg_version=LINUX_FIRMWARE_VER)
     log(f"linux-firmware {LINUX_FIRMWARE_VER} bundled from upstream ({dst_root}).",
         color=GREEN)
 
 def phase_grub(target):
     log_phase("grub", f"Compile GRUB {GRUB_VER} EFI + BIOS")
+    since_ts = time.time()
     src     = sources(target)
     tarball = os.path.join(src, f"grub-{GRUB_VER}.tar.xz")
     download(GRUB_URL, tarball)
@@ -1168,6 +1173,7 @@ def phase_grub(target):
          "-o", os.path.join(font_dir, "unicode.pf2"), bdf],
         env=env, sudo=(os.geteuid() != 0))
     log(f"unicode.pf2 generated from GNU Unifont {UNIFONT_VER}.", color=GREEN)
+    _record_component_manifest(target, "grub", target, since_ts, pkg_version=GRUB_VER)
 
 def phase_qt_deps(target):
     log_phase("qt-deps", f"Compile Qt6 {QT6_VER} modules")
@@ -1392,7 +1398,8 @@ def phase_mesa(target):
             "-Dintel-rt=disabled",
         ],
         env=mesa_env,
-        build_dir=os.path.join(BUILD_TMP, "mesa-build"))
+        build_dir=os.path.join(BUILD_TMP, "mesa-build"),
+        pkg_name="mesa", pkg_version=MESA_VER)
     log(f"Mesa {MESA_VER} installed.", color=GREEN)
 
 def _patch_tar_acl(bd):
@@ -2147,6 +2154,7 @@ def _kde_pkg(name, version, base_url, target, env, profile="smechos-plasma-live"
 
 def phase_wayland(target):
     log_phase("wayland", f"Build wayland {WAYLAND_VER}")
+    since_ts = time.time()
     src     = sources(target)
     tarball = os.path.join(src, f"wayland-{WAYLAND_VER}.tar.gz")
     download(WAYLAND_URL, tarball)
@@ -2167,10 +2175,12 @@ def phase_wayland(target):
     run(["ninja", "-C", builddir], env=env)
     run(["ninja", "-C", builddir, "install"], env=env)
     result = subprocess.run(["wayland-scanner", "--version"], capture_output=True, text=True)
+    _record_component_manifest(target, "wayland", target, since_ts, pkg_version=WAYLAND_VER)
     log(f"wayland-scanner: {result.stderr.strip() or result.stdout.strip()}", color=GREEN)
 
 def phase_wayland_protocols(target):
     log_phase("wayland-protocols", f"Build wayland-protocols {WAYLAND_PROTO_VER}")
+    since_ts = time.time()
     src     = sources(target)
     tarball = os.path.join(src, f"wayland-protocols-{WAYLAND_PROTO_VER}.tar.gz")
     download(WAYLAND_PROTO_URL, tarball)
@@ -2188,10 +2198,12 @@ def phase_wayland_protocols(target):
          "--buildtype=release"], env=env)
     run(["ninja", "-C", builddir], env=env)
     run(["ninja", "-C", builddir, "install"], env=env)
+    _record_component_manifest(target, "wayland-protocols", target, since_ts, pkg_version=WAYLAND_PROTO_VER)
     log(f"wayland-protocols {WAYLAND_PROTO_VER} installed", color=GREEN)
 
 def phase_libinput(target):
     log_phase("libinput", f"Build libinput {LIBINPUT_VER}")
+    since_ts = time.time()
     src     = sources(target)
     tarball = os.path.join(src, f"libinput-{LIBINPUT_VER}.tar.gz")
     download(LIBINPUT_URL, tarball)
@@ -2211,10 +2223,12 @@ def phase_libinput(target):
          "-Ddebug-gui=false"], env=env)
     run(["ninja", "-C", builddir], env=env)
     run(["ninja", "-C", builddir, "install"], env=env)
+    _record_component_manifest(target, "libinput", target, since_ts, pkg_version=LIBINPUT_VER)
     log(f"libinput {LIBINPUT_VER} installed", color=GREEN)
 
 def phase_libeis(target):
     log_phase("libeis", f"Build libeis {LIBEIS_VER} (remote input emulation for kwin)")
+    since_ts = time.time()
     src     = sources(target)
     tarball = os.path.join(src, f"libeis-{LIBEIS_VER}.tar.xz")
     download(LIBEIS_URL, tarball)
@@ -2232,6 +2246,7 @@ def phase_libeis(target):
          "-Ddocumentation=disabled"], env=env)
     run(["ninja", "-C", builddir], env=env)
     run(["ninja", "-C", builddir, "install"], env=env)
+    _record_component_manifest(target, "libeis", target, since_ts, pkg_version=LIBEIS_VER)
     log(f"libeis {LIBEIS_VER} installed", color=GREEN)
     log(f"wayland-protocols {WAYLAND_PROTO_VER} installed to {target}/usr", color=GREEN)
 
@@ -2270,7 +2285,7 @@ def _build_xkbregistry(target, profile="smechos-plasma-live"):
         "-Denable-xkbregistry=true",
         "-Denable-x11=true",
         "-Denable-wayland=true",
-    ])
+    ], pkg_name="xkbcommon", pkg_version=ver)
     _mark_done(profile, stamp)
     log(f"xkbcommon {ver} (with xkbregistry) done.", color=GREEN)
 
@@ -2349,7 +2364,7 @@ def phase_kde(target):
                         "-DBUILD_WITH_QT6=ON",
                         "-DBUILD_TESTS=OFF", "-DBUILD_TESTING=OFF",
                         "-DBUILD_TOOLS=OFF"],
-            env=env)
+            env=env, pkg_name="qca", pkg_version=_qca_ver)
         _mark_done(_profile, _qca_stamp)
         log(f"qca-qt6 {_qca_ver} done.", color=GREEN)
     else:
@@ -2429,7 +2444,7 @@ def phase_kde(target):
         extract(_pwp_tb, _pwp_bd)
         cmake_install(_pwp_bd, f"{target}/usr",
             extra_args=[f"-DCMAKE_PREFIX_PATH={target}/usr"],
-            env=env)
+            env=env, pkg_name="plasma-wayland-protocols", pkg_version=_pwp_ver)
         _mark_done(_profile, _pwp_stamp)
         log(f"plasma-wayland-protocols {_pwp_ver} done.", color=GREEN)
     else:
@@ -2549,7 +2564,8 @@ def phase_kde(target):
         _ldi_bd  = os.path.join(BUILD_TMP, "libdisplay-info")
         shutil.rmtree(_ldi_bd, ignore_errors=True)
         extract(_ldi_tb, _ldi_bd)
-        meson_install(_ldi_bd, f"{target}/usr", env=env)
+        meson_install(_ldi_bd, f"{target}/usr", env=env,
+            pkg_name="libdisplay-info", pkg_version=_ldi_ver)
         _mark_done(_profile, _ldi_stamp)
         log(f"libdisplay-info {_ldi_ver} done.", color=GREEN)
     else:
@@ -2579,7 +2595,7 @@ def phase_kde(target):
                         # which then hard-fails Qt6's own find_package()
                         # for a component that plain doesn't exist here.
                         "-DQCORO_WITH_QTWEBSOCKETS=OFF"],
-            env=env)
+            env=env, pkg_name="qcoro", pkg_version=_qcoro_ver)
         _mark_done(_profile, _qcoro_stamp)
         log(f"QCoro {_qcoro_ver} done.", color=GREEN)
     else:
@@ -2604,7 +2620,7 @@ def phase_kde(target):
             extra_args=[f"-DCMAKE_PREFIX_PATH={target}/usr",
                         "-DQT_MAJOR_VERSION=6",
                         "-DBUILD_EXAMPLES=OFF", "-DBUILD_TEST=OFF"],
-            env=env)
+            env=env, pkg_name="polkit-qt-1", pkg_version=_pqt_ver)
         _mark_done(_profile, _pqt_stamp)
         log(f"polkit-qt-1 {_pqt_ver} done.", color=GREEN)
     else:
@@ -2739,7 +2755,7 @@ def phase_kde(target):
         cmake_install(_paq_bd, f"{target}/usr",
             extra_args=[f"-DCMAKE_PREFIX_PATH={target}/usr",
                         "-DBUILD_TESTING=OFF"],
-            env=env)
+            env=env, pkg_name="pulseaudio-qt", pkg_version=_paq_ver)
         _mark_done("smechos-plasma-live", _paq_stamp)
         log(f"pulseaudio-qt {_paq_ver} done.", color=GREEN)
     else:
@@ -2760,7 +2776,7 @@ def phase_kde(target):
                         "-DBUILD_TESTING=OFF",
                         "-DBUILD_WITH_QT6=ON",
                         "-DLIBSECRET_SUPPORT=OFF"],  # avoid libsecret dep
-            env=env)
+            env=env, pkg_name="qtkeychain", pkg_version=_qk_ver)
         _mark_done("smechos-plasma-live", _qtkeychain_stamp)
         log(f"qtkeychain {_qk_ver} done.", color=GREEN)
     else:
@@ -3136,7 +3152,7 @@ def _phase_fastfetch(target):
     # directly in bd -- there's no separate "fastfetch-{VER}" subdirectory
     # to descend into on top of that.
     extract(tarball, bd)
-    cmake_install(bd, prefix)
+    cmake_install(bd, prefix, pkg_name="fastfetch", pkg_version=FASTFETCH_VER)
 
     # System-wide default config: fastfetch checks /etc/xdg/fastfetch first
     # when no per-user config exists, so this is what a fresh SmechOS user
@@ -3199,7 +3215,7 @@ def phase_plasma_discover(target):
     meson_install(bd_src, prefix,
         extra_args=["-Ddocs=false", "-Dapidocs=false",
                     "-Dcompose=false", "-Dqt=true"],
-        env=env)
+        env=env, pkg_name="appstream", pkg_version=APPSTREAM_VER)
 
     # PackageKit
     url     = f"https://www.freedesktop.org/software/PackageKit/releases/PackageKit-{PACKAGEKIT_VER}.tar.xz"
@@ -3211,7 +3227,7 @@ def phase_plasma_discover(target):
     meson_install(bd, prefix,
         extra_args=["-Ddaemon_tests=false", "-Dlocal_checkout=false",
                     "-Dgstreamer_plugin=false", "-Dgtk_module=false"],
-        env=env)
+        env=env, pkg_name="packagekit", pkg_version=PACKAGEKIT_VER)
 
     # packagekit-qt (Qt6 bindings for PackageKit — required by Discover)
     _pf = "smechos-plasma-live"
@@ -3225,7 +3241,7 @@ def phase_plasma_discover(target):
         extract(pkqt_tarball, pkqt_bd)
         cmake_install(pkqt_bd, prefix,
             extra_args=[f"-DCMAKE_PREFIX_PATH={prefix}"],
-            env=env)
+            env=env, pkg_name="packagekit-qt", pkg_version=PACKAGEKITQT_VER)
         _mark_done(_pf, pkqt_stamp)
 
     # The real spk binary itself. Never previously downloaded by this
@@ -3293,7 +3309,8 @@ def phase_plasma_discover(target):
                     "-DCMAKE_INSTALL_LIBDIR=lib",
                     "-DBUILD_TESTING=OFF",
                     f"-DCMAKE_PREFIX_PATH={prefix}"],
-        env=env, build_dir=os.path.join(BUILD_TMP, "discover-build"))
+        env=env, build_dir=os.path.join(BUILD_TMP, "discover-build"),
+        pkg_name="plasma-discover", pkg_version=PLASMA_VER)
     log("Plasma Discover + PackageKit + Flatpak + fwupd installed.", color=GREEN)
 
 # ── Package bundling ─────────────────────────────────────────────────────────
@@ -3470,26 +3487,30 @@ def phase_bundle_packages(target):
 def phase_bundle_spkg_packages(target):
     """Emit one real .spkg (control.tar.xz + data.tar.xz, the format
     Smech-Labs/spk v2.2.0+ understands) per component recorded by
-    _record_component_manifest -- currently every KF6 module, Plasma
-    app, Qt6 module, and Firefox, since those are the call sites wired to
-    record a manifest (cmake_install()/meson_install()'s pkg_name=/
-    pkg_version= for the loops, a direct _record_component_manifest()
-    call for Firefox's plain download+extract). Also writes index.txt,
-    which spk v2.4.0+'s `create-live-image` fetches to discover what to
-    install.
+    _record_component_manifest. As of this pass, that's essentially
+    everything the smechos-plasma-live profile builds: every KF6 module,
+    Plasma app, and Qt6 module (via cmake_install()/meson_install()'s
+    pkg_name=/pkg_version=); the KDE third-party deps that used to bypass
+    that (qca, qcoro, polkit-qt-1, pulseaudio-qt, qtkeychain,
+    plasma-wayland-protocols, libdisplay-info, xkbcommon); Mesa and
+    Mesa-CL; Wayland, wayland-protocols, libinput, libeis; systemd (plus
+    its own gperf/libcap/util-linux deps and vendored runtime libs as
+    their own small packages); the Discover stack (AppStream, PackageKit,
+    packagekit-qt, Plasma Discover); Calamares (plus yaml-cpp,
+    extra-cmake-modules, kpmcore); fastfetch; the kernel; firmware; GRUB;
+    the base glibc userland (bash/coreutils/grep/sed/gawk/findutils/tar/
+    gzip/xz, each its own package, plus the FHS/glibc-runtime bootstrap
+    itself); the live-initramfs; and Firefox (via a direct
+    _record_component_manifest() call around its plain download+extract,
+    since it never goes through cmake_install()/meson_install() at all).
+    Also writes index.txt, which spk v2.4.0+'s `create-live-image` fetches
+    to discover what to install.
 
-    This is a real slice of per-package atomization, not a claim the
-    whole system is atomized: kernel, firmware, GRUB, systemd, Mesa,
-    Wayland, and the handful of hand-written cmake_install() calls
-    outside the KF6/Plasma/Qt6 loops (qca, qcoro, polkit-qt-1,
-    pulseaudio-qt, qtkeychain, plasma-wayland-protocols,
-    libdisplay-info) have no manifests yet and stay on
-    phase_bundle_packages()'s category-level .tar.xz bundles above.
-    Extending pkg_name=/pkg_version= (or a direct
-    _record_component_manifest() call, for anything that doesn't go
-    through cmake_install()/meson_install() at all) to those remaining
-    call sites is the same mechanical pattern, just not done everywhere
-    yet.
+    Deliberately NOT atomized: `cmake-bootstrap` installs to the build
+    container's own /usr/local, never under `target` at all -- there is
+    nothing to scan for it, an empty manifest would just be a fake entry.
+    It's a build tool this pipeline needs to run, not something that ships
+    in the image.
 
     Manifest attribution is by install mtime window (see
     _record_component_manifest), not real dependency tracking -- a file
@@ -3594,6 +3615,17 @@ def phase_bundle_spkg_packages(target):
 
 # ── Plasma Live phases ────────────────────────────────────────────────────────
 
+def _host_glibc_version():
+    """Real glibc version string of the build container, e.g. "2.39" --
+    parsed from `ldd --version`'s first line (glibc's own ldd always prints
+    "ldd (...) X.Y" there), not guessed or hardcoded."""
+    try:
+        out = subprocess.run(["ldd", "--version"], capture_output=True,
+                              text=True, check=True).stdout.splitlines()[0]
+        return out.strip().split()[-1]
+    except Exception:
+        return "0.0.0"
+
 def _bootstrap_glibc_runtime(target):
     """Copy the build container's own glibc runtime + dynamic linker into the
     target rootfs, and lay down the FHS/usrmerge compatibility symlinks.
@@ -3631,6 +3663,7 @@ def _bootstrap_glibc_runtime(target):
     from-scratch-style distro bootstraps from *some* host toolchain's
     libc. What was missing was just actually copying it into the image.
     """
+    since_ts = time.time()
     # {target}/lib is routinely a real, already-populated directory by this
     # point (phase_kernel drops modules at lib/modules, phase_firmware at
     # lib/firmware) rather than empty -- merge its content into usr/lib
@@ -3742,6 +3775,9 @@ def _bootstrap_glibc_runtime(target):
     if not os.path.islink(sh_link) and not os.path.exists(sh_link):
         symlink("bash", sh_link)
 
+    _record_component_manifest(target, "glibc-runtime", target, since_ts,
+                                pkg_version=_host_glibc_version())
+
 def phase_bootstrap_userland_glibc(target):
     """Bootstrap GNU userland against host glibc (used by the plasma-live profile)."""
     log_phase("userland-glibc", "Bootstrap GNU userland against host glibc")
@@ -3772,6 +3808,7 @@ def phase_bootstrap_userland_glibc(target):
          ["--disable-xzdec", "--disable-lzmadec"]),
     ]
     for name, ver, url, flags in pkgs:
+        since_ts = time.time()
         tarball = os.path.join(src, os.path.basename(url))
         download(url, tarball)
         bd = os.path.join(BUILD_TMP, name)
@@ -3782,6 +3819,7 @@ def phase_bootstrap_userland_glibc(target):
         run(["./configure", f"--prefix={pfix}"] + flags, cwd=bd, env=env)
         run(["make", "-j", nproc()], cwd=bd, env=env)
         run(["make", "install"], cwd=bd, env=env, sudo=(os.geteuid() != 0))
+        _record_component_manifest(target, name, target, since_ts, pkg_version=ver)
         log(f"{name} {ver} installed.", color=GREEN)
 
 def _resolve_systemd_version():
@@ -3811,6 +3849,7 @@ def phase_systemd(target):
     prefix = f"{target}/usr"
 
     # ── gperf (needed for systemd hash table generation) ──────────────────────
+    since_ts = time.time()
     gperf_ver = "3.1"
     gperf_url = f"https://ftp.gnu.org/gnu/gperf/gperf-{gperf_ver}.tar.gz"
     tarball   = os.path.join(src, f"gperf-{gperf_ver}.tar.gz")
@@ -3821,9 +3860,11 @@ def phase_systemd(target):
     run(["./configure", f"--prefix={prefix}"], cwd=bd, env=env)
     run(["make", "-j", nproc()], cwd=bd, env=env)
     run(["make", "install"], cwd=bd, env=env, sudo=(os.geteuid() != 0))
+    _record_component_manifest(target, "gperf", target, since_ts, pkg_version=gperf_ver)
     log("gperf installed.", color=GREEN)
 
     # ── libcap (POSIX capabilities library) ───────────────────────────────────
+    since_ts = time.time()
     libcap_ver = "2.73"
     libcap_url = (f"https://mirrors.edge.kernel.org/pub/linux/libs/security/"
                   f"linux-privs/libcap2/libcap-{libcap_ver}.tar.xz")
@@ -3839,9 +3880,11 @@ def phase_systemd(target):
     run(["make", "install", f"prefix={prefix}", "lib=lib",
          "GOLANG=no", "PYTHON=no"], cwd=bd, env=cap_env,
         sudo=(os.geteuid() != 0))
+    _record_component_manifest(target, "libcap", target, since_ts, pkg_version=libcap_ver)
     log("libcap installed.", color=GREEN)
 
     # ── util-linux (provides libmount + libblkid required by systemd) ─────────
+    since_ts = time.time()
     ul_ver = "2.40.4"
     ul_url = (f"https://mirrors.edge.kernel.org/pub/linux/utils/util-linux/"
               f"v2.40/util-linux-{ul_ver}.tar.xz")
@@ -3866,6 +3909,7 @@ def phase_systemd(target):
          "--without-python", "--disable-nls"], cwd=bd, env=env)
     run(["make", "-j", nproc()], cwd=bd, env=env)
     run(["make", "install"], cwd=bd, env=env, sudo=(os.geteuid() != 0))
+    _record_component_manifest(target, "util-linux", target, since_ts, pkg_version=ul_ver)
     log("util-linux (full program set + libmount/libblkid/libuuid) installed.",
         color=GREEN)
 
@@ -3902,8 +3946,10 @@ def phase_systemd(target):
             "-Dfallback-hostname=smechos",
             "-Dmode=release",
         ],
-        env=env, build_dir=os.path.join(BUILD_TMP, "systemd-build"))
+        env=env, build_dir=os.path.join(BUILD_TMP, "systemd-build"),
+        pkg_name="systemd", pkg_version=systemd_ver)
     log(f"systemd {systemd_ver} installed.", color=GREEN)
+    since_ts = time.time()
 
     # liblz4-dev (see Dockerfile.build) satisfies the build-time header
     # need, but systemd links a real NEEDED liblz4.so.1 once HAVE_LZ4=1 --
@@ -3982,6 +4028,11 @@ def phase_systemd(target):
         err("No libarchive.so* found in the build container -- is libarchive-dev "
             "installed? (see Dockerfile.build)")
     log(f"Copied {archive_copied} libarchive runtime file(s) into target rootfs", color=GREEN)
+    # Vendored host runtime libs systemd links against (liblz4/libkmod/
+    # libacl/libseccomp/libarchive) -- their own small package, since they're
+    # copied in after systemd's own meson_install() already closed out
+    # systemd's manifest, same "kde-*-runtime" pattern used in phase_kde.
+    _record_component_manifest(target, "systemd-runtime-libs", target, since_ts)
 
 def phase_systemd_configure(target):
     """Configure baseline systemd state (graphical target, machine-id, hostname).
@@ -4143,7 +4194,8 @@ def phase_calamares(target):
     cmake_install(bd, prefix,
         extra_args=["-DYAML_BUILD_SHARED_LIBS=ON", "-DYAML_CPP_BUILD_TESTS=OFF",
                     f"-DCMAKE_PREFIX_PATH={prefix}"],
-        env=env, build_dir=os.path.join(BUILD_TMP, "yaml-cpp-build"))
+        env=env, build_dir=os.path.join(BUILD_TMP, "yaml-cpp-build"),
+        pkg_name="yaml-cpp", pkg_version=yaml_ver)
 
     # extra-cmake-modules (ECM) — needed by kpmcore + calamares
     # (already built once in phase_kde too; rebuilt here since this phase
@@ -4159,7 +4211,8 @@ def phase_calamares(target):
     extract(tarball, bd)
     cmake_install(bd, prefix,
         extra_args=[f"-DCMAKE_PREFIX_PATH={prefix}", "-DBUILD_TESTING=OFF"],
-        env=env, build_dir=os.path.join(BUILD_TMP, "ecm-build"))
+        env=env, build_dir=os.path.join(BUILD_TMP, "ecm-build"),
+        pkg_name="extra-cmake-modules", pkg_version=ecm_ver)
 
     # kpmcore 24.08.3 (KDE Partition Manager library)
     kpm_ver = "24.08.3"
@@ -4172,7 +4225,8 @@ def phase_calamares(target):
     extract(tarball, bd)
     cmake_install(bd, prefix,
         extra_args=[f"-DCMAKE_PREFIX_PATH={prefix}", "-DBUILD_TESTING=OFF"],
-        env=env, build_dir=os.path.join(BUILD_TMP, "kpmcore-build"))
+        env=env, build_dir=os.path.join(BUILD_TMP, "kpmcore-build"),
+        pkg_name="kpmcore", pkg_version=kpm_ver)
 
     # Calamares
     cal_url = (f"https://github.com/calamares/calamares/releases/download"
@@ -4186,7 +4240,8 @@ def phase_calamares(target):
         extra_args=[f"-DCMAKE_PREFIX_PATH={prefix}",
                     "-DWITH_PYTHON=ON", "-DWITH_QT6=ON",
                     "-DBUILD_TESTING=OFF", "-DINSTALL_CONFIG=ON"],
-        env=env, build_dir=os.path.join(BUILD_TMP, "calamares-build"))
+        env=env, build_dir=os.path.join(BUILD_TMP, "calamares-build"),
+        pkg_name="calamares", pkg_version=CALAMARES_VER)
 
     # Calamares settings.conf
     cal_etc = os.path.join(target, "etc", "calamares")
@@ -4421,6 +4476,7 @@ def phase_firefox(target):
 def phase_live_initramfs(target):
     """Build a static busybox initramfs for live boot (squashfs + overlayfs)."""
     log_phase("live-initramfs", f"Build busybox {BUSYBOX_VER} live initramfs")
+    since_ts = time.time()
     src = sources(target)
 
     # Busybox static
@@ -4611,6 +4667,7 @@ def phase_live_initramfs(target):
         gzip_proc = subprocess.Popen(["gzip", "-9"], stdin=cpio_proc.stdout, stdout=out_f)
     cpio_proc.stdout.close()
     gzip_proc.wait(); find_proc.wait(); cpio_proc.wait()
+    _record_component_manifest(target, "live-initramfs", target, since_ts, pkg_version=BUSYBOX_VER)
     log(f"Live initramfs: {initrd_path}", color=GREEN)
 
 # ── SmechVisor phases ─────────────────────────────────────────────────────────
@@ -4674,7 +4731,8 @@ def phase_mesa_cl(target):
             "-Dplatforms=", "-Dglvnd=disabled", "-Db_lto=false",
         ],
         env=build_env_bitcoin(target),
-        build_dir=os.path.join(BUILD_TMP, "mesa-cl-build"))
+        build_dir=os.path.join(BUILD_TMP, "mesa-cl-build"),
+        pkg_name="mesa-cl", pkg_version=MESA_VER)
     log(f"Mesa {MESA_VER} (Clover/r600) installed.", color=GREEN)
 
 def phase_bitcoind(target):
