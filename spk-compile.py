@@ -3806,6 +3806,14 @@ def _bootstrap_glibc_runtime(target):
     # were fixed.
     kmod_dst = os.path.join(target, "usr", "bin", "kmod")
     if not os.path.exists(kmod_dst):
+        # On a genuinely fresh target (never built before -- previously
+        # latent, since this rootfs was always reused/pre-populated from
+        # an earlier run until this session's first truly clean build),
+        # usr/bin/usr/sbin don't exist yet at all: the FHS symlinks above
+        # only point bin/sbin AT usr/bin/usr/sbin, they don't create the
+        # real directories those symlinks resolve to.
+        ensure(os.path.dirname(kmod_dst))
+        ensure(os.path.join(target, "usr", "sbin"))
         shutil.copy2("/usr/bin/kmod", kmod_dst)
         shutil.copystat("/usr/bin/kmod", kmod_dst)
         for applet in ("modprobe", "insmod", "rmmod", "depmod", "lsmod"):
@@ -3822,6 +3830,7 @@ def _bootstrap_glibc_runtime(target):
     # the plain name instead of reproducing dpkg-specific wrapper logic.
     ldconfig_dst = os.path.join(target, "usr", "sbin", "ldconfig")
     if not os.path.exists(ldconfig_dst):
+        ensure(os.path.dirname(ldconfig_dst))
         shutil.copy2("/sbin/ldconfig.real", ldconfig_dst)
         shutil.copystat("/sbin/ldconfig.real", ldconfig_dst)
         log("ldconfig copied from host (real binary, not the dpkg wrapper).",
