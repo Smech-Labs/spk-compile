@@ -2872,6 +2872,87 @@ def _pam_ensure_line(pam_file, marker_re, line):
         f.write(line + "\n")
     return True
 
+def _pam_make_optional(pam_file, marker_re):
+    """Idempotently prefix a matching, currently-hard-required PAM line with
+    "-" (PAM's own syntax for "ignore this module's result") so a module
+    failure no longer fails the whole stack. Used the same way distros
+    patch upstream-shipped PAM templates whose hard requirements don't fit
+    a given system (see phase_plasma_configure) -- this project's own
+    postlogin/system-auth stubs and pam_gnome_keyring/pam_kwallet lines
+    already use the same "-" convention, just pre-written by upstream.
+    """
+    import re
+    with open(pam_file) as f:
+        content = f.read()
+    new_content, n = re.subn(marker_re, r"-\g<0>", content, flags=re.MULTILINE)
+    if n == 0:
+        return False
+    with open(pam_file, "w") as f:
+        f.write(new_content)
+    return True
+
+def _merge_qt_plugin_trees(target):
+    """Merge /usr/lib/x86_64-linux-gnu/plugins/* into /usr/plugins/*.
+
+    Root-caused via a real boot, once every fix in _bootstrap_glibc_runtime
+    and phase_systemd got autologin's session to genuinely launch
+    kwin_wayland for the first time in this whole project: kwin_wayland
+    segfaulted deterministically (confirmed via addr2line against the
+    actual libQt6Gui.so.6.10.3, same file offset on every crash) inside
+    QStyleHintsPrivate::update(QPlatformTheme const*) dereferencing a null
+    theme pointer -- Qt6Gui doesn't null-check it, so a missing platform
+    theme plugin is fatal, not just cosmetic.
+
+    The plugin (KDEPlasmaPlatformTheme6.so, confirmed present via `find`)
+    was never missing -- it was just in the wrong tree. This build has TWO
+    separate, fully-populated Qt plugin directory trees that were never
+    reconciled: qtbase's own build (phase_qt_deps) installs to
+    /usr/plugins/<category>/ (Qt6's compiled-in QLibraryInfo::PluginsPath
+    default when CMAKE_INSTALL_PREFIX=/usr without Debian's multiarch
+    patches), while KDE Frameworks/Plasma components built via ECM
+    (extra-cmake-modules) install to the multiarch-conventional
+    /usr/lib/x86_64-linux-gnu/plugins/<category>/ instead. Qt's runtime
+    plugin loader only ever scans the first tree (confirmed via
+    QT_DEBUG_PLUGINS=1: it checks ".../platforms" under /usr/lib/x86_64-
+    linux-gnu directly, then falls through to statically-registered
+    plugins for anything else -- it never scans .../plugins/<category> at
+    all), so everything ECM ever installs (platformthemes, styles,
+    kiconthemes6, kwin's own kcms, plasma, kf6, ...) is invisible to Qt at
+    runtime. Confirmed via `find`: /usr/plugins/platformthemes only had
+    libqxdgdesktopportal.so; the real fix (an ECM install-path
+    reconfiguration to make phase_qt_deps and every KDE/ECM phase agree on
+    one plugin root) is out of scope for a live-boot fix -- this merges
+    the trees together after the fact instead, category by category,
+    non-destructively (never overwrites a file already present in
+    /usr/plugins, matching the "host runtime, documented" skip-if-exists
+    convention used throughout this pipeline).
+    """
+    ecm_plugins_dir = os.path.join(target, "usr", "lib", "x86_64-linux-gnu", "plugins")
+    qt_plugins_dir = os.path.join(target, "usr", "plugins")
+    if not os.path.isdir(ecm_plugins_dir) or not os.path.isdir(qt_plugins_dir):
+        return
+    merged = 0
+    for category in os.listdir(ecm_plugins_dir):
+        src_category_dir = os.path.join(ecm_plugins_dir, category)
+        if not os.path.isdir(src_category_dir) or os.path.islink(src_category_dir):
+            continue
+        dst_category_dir = os.path.join(qt_plugins_dir, category)
+        for root, dirs, files in os.walk(src_category_dir):
+            rel = os.path.relpath(root, src_category_dir)
+            dst_root = dst_category_dir if rel == "." else os.path.join(dst_category_dir, rel)
+            ensure(dst_root)
+            for name in files:
+                src_path = os.path.join(root, name)
+                dst_path = os.path.join(dst_root, name)
+                if os.path.exists(dst_path) or os.path.islink(dst_path):
+                    continue
+                shutil.copy2(src_path, dst_path)
+                shutil.copystat(src_path, dst_path)
+                merged += 1
+    log(f"Qt/KDE plugin trees merged ({merged} file(s) copied into "
+        "/usr/plugins so Qt's runtime loader can actually see them).",
+        color=GREEN)
+
 def phase_plasma_configure(target):
     """Configure the display manager: PLM (plasmalogin) if built, else SDDM.
 
@@ -2893,7 +2974,139 @@ def phase_plasma_configure(target):
     several of the fixes below, not something introduced here.
     """
     log_phase("plasma-configure", "Configure display manager (PLM, fallback SDDM)")
+    _merge_qt_plugin_trees(target)
     etc = os.path.join(target, "etc")
+
+    # /etc/environment: never written anywhere in this pipeline -- every
+    # boot log throughout this whole session shows "pam_env(...:setcred):
+    # Unable to open env file: /etc/environment" as a warning, which
+    # looked cosmetic right up until the kwin_wayland Qt6Gui crash was
+    # actually root-caused. Confirmed via `strings` on kwin_wayland: it
+    # has its own KWin::QPA::Integration::createPlatformTheme(const
+    # QString&), which reads QT_QPA_PLATFORMTHEME to decide which named
+    # QPlatformTheme plugin to request -- the shipped theme plugin itself
+    # registers under the key "kde" (confirmed via `strings` on
+    # KDEPlasmaPlatformTheme6.so: "KdePlatformThemePlugin" immediately
+    # followed by "kde"), and dlopens fine on its own (confirmed via a
+    # direct dlopen() test through the target's own ld.so). With
+    # QT_QPA_PLATFORMTHEME never set (pam_env's normal mechanism for
+    # loading this file into every session's environment had nothing to
+    # load), KWin's Integration::createPlatformTheme() has no name to ask
+    # for, QPlatformThemeFactory::create() returns null, and
+    # QStyleHintsPrivate::update(QPlatformTheme const*) -- called with
+    # that null pointer -- doesn't check before dereferencing it. This is
+    # the actual root cause behind the deterministic SIGSEGV crash-loop
+    # (same file offset in libQt6Gui.so.6.10.3 on every single crash).
+    etc_environment = os.path.join(etc, "environment")
+    if not os.path.exists(etc_environment):
+        with open(etc_environment, "w") as f:
+            f.write("QT_QPA_PLATFORMTHEME=kde\n")
+        log("/etc/environment created (QT_QPA_PLATFORMTHEME=kde).", color=GREEN)
+
+    # QT_PLUGIN_PATH for the systemd --user manager specifically: kwin_wayland
+    # and plasmashell are launched directly by plasma_session as plain child
+    # processes and inherit a working environment from it, but every OTHER
+    # session component started independently as its own systemd --user unit
+    # (plasma-kactivitymanagerd.service, plasma-polkit-agent.service,
+    # plasma-powerdevil.service, the plasma-setup first-boot wizard, ...) does
+    # not go through that inheritance chain at all -- confirmed via a real
+    # boot: every one of them logged 'qt.qpa.plugin: Could not find the Qt
+    # platform plugin "wayland" in ""' and aborted (kactivitymanagerd and
+    # polkit's agent both core-dumped on the resulting null QPlatformTheme,
+    # same crash *class* as the one _merge_qt_plugin_trees above already
+    # root-caused for kwin_wayland, just hitting a second, independent
+    # process/unit that fix's environment change never reached). /etc/
+    # environment (written above) is only consulted by PAM's own login path,
+    # not by systemd --user's unit environment -- the actual mechanism for
+    # that is environment.d (systemd 233+), read by the
+    # 30-systemd-environment-d-generator user-environment-generator BEFORE
+    # any unit starts. Confirmed fixed via the same real boot re-run: zero
+    # "Could not find the Qt platform plugin" lines anywhere afterward.
+    # QML2_IMPORT_PATH is the exact same gap, one layer up: this Qt build's
+    # QML plugins (e.g. libqtquickcontrols2plugin.so) install under
+    # /usr/qml/<Module>/ for the identical -prefix=/usr reason /usr/plugins
+    # exists above, and the plasma-setup first-boot wizard (started via its
+    # own XDG-autostart-generated systemd --user unit, not a plasma_session
+    # direct child) hit the QML equivalent of the same crash: 'module
+    # "QtQuick.Controls" plugin "qtquickcontrols2plugin" not found'.
+    environment_d_dir = os.path.join(target, "usr", "lib", "environment.d")
+    qt_plugin_path_conf = os.path.join(environment_d_dir, "50-qt-plugin-path.conf")
+    if not os.path.exists(qt_plugin_path_conf):
+        ensure(environment_d_dir)
+        with open(qt_plugin_path_conf, "w") as f:
+            f.write("QT_PLUGIN_PATH=/usr/plugins\n")
+            f.write("QML2_IMPORT_PATH=/usr/qml\n")
+        log("usr/lib/environment.d/50-qt-plugin-path.conf created "
+            "(QT_PLUGIN_PATH=/usr/plugins, QML2_IMPORT_PATH=/usr/qml, for "
+            "systemd --user units).", color=GREEN)
+
+    # xrdb: never installed anywhere in this pipeline (confirmed: not even
+    # in this build container before x11-xserver-utils was added to its own
+    # apt list -- only a bash-completion script referencing it existed).
+    # kcminit_startup's X resource-merge step forks it unconditionally, even
+    # in a pure-Wayland session -- root-caused via a real boot with strace
+    # attached to the actual hung process: the forked child execve()s an
+    # EMPTY path (["", "-quiet", "-merge", "/tmp/kcminit.XXXXXX"]) and dies
+    # with ENOENT because nothing ever resolved xrdb's location. (This
+    # specific failure is fire-and-forget and not itself what stalls
+    # plasma-kcminit.service for its full 90s timeout -- that stall is a
+    # separate, still-open issue: kcminit then opens its own raw X11
+    # connection to Xwayland and blocks forever in poll() waiting on a
+    # server reply that never arrives within the capture window. Fixing
+    # xrdb's absence is correct regardless and removes one real, confirmed
+    # failure from the boot log even though it doesn't fully explain the
+    # timeout on its own.)
+    xrdb_dst = os.path.join(target, "usr", "bin", "xrdb")
+    if not os.path.exists(xrdb_dst):
+        xrdb_src = "/usr/bin/xrdb"
+        if os.path.exists(xrdb_src):
+            ensure(os.path.dirname(xrdb_dst))
+            shutil.copy2(xrdb_src, xrdb_dst)
+            shutil.copystat(xrdb_src, xrdb_dst)
+            log("xrdb copied from host (kcminit forks it unconditionally "
+                "for its X resource-merge step).", color=GREEN)
+
+    # plasma-setup's own sysusers.d line has no "video"/"render" group
+    # membership -- same root cause already fixed for the "smech" user
+    # above (see the "group" file entry's own comment: smech was in
+    # "video" but not "render", confirmed via a real boot as why
+    # kwin_wayland_wr dumped core), just for a SECOND, separate account
+    # this project's own /etc/group static list never covered. Root-caused
+    # via a real boot + gdb: the live autologin session actually runs as
+    # "plasma-setup" (KDE's own first-run onboarding account, created
+    # dynamically by systemd-sysusers from plasma-workspace's own shipped
+    # /usr/lib/sysusers.d/plasma-setup-sysuser.conf -- a plain "u ..." line
+    # with zero supplementary groups), not "smech" -- so the earlier fix
+    # never applied to it. `id` inside the live guest confirmed
+    # "groups=983(plasma-setup)" only; `/dev/dri/card0` is root:video
+    # 0660, so kwin_wayland's own DRM backend setup ("kwin_core: Failed to
+    # open drm node") failed outright, which is what actually caused the
+    # segfault crash-loop everything else in this investigation traced
+    # back to. sysusers.d's own "m <user> <group>" directive (documented
+    # systemd mechanism for supplementary group membership, distinct from
+    # the "u" user-creation line) is the correct place to add this --
+    # appended to the same shipped conf file rather than duplicated
+    # elsewhere, idempotent against a re-run finding it already patched.
+    plasma_setup_sysusers = os.path.join(
+        target, "usr", "lib", "sysusers.d", "plasma-setup-sysuser.conf")
+    if os.path.exists(plasma_setup_sysusers):
+        with open(plasma_setup_sysusers) as f:
+            sysusers_content = f.read()
+        needed_lines = []
+        for group in ("video", "render"):
+            marker = f"m plasma-setup {group}"
+            if marker not in sysusers_content:
+                needed_lines.append(marker)
+        if needed_lines:
+            with open(plasma_setup_sysusers, "a") as f:
+                if not sysusers_content.endswith("\n"):
+                    f.write("\n")
+                for line in needed_lines:
+                    f.write(line + "\n")
+            log(f"plasma-setup-sysuser.conf: added {len(needed_lines)} "
+                "supplementary group membership(s) (video/render).",
+                color=GREEN)
+
     plasmalogin_bin = os.path.join(target, "usr", "bin", "plasmalogin")
 
     if os.path.exists(plasmalogin_bin):
@@ -2934,6 +3147,20 @@ def phase_plasma_configure(target):
                 f.write("# Intentionally minimal -- see phase_plasma_configure "
                          "in spk-compile.py for why this needs to exist at all.\n")
 
+        # --- system-auth: guarantee it exists -----------------------------
+        # Same missing-include problem as postlogin above, for a second
+        # authselect-style filename: plasmalogin-autologin's account/
+        # password/session stacks each end in "include system-auth" (plain
+        # "plasmalogin" uses "password-auth" instead -- not stubbed here
+        # since that service isn't on the live autologin path this rootfs
+        # actually boots through). Same fix: a comment-only stub is enough
+        # for an include to stop hard-aborting the stack.
+        system_auth = os.path.join(pam_dir, "system-auth")
+        if not os.path.exists(system_auth):
+            with open(system_auth, "w") as f:
+                f.write("# Intentionally minimal -- see phase_plasma_configure "
+                         "in spk-compile.py for why this needs to exist at all.\n")
+
         # --- plasmalogin-autologin: add pam_systemd.so -------------------
         # Even with auth fixed, the shipped session stack (ending in
         # "session include system-auth", whose own session stack is just
@@ -2949,6 +3176,28 @@ def phase_plasma_configure(target):
             _pam_ensure_line(autologin_pam, r"^session\s+optional\s+pam_systemd\.so",
                               "session    optional    pam_systemd.so")
 
+            # --- plasmalogin-autologin: give the account phase a real
+            # terminal entry ---------------------------------------------
+            # Root-caused via a real boot, across two fix attempts: the
+            # account phase ("account required pam_nologin.so" + "account
+            # include system-auth") failed with "[PAM] acctMgmt: Permission
+            # denied" / "Autologin failed!" even after nsswitch.conf was
+            # added (ruling out a getpwuid() lookup failure) AND after
+            # making pam_nologin.so itself non-fatal via "-" (ruling out
+            # pam_nologin specifically) -- the identical failure persisted
+            # either way. The actual cause: system-auth is this project's
+            # own comment-only stub (see above), contributing zero account
+            # lines, so once pam_nologin.so is ignored the account phase
+            # has NO real entries left at all -- and Linux-PAM treats a
+            # stack with zero applicable lines for a management group as a
+            # service error, not automatic success. plasmalogin-greeter's
+            # own shipped account phase is a single real line ("account
+            # required pam_permit.so") and its greeter session opens fine
+            # every boot -- mirroring that gives autologin's account phase
+            # a real, always-succeeding entry instead of an empty one.
+            _pam_ensure_line(autologin_pam, r"^account\s+required\s+pam_permit\.so",
+                              "account    required    pam_permit.so")
+
         # --- enable plasmalogin.service -----------------------------------
         # PLM's own install already ships /usr/lib/systemd/system/
         # plasmalogin.service (Alias=display-manager.service) -- only the
@@ -2956,11 +3205,37 @@ def phase_plasma_configure(target):
         # SDDM fallback below, which has no shipped unit to enable).
         unit = os.path.join(target, "usr", "lib", "systemd", "system", "plasmalogin.service")
         if os.path.exists(unit):
+            # symlink() is a plain os.symlink() with no path rewriting --
+            # the target must be the path as it will exist in the *booted*
+            # OS (/usr/lib/...), never `unit` itself, which is prefixed with
+            # this build's host-side `target` directory and would dangle on
+            # every real boot. Found by directly inspecting the resulting
+            # symlinks on a real rootfs: both of the below were absent
+            # entirely (not even dangling -- ensure()'s directory creation
+            # ran, but the symlink call itself apparently never had, despite
+            # `systemctl status` separately reporting "enabled" via preset
+            # inference rather than a real .wants symlink).
+            unit_guest_path = "/usr/lib/systemd/system/plasmalogin.service"
             gfx_wants = os.path.join(etc, "systemd", "system", "graphical.target.wants")
             ensure(gfx_wants)
             link = os.path.join(gfx_wants, "plasmalogin.service")
             if not os.path.lexists(link):
-                symlink(unit, link)
+                symlink(unit_guest_path, link)
+            # The graphical.target.wants symlink alone only covers
+            # WantedBy=graphical.target -- it does NOT cover the unit's
+            # separate Alias=display-manager.service (per its own [Install]
+            # section, see comment above). A real `systemctl enable` creates
+            # both symlinks; this code only ever created the first one.
+            # Root-caused by diffing against RC2's actual shipped image
+            # (/etc/systemd/system/display-manager.service -> .../plasmalogin
+            # .service, confirmed present there, confirmed absent here) --
+            # graphical.target itself never resolves which display manager
+            # to start without this alias, which is consistent with
+            # plasmalogin.service showing "loaded, enabled" but staying
+            # "inactive (dead)" through boot on a real test.
+            dm_link = os.path.join(etc, "systemd", "system", "display-manager.service")
+            if not os.path.lexists(dm_link):
+                symlink(unit_guest_path, dm_link)
         else:
             log("plasmalogin binary present but no systemd unit shipped with it "
                 "-- service not enabled.", color=YELLOW)
@@ -2994,11 +3269,20 @@ def phase_plasma_configure(target):
                 [Install]
                 Alias=display-manager.service
             """))
+        # sddm_unit_path is host-prefixed (under `target`); symlinks need
+        # the guest-real path instead (see the matching PLM comment above).
+        sddm_unit_guest_path = "/etc/systemd/system/sddm.service"
         gfx_wants = os.path.join(etc, "systemd", "system", "graphical.target.wants")
         ensure(gfx_wants)
         link = os.path.join(gfx_wants, "sddm.service")
         if not os.path.lexists(link):
-            symlink(sddm_unit_path, link)
+            symlink(sddm_unit_guest_path, link)
+        # Same Alias=display-manager.service gap as the PLM path above --
+        # fixed here too for consistency, even though PLM is the active
+        # path in every build so far.
+        dm_link = os.path.join(etc, "systemd", "system", "display-manager.service")
+        if not os.path.lexists(dm_link):
+            symlink(sddm_unit_guest_path, dm_link)
     log("SDDM configured (fallback).", color=GREEN)
 
 def phase_kwin_deps(target):
@@ -3034,6 +3318,17 @@ def phase_xwayland_deps(target):
     compile failure -> "Failed to activate virtual core keyboard" -> fatal),
     and kwin gives up on Xwayland after 4 crashes in 10 minutes.
 
+    A later, separate real boot hit the SAME end symptom (Xwayland never
+    appears as a process at all, kcminit/ksmserver still hard-timeout at
+    90s each) via a DIFFERENT cause than either of the above: the extra_libs
+    list below was missing libdecor-0.so.0. Confirmed directly by running
+    the actual shipped Xwayland binary by hand: `error while loading shared
+    libraries: libdecor-0.so.0: cannot open shared object file`, exit 127 --
+    a fatal dynamic-linker-at-startup error, not a soft/optional dlopen()
+    failure, so this is a real DT_NEEDED dependency of this Xwayland build
+    (presumably compiled with libdecor's rootful-mode window decoration
+    support enabled), not just a nice-to-have.
+
     These are pulled from a matching-ABI Ubuntu 24.04 container rather than
     the build host directly -- this pipeline's target rootfs is Debian/
     Ubuntu glibc ABI (see build_env_glibc), but the build host itself may be
@@ -3044,7 +3339,8 @@ def phase_xwayland_deps(target):
     """
     log_phase("xwayland-deps", "Fetch Xwayland + xkbcomp + xkb-data (Ubuntu 24.04 ABI)")
 
-    extra_libs = ["libXfont2.so.2", "libfontenc.so.1", "libxkbfile.so.1"]
+    extra_libs = ["libXfont2.so.2", "libfontenc.so.1", "libxkbfile.so.1",
+                  "libdecor-0.so.0"]
     tmp = os.path.join(BUILD_TMP, "xwayland-import")
     shutil.rmtree(tmp, ignore_errors=True)
     ensure(tmp)
@@ -3054,7 +3350,14 @@ def phase_xwayland_deps(target):
         # _in_matching_build_image) -- no need to spin up a nested one just
         # to apt-get install into it, install straight into this container.
         run(["apt-get", "update", "-qq"])
-        run(["apt-get", "install", "-y", "-qq", "xwayland", "x11-xkb-utils"])
+        # libdecor-0-0 explicitly listed, not assumed as an automatic
+        # dependency of xwayland -- confirmed via a real boot that a
+        # previously-fetched Xwayland binary needed it (DT_NEEDED, fatal at
+        # dynamic-link time) but it wasn't present, and this install command
+        # has never passed --install-recommends, so a Recommends-only
+        # relationship (if that's what it is) would silently not pull it in.
+        run(["apt-get", "install", "-y", "-qq", "xwayland", "x11-xkb-utils",
+             "libdecor-0-0"])
         shutil.copy2("/usr/bin/Xwayland", tmp)
         shutil.copy2("/usr/bin/xkbcomp", tmp)
         shutil.copytree("/usr/share/X11/xkb", os.path.join(tmp, "xkb"), dirs_exist_ok=True)
@@ -3078,7 +3381,8 @@ def phase_xwayland_deps(target):
         run(["podman", "run", "-d", "--name", container, "ubuntu:24.04", "sleep", "infinity"])
         try:
             run(["podman", "exec", container, "bash", "-c",
-                 "apt-get update -qq && apt-get install -y -qq xwayland x11-xkb-utils"])
+                 "apt-get update -qq && apt-get install -y -qq xwayland x11-xkb-utils "
+                 "libdecor-0-0"])
             run(["podman", "cp", f"{container}:/usr/bin/Xwayland", tmp])
             run(["podman", "cp", f"{container}:/usr/bin/xkbcomp", tmp])
             run(["podman", "cp", f"{container}:/usr/share/X11/xkb", os.path.join(tmp, "xkb")])
@@ -3790,6 +4094,39 @@ def _bootstrap_glibc_runtime(target):
         elif os.path.isfile(src_path):
             shutil.copy2(src_path, dst_path)
             copied += 1
+
+    # Some of the symlinks just copied point OUTSIDE this directory into
+    # other host lib trees this loop never visits -- e.g. Mesa's
+    # libLLVM.so.18.1 -> ../llvm-18/lib/libLLVM.so.1. Copying only the
+    # symlink without its real target leaves it dangling. Confirmed
+    # directly as the root cause of kwin_wayland silently exiting clean
+    # (no crash, no journal entry, no core dump) on every single boot:
+    # Mesa's DRI/GBM loader could never dlopen libLLVM.so.18.1 since the
+    # 123MB real file it pointed to didn't exist anywhere in the target,
+    # so KWin could never create a GBM device and just gave up quietly.
+    # ldconfig -r (see phase_iso_live_smechos) even actively made this
+    # worse on a rebuild: it prunes symlinks it finds dangling, so a
+    # rebuild without this fix would delete the broken symlink outright
+    # rather than leave a clue behind.
+    for name in os.listdir(dst_multiarch):
+        dst_path = os.path.join(dst_multiarch, name)
+        if not os.path.islink(dst_path):
+            continue
+        real_target = os.path.realpath(dst_path)
+        if os.path.exists(real_target):
+            continue
+        host_real_target = os.path.realpath(os.path.join(host_multiarch, name))
+        if not os.path.isfile(host_real_target):
+            continue
+        rel = os.path.relpath(host_real_target, "/")
+        target_real_path = os.path.join(target, rel)
+        ensure(os.path.dirname(target_real_path))
+        shutil.copy2(host_real_target, target_real_path)
+        shutil.copystat(host_real_target, target_real_path)
+        copied += 1
+        log(f"  resolved dangling symlink target: {name} -> /{rel}",
+            color=YELLOW)
+
     log(f"glibc runtime bootstrapped from host container ({copied} files/links "
         f"added to {dst_multiarch}, existing target-built libs preserved).",
         color=GREEN)
@@ -3836,6 +4173,235 @@ def _bootstrap_glibc_runtime(target):
         log("ldconfig copied from host (real binary, not the dpkg wrapper).",
             color=GREEN)
 
+    # dbus-daemon: never built from source or apt-get-installed anywhere in
+    # this pipeline -- the system message bus config/policy files (system.d,
+    # system-services, etc.) and the "messagebus" service account both
+    # existed, but the actual daemon binary that reads them was never
+    # copied into the target at all. Root-caused via a real boot: systemd
+    # reported "Unit dbus-daemon.service could not be found" / "dbus-broker
+    # .service could not be found", and nothing in the rootfs owned
+    # /usr/bin/dbus-daemon. Without a running system bus, essentially
+    # nothing past early boot works (systemd-logind, udev's dbus hooks,
+    # and the entire Plasma session all depend on it) -- same "host
+    # runtime, documented" category as kmod/ldconfig above. dbus-send and
+    # dbus-uuidgen are pulled in too (both genuinely used: dbus-uuidgen by
+    # dbus-daemon's own machine-id-less-boot fallback, dbus-send by a
+    # handful of session-startup scripts), plus the setuid launch helper
+    # at-console policies rely on. All four are dynamically linked purely
+    # against libs already covered by the host_multiarch copy above.
+    dbus_daemon_dst = os.path.join(target, "usr", "bin", "dbus-daemon")
+    if not os.path.exists(dbus_daemon_dst):
+        ensure(os.path.dirname(dbus_daemon_dst))
+        for bin_name in ("dbus-daemon", "dbus-send", "dbus-uuidgen"):
+            src_path = f"/usr/bin/{bin_name}"
+            dst_path = os.path.join(target, "usr", "bin", bin_name)
+            shutil.copy2(src_path, dst_path)
+            shutil.copystat(src_path, dst_path)
+        launch_helper_src = "/usr/lib/dbus-1.0/dbus-daemon-launch-helper"
+        launch_helper_dst = os.path.join(target, "usr", "lib", "dbus-1.0",
+                                          "dbus-daemon-launch-helper")
+        if os.path.exists(launch_helper_src):
+            ensure(os.path.dirname(launch_helper_dst))
+            shutil.copy2(launch_helper_src, launch_helper_dst)
+            shutil.copystat(launch_helper_src, launch_helper_dst)
+        log("dbus-daemon (+ dbus-send, dbus-uuidgen, launch helper) copied "
+            "from host.", color=GREEN)
+
+        # The binary alone doesn't get the bus running -- systemd needs the
+        # unit files too. Confirmed via a real boot: "Unit dbus-daemon
+        # .service could not be found" / "dbus-broker.service could not be
+        # found" persisted even after the binary copy above, because no
+        # unit referencing it existed anywhere in the target. Debian/Ubuntu
+        # activate the system bus via dbus.socket (ListenStream=/run/dbus/
+        # system_bus_socket), which pulls in dbus.service on first
+        # connection -- copy both real host units and recreate the same
+        # static enablement symlink the container itself has
+        # (sockets.target.wants/dbus.socket -> ../dbus.socket).
+        sysd_dir = os.path.join(target, "usr", "lib", "systemd", "system")
+        for unit in ("dbus.service", "dbus.socket"):
+            src_path = f"/usr/lib/systemd/system/{unit}"
+            dst_path = os.path.join(sysd_dir, unit)
+            if os.path.exists(src_path) and not os.path.exists(dst_path):
+                shutil.copy2(src_path, dst_path)
+                shutil.copystat(src_path, dst_path)
+        sockets_wants = os.path.join(sysd_dir, "sockets.target.wants")
+        ensure(sockets_wants)
+        dbus_socket_link = os.path.join(sockets_wants, "dbus.socket")
+        if not os.path.islink(dbus_socket_link) and not os.path.exists(dbus_socket_link):
+            symlink("../dbus.socket", dbus_socket_link)
+        log("dbus.service/dbus.socket units copied and socket-activation "
+            "enabled.", color=GREEN)
+
+    # The SYSTEM bus units above are a separate package (dbus-daemon) from
+    # dbus-user-session, which ships the USER-manager equivalents at
+    # usr/lib/systemd/**user**/dbus.{service,socket} -- neither was ever
+    # copied. Root-caused via a real boot with a custom diagnostic: every
+    # plasma-workspace systemd --user target (plasma-login-wayland.target,
+    # plasma-workspace-wayland.target, plasma-core.target, and so on down
+    # to plasma-plasmashell.service itself) stayed "inactive (dead)"
+    # forever despite kwin_wayland/ksplashqml/kcminit_startup all launching
+    # fine as plain child processes -- without a user dbus.socket, systemd
+    # --user has no session bus to activate the Type=dbus-gated units
+    # (plasmashell's own unit is BusName=org.kde.plasmashell) against, so
+    # the whole target chain silently never starts and the desktop never
+    # renders, with no crash, no journal entry, and no error anywhere to
+    # find -- the same silent-failure shape as the missing libLLVM payload
+    # earlier in this same build, just one layer up the stack.
+    user_sysd_dir = os.path.join(target, "usr", "lib", "systemd", "user")
+    user_dbus_dst = os.path.join(user_sysd_dir, "dbus.socket")
+    if not os.path.exists(user_dbus_dst):
+        ensure(user_sysd_dir)
+        for unit in ("dbus.service", "dbus.socket"):
+            src_path = f"/usr/lib/systemd/user/{unit}"
+            dst_path = os.path.join(user_sysd_dir, unit)
+            if os.path.exists(src_path) and not os.path.exists(dst_path):
+                shutil.copy2(src_path, dst_path)
+                shutil.copystat(src_path, dst_path)
+        user_sockets_wants = os.path.join(user_sysd_dir, "sockets.target.wants")
+        ensure(user_sockets_wants)
+        user_dbus_socket_link = os.path.join(user_sockets_wants, "dbus.socket")
+        if not os.path.islink(user_dbus_socket_link) and not os.path.exists(user_dbus_socket_link):
+            symlink("../dbus.socket", user_dbus_socket_link)
+        log("user dbus.service/dbus.socket units copied and socket-activation "
+            "enabled -- required for any systemd --user Type=dbus unit "
+            "(plasmashell included) to ever be reachable.", color=GREEN)
+
+    # dbus-daemon's own top-level bus policy files: never copied even
+    # though the binary, units, and the interface/service XML fragments
+    # OTHER packages drop into usr/share/dbus-1/{interfaces,services,
+    # system-services,system.d} were all already present -- system.conf
+    # and session.conf themselves only ship in the dbus package itself, and
+    # nothing in this pipeline ever installs that package. Root-caused via
+    # a real boot, after the PAM fixes above got far enough to reach it:
+    # "Failed to open /usr/share/dbus-1/system.conf: No such file or
+    # directory", crash-looping dbus.service into start-limit-hit and
+    # leaving plasmalogin's "Not connected to D-Bus server" /
+    # pam_systemd's CreateSession failure right behind it. Deliberately
+    # guarded independently of the dbus_daemon_dst check above (not nested
+    # inside it): that check is already satisfied on any rootfs that
+    # previously got this far, which would otherwise silently skip this
+    # fix forever on an existing build.
+    dbus_share_dir = os.path.join(target, "usr", "share", "dbus-1")
+    ensure(dbus_share_dir)
+    for conf_name in ("system.conf", "session.conf"):
+        src_path = f"/usr/share/dbus-1/{conf_name}"
+        dst_path = os.path.join(dbus_share_dir, conf_name)
+        if os.path.exists(src_path) and not os.path.exists(dst_path):
+            shutil.copy2(src_path, dst_path)
+            shutil.copystat(src_path, dst_path)
+    # Both config files reference <includedir ignore_missing="yes"> for
+    # /etc/dbus-1/{system.d,session.d} -- optional per their own config,
+    # but creating the real empty dirs avoids relying on that at all.
+    for override_dir in ("system.d", "session.d"):
+        ensure(os.path.join(target, "etc", "dbus-1", override_dir))
+    log("dbus-1 system.conf/session.conf policy files copied from host.",
+        color=GREEN)
+
+    # dbus-run-session: the original dbus-daemon copy above only pulled in
+    # dbus-daemon/dbus-send/dbus-uuidgen -- missed this one, even though
+    # it's what actually starts a per-user SESSION bus (as opposed to the
+    # system bus dbus-daemon itself provides). Root-caused via a real
+    # boot, once every fix above got autologin's PAM session to genuinely
+    # open: the session launch still failed ("Auth: plasmalogin-helper
+    # exited with 127") because /usr/share/plasmalogin/scripts/wayland-
+    # session hands off to /usr/lib/x86_64-linux-gnu/libexec/plasma-dbus-
+    # run-session-if-needed, whose whole job -- when $DBUS_SESSION_BUS_
+    # ADDRESS is unset, which it always is this early in a fresh autologin
+    # session -- is `exec dbus-run-session "$@"`. Independently guarded
+    # (not nested in the dbus_daemon_dst check above) for the same reason
+    # as the system.conf/session.conf fix: that check is already satisfied
+    # on any rootfs that got this far.
+    dbus_run_session_dst = os.path.join(target, "usr", "bin", "dbus-run-session")
+    if not os.path.exists(dbus_run_session_dst):
+        src_path = "/usr/bin/dbus-run-session"
+        if os.path.exists(src_path):
+            ensure(os.path.dirname(dbus_run_session_dst))
+            shutil.copy2(src_path, dbus_run_session_dst)
+            shutil.copystat(src_path, dbus_run_session_dst)
+            log("dbus-run-session copied from host.", color=GREEN)
+
+    # libdbus-1.so.3: force-synced to the host container's current build,
+    # not just copied-if-missing like the rest of host_multiarch above.
+    # Root-caused via a chroot simulation of the exact autologin launch
+    # chain (su itself is broken on this rootfs -- see the "Critical
+    # error" note on the CALAMARES DIRECT LAUNCH TEST diag section -- so
+    # setpriv was used instead to reproduce plasmalogin-helper's own raw
+    # uid-switch): "dbus-run-session: /lib/x86_64-linux-gnu/libdbus-1.so.3:
+    # version 'LIBDBUS_PRIVATE_1.16.2' not found (required by
+    # dbus-run-session)" -- this is what "Auth: plasmalogin-helper exited
+    # with 1" actually was. The target's libdbus-1.so.3 was version 3.32.4,
+    # copied in by the plain host_multiarch loop back when the *container's
+    # own* dbus package was that old; since then the container's dbus
+    # package (and therefore dbus-daemon/dbus-send/dbus-uuidgen/
+    # dbus-run-session copied above) moved on to 3.38.3, but
+    # host_multiarch's "skip if the destination already exists" rule left
+    # the stale 3.32.4 .so in place forever, out of sync with its own
+    # sibling binaries. dbus-daemon itself never showed this because it
+    # only calls libdbus's public API, not the private symbol version
+    # dbus-run-session's small wrapper happens to need. Fixed by comparing
+    # versioned filenames and replacing the whole set (old file removed,
+    # not left alongside) whenever the host's version differs -- the
+    # SONAME symlink (libdbus-1.so.3) stays ABI-stable for every other
+    # consumer already linked against it.
+    host_libdbus_dir = "/usr/lib/x86_64-linux-gnu"
+    target_libdbus_dir = os.path.join(target, "usr", "lib", "x86_64-linux-gnu")
+    host_libdbus_versioned = None
+    for name in os.listdir(host_libdbus_dir):
+        if name.startswith("libdbus-1.so.") and name[len("libdbus-1.so."):].split(".")[0].isdigit():
+            host_libdbus_versioned = name
+            break
+    if host_libdbus_versioned:
+        host_libdbus_path = os.path.join(host_libdbus_dir, host_libdbus_versioned)
+        target_libdbus_path = os.path.join(target_libdbus_dir, host_libdbus_versioned)
+        if not os.path.exists(target_libdbus_path):
+            for stale_name in list(os.listdir(target_libdbus_dir)):
+                if stale_name.startswith("libdbus-1.so.") and stale_name != host_libdbus_versioned:
+                    stale_path = os.path.join(target_libdbus_dir, stale_name)
+                    if os.path.isfile(stale_path) and not os.path.islink(stale_path):
+                        os.remove(stale_path)
+            shutil.copy2(host_libdbus_path, target_libdbus_path)
+            shutil.copystat(host_libdbus_path, target_libdbus_path)
+            for link_name in ("libdbus-1.so", "libdbus-1.so.3"):
+                link_path = os.path.join(target_libdbus_dir, link_name)
+                if os.path.islink(link_path) or os.path.exists(link_path):
+                    os.remove(link_path)
+                symlink(host_libdbus_versioned, link_path)
+            log(f"libdbus-1.so synced to host version ({host_libdbus_versioned}).",
+                color=GREEN)
+
+            # dbus-daemon/dbus-send/dbus-uuidgen/the launch helper are the
+            # SAME kind of stale artifact libdbus-1.so.3 just was -- copied
+            # once by the dbus_daemon_dst-guarded block above, back when
+            # the container's dbus package was the same old build libdbus
+            # just got replaced from. Verified via a real chroot test right
+            # after the libdbus-only fix: dbus-run-session got further, but
+            # the dbus-daemon it spawns for the session bus then failed
+            # the exact same way ("version 'LIBDBUS_PRIVATE_1.14.10' not
+            # found (required by dbus-daemon)") -- confirming dbus-daemon
+            # itself was still the old build, just linked against a
+            # DIFFERENT private symbol than dbus-run-session needed,
+            # because it was never covered by that first guard once
+            # dbus-daemon already existed on a rootfs reused across builds.
+            # Whenever libdbus genuinely changes version (the branch this
+            # comment lives in), force-refresh the whole toolset together
+            # so it's never split across two host dbus package versions.
+            for bin_name in ("dbus-daemon", "dbus-send", "dbus-uuidgen"):
+                src_path = f"/usr/bin/{bin_name}"
+                dst_path = os.path.join(target, "usr", "bin", bin_name)
+                if os.path.exists(src_path):
+                    shutil.copy2(src_path, dst_path)
+                    shutil.copystat(src_path, dst_path)
+            launch_helper_src = "/usr/lib/dbus-1.0/dbus-daemon-launch-helper"
+            launch_helper_dst = os.path.join(target, "usr", "lib", "dbus-1.0",
+                                              "dbus-daemon-launch-helper")
+            if os.path.exists(launch_helper_src):
+                ensure(os.path.dirname(launch_helper_dst))
+                shutil.copy2(launch_helper_src, launch_helper_dst)
+                shutil.copystat(launch_helper_src, launch_helper_dst)
+            log("dbus-daemon/dbus-send/dbus-uuidgen/launch helper "
+                "re-synced to host to match the new libdbus-1.so.",
+                color=GREEN)
+
     # /bin/sh: nothing in this profile ever builds a POSIX sh or symlinks
     # bash as one. Pulling in dash (Ubuntu's /bin/sh) as a whole separate
     # from-source package just for this is disproportionate -- bash's own
@@ -3845,6 +4411,53 @@ def _bootstrap_glibc_runtime(target):
     sh_link = os.path.join(target, "usr", "bin", "sh")
     if not os.path.islink(sh_link) and not os.path.exists(sh_link):
         symlink("bash", sh_link)
+
+    # /etc/nsswitch.conf: never written anywhere in this pipeline, even
+    # though libnss_files.so.2 (copied by the host_multiarch loop above)
+    # and a real /etc/passwd/shadow with the "smech" user both exist.
+    # Root-caused via a real boot, after the dbus fix above got far enough
+    # to reach it: plasmalogin-autologin's account phase (just "account
+    # required pam_nologin.so") failed with "[PAM] acctMgmt: Permission
+    # denied" -- pam_nologin's own logic needs getpwuid() to tell root
+    # from non-root before it can decide anything, and with no
+    # nsswitch.conf glibc's NSS has no configured passwd source, so the
+    # lookup fails and pam_nologin denies defensively. The host
+    # container's own /etc/nsswitch.conf is a plain "files"-only config
+    # (no "systemd" source) -- deliberately taking it as-is rather than
+    # writing something that also references nss-systemd, since this
+    # target's systemd build was never verified to expose that NSS
+    # module correctly and "files" alone is already sufficient for every
+    # local lookup (passwd/group/shadow) this system does.
+    nsswitch_dst = os.path.join(target, "etc", "nsswitch.conf")
+    if not os.path.exists(nsswitch_dst):
+        shutil.copy2("/etc/nsswitch.conf", nsswitch_dst)
+        shutil.copystat("/etc/nsswitch.conf", nsswitch_dst)
+        log("/etc/nsswitch.conf copied from host.", color=GREEN)
+
+    # fontconfig + at least one real font: never installed anywhere in this
+    # pipeline -- neither /etc/fonts nor /usr/share/fonts existed at all.
+    # Root-caused via a real boot, once the desktop finally rendered for the
+    # first time this whole session (libLLVM + dbus user units + Qt plugin
+    # paths + libdecor all fixed): every piece of text on screen rendered as
+    # a tofu box (missing-glyph placeholder), and ksplashqml/plasma-setup
+    # both logged "Fontconfig error: Cannot load default config file: No
+    # such file: (null)" -- fontconfig had zero knowledge of any installed
+    # font at all, so nothing could substitute a real glyph for anything.
+    # fonts-dejavu-core is the traditional baseline Linux default (small,
+    # broad Latin coverage) -- copied here rather than left to a later KDE-
+    # specific phase since this is a generic, distro-wide gap.
+    fonts_etc_dst = os.path.join(target, "etc", "fonts")
+    if not os.path.exists(fonts_etc_dst):
+        fonts_etc_src = "/etc/fonts"
+        if os.path.isdir(fonts_etc_src):
+            shutil.copytree(fonts_etc_src, fonts_etc_dst)
+            log("/etc/fonts (fontconfig config) copied from host.", color=GREEN)
+    fonts_share_dst = os.path.join(target, "usr", "share", "fonts")
+    if not os.path.exists(fonts_share_dst):
+        fonts_share_src = "/usr/share/fonts"
+        if os.path.isdir(fonts_share_src):
+            shutil.copytree(fonts_share_src, fonts_share_dst)
+            log("/usr/share/fonts (DejaVu) copied from host.", color=GREEN)
 
     _record_component_manifest(target, "glibc-runtime", target, before_snapshot,
                                 pkg_version=_host_glibc_version())
@@ -4001,7 +4614,15 @@ def phase_systemd(target):
     extract(tarball, bd)
     meson_install(bd, prefix,
         extra_args=[
-            "-Dpam=disabled",
+            # PAM was disabled here originally; flipped to enabled after a
+            # real boot showed plasmalogin's greeter session failing PAM
+            # auth with "PAM unable to dlopen(pam_systemd.so): ... No such
+            # file or directory" -- systemd never built or installed its
+            # own pam_systemd.so with PAM support off, even though
+            # libpam0g-dev is already present in this image for kwallet-pam
+            # (see Dockerfile.build). No new build dependency needed, just
+            # this flag.
+            "-Dpam=enabled",
             "-Daudit=disabled",
             "-Dselinux=disabled",
             "-Dlibcryptsetup=disabled",
@@ -4106,6 +4727,103 @@ def phase_systemd(target):
         err("No libarchive.so* found in the build container -- is libarchive-dev "
             "installed? (see Dockerfile.build)")
     log(f"Copied {archive_copied} libarchive runtime file(s) into target rootfs", color=GREEN)
+
+    # PAM module search path mismatch: this rootfs's actual PAM implementation
+    # looks for modules in /usr/lib/security (confirmed by pam_cap.so and
+    # pam_lastlog2.so already living there, installed by other packages) --
+    # NOT the Debian-multiarch path (/usr/lib/x86_64-linux-gnu/security/)
+    # systemd's own meson build defaults pam_systemd.so/pam_systemd_loadkey.so
+    # into. Root-caused via a real boot: plasmalogin's greeter session failed
+    # PAM auth with "PAM unable to dlopen(pam_systemd.so): ... No such file
+    # or directory" even though the .so genuinely existed on disk, just at
+    # the wrong path for what this PAM actually searches.
+    pam_multiarch_dir = os.path.join(arch_libdir, "security")
+    pam_legacy_dir = os.path.join(target, "usr", "lib", "security")
+    ensure(pam_legacy_dir)
+    for pam_mod in ("pam_systemd.so", "pam_systemd_loadkey.so"):
+        src_path = os.path.join(pam_multiarch_dir, pam_mod)
+        dst_path = os.path.join(pam_legacy_dir, pam_mod)
+        if os.path.exists(src_path) and not os.path.lexists(dst_path):
+            symlink(f"/usr/lib/x86_64-linux-gnu/security/{pam_mod}", dst_path)
+    log("pam_systemd.so linked into /usr/lib/security (where this PAM actually looks).",
+        color=GREEN)
+
+    # Base libpam-modules: never built from source or apt-get-installed
+    # anywhere in this pipeline -- same gap as pam_systemd above, just for
+    # the standard modules (pam_unix, pam_nologin, etc.) every PAM service
+    # file on this system references. Root-caused via a real boot:
+    # plasmalogin-greeter's PAM auth failed with "authenticate: Module is
+    # unknown" for pam_nologin.so specifically, and a full audit of every
+    # PAM config PLM ships (/usr/lib/pam.d/{plasmalogin,plasmalogin-
+    # autologin,plasmalogin-greeter,systemd-user,systemd-run0}) showed none
+    # of their non-optional (no "-" prefix) modules existed anywhere in the
+    # target -- only pam_cap.so/pam_lastlog2.so (from other packages) and
+    # now pam_systemd.so lived in /usr/lib/security at all. These come from
+    # the host container's own libpam-modules/libpam-modules-bin packages
+    # (confirmed present via `dpkg -L` on the container), same "host
+    # runtime, documented" category as kmod/ldconfig/dbus-daemon: copied
+    # whole rather than built, since this project doesn't differentiate on
+    # base PAM module implementations. pam_selinux_permit.so is deliberately
+    # excluded -- confirmed via a real `dpkg -L libpam-modules` on the
+    # container that Debian doesn't ship it at all (it's a separate
+    # Fedora/authselect-only module name; Debian's nearest equivalent,
+    # pam_sepermit.so, isn't referenced by any of PLM's shipped configs).
+    # pam_selinux.so, by contrast, genuinely IS part of Debian's
+    # libpam-modules and IS required (non-optional) in plasmalogin-
+    # autologin's session stack -- included below. With SELinux actually
+    # disabled at the kernel level, pam_selinux.so's own
+    # is_selinux_enabled() check makes it a safe no-op at runtime; it just
+    # needs to dlopen successfully.
+    host_pam_multiarch_dir = "/usr/lib/x86_64-linux-gnu/security"
+    base_pam_mods = ("pam_unix.so", "pam_nologin.so", "pam_env.so",
+                      "pam_permit.so", "pam_deny.so", "pam_keyinit.so",
+                      "pam_loginuid.so", "pam_namespace.so", "pam_umask.so",
+                      "pam_selinux.so")
+    base_pam_copied = 0
+    for pam_mod in base_pam_mods:
+        src_path = os.path.join(host_pam_multiarch_dir, pam_mod)
+        dst_path = os.path.join(pam_legacy_dir, pam_mod)
+        if os.path.exists(src_path) and not os.path.lexists(dst_path):
+            shutil.copy2(src_path, dst_path)
+            shutil.copystat(src_path, dst_path)
+            base_pam_copied += 1
+    log(f"{base_pam_copied} base libpam-modules module(s) copied from host into "
+        "/usr/lib/security.", color=GREEN)
+
+    # /etc/security/*: same missing-base-config gap as nsswitch.conf (see
+    # _bootstrap_glibc_runtime), just for the whole directory instead of
+    # one file. Originally only pam_env.conf was copied here (confirmed
+    # via "pam_env(plasmalogin-greeter:setcred): Unable to open env file"),
+    # but a later boot -- once the account-phase fix above let autologin's
+    # session actually try to open -- showed the real blocker was
+    # "pam_namespace(plasmalogin-autologin:session): Error opening config
+    # file /etc/security/namespace.conf" from "session required
+    # pam_namespace.so" (a hard requirement, unlike optional/"-"-prefixed
+    # lines), which aborted pam_open_session() entirely ("Cannot make/
+    # remove an entry for the specified session" / "Session started
+    # false"). Copying the whole directory wholesale rather than
+    # cherry-picking namespace.conf too avoids a third round of "missing
+    # /etc/security/X" discoveries for limits.conf/access.conf/time.conf/
+    # etc, none of which this pipeline has any reason to differ from the
+    # host's own defaults for.
+    host_security_dir = "/etc/security"
+    target_security_dir = os.path.join(target, "etc", "security")
+    ensure(target_security_dir)
+    security_copied = 0
+    for root, dirs, files in os.walk(host_security_dir):
+        rel = os.path.relpath(root, host_security_dir)
+        dst_root = target_security_dir if rel == "." else os.path.join(target_security_dir, rel)
+        ensure(dst_root)
+        for name in files:
+            src_path = os.path.join(root, name)
+            dst_path = os.path.join(dst_root, name)
+            if os.path.exists(dst_path) or os.path.islink(dst_path):
+                continue
+            shutil.copy2(src_path, dst_path)
+            shutil.copystat(src_path, dst_path)
+            security_copied += 1
+    log(f"{security_copied} /etc/security file(s) copied from host.", color=GREEN)
+
     # Vendored host runtime libs systemd links against (liblz4/libkmod/
     # libacl/libseccomp/libarchive) -- their own small package, since they're
     # copied in after systemd's own meson_install() already closed out
@@ -4130,6 +4848,27 @@ def phase_systemd_configure(target):
     graphical    = "/lib/systemd/system/graphical.target"
     if not os.path.lexists(default_link):
         symlink(graphical, default_link)
+
+    # Mask systemd-firstboot.service: this is the real root cause behind a
+    # boot hang confirmed directly via `systemctl list-jobs` on a live test
+    # -- of 16 queued jobs (graphical.target, sysinit.target, dbus.socket,
+    # plasmalogin.service, all of it), every single one sat in "start
+    # waiting" except systemd-firstboot.service itself, stuck in "start
+    # running" forever. It's the standard first-boot setup wizard (machine
+    # -id, hostname, locale, root password prompts) and it hangs waiting
+    # for interactive TTY input that never arrives in this quiet/headless
+    # live-boot environment -- with so much of the transaction ordered
+    # behind it, one stuck unit silently blocks the entire boot. A live ISO
+    # has no real "first boot" to configure (every boot IS one), so this
+    # unit should never run here at all. This also retroactively explains
+    # the "zero trace in a real boot log" mystery documented above for
+    # every previous plasmalogin-adjacent standalone-unit attempt: nothing
+    # ordered anywhere near sysinit.target could ever have run either,
+    # regardless of how it was ordered, because the whole queue was jammed
+    # behind firstboot the entire time.
+    firstboot_mask = os.path.join(target, "etc", "systemd", "system", "systemd-firstboot.service")
+    if not os.path.lexists(firstboot_mask):
+        symlink("/dev/null", firstboot_mask)
 
     # Explicit GPU module load, independent of udev's own module auto-loading.
     # This systemd build compiles with -Dkmod=enabled (meson confirms
@@ -4699,6 +5438,62 @@ def phase_live_initramfs(target):
             # already-running background process by then. Sleeping *inside*
             # the chroot instead uses the target rootfs's own persistent
             # /bin/sh + sleep, unaffected by the old root's deletion.
+            #
+            # Second, independent background scanner dedicated to catching
+            # kwin_wayland's environment while it's actually alive: the
+            # main diagnostic below waits 40s before doing anything, but
+            # kwin_wayland's crash-loop (confirmed via dmesg timestamps
+            # across many boots) happens around 16-20s kernel-uptime and
+            # exhausts its restart attempts well before 40s -- the main
+            # diagnostic's own environ-scan consistently found nothing
+            # (kfound=0) because by the time it looked, every instance was
+            # long gone. This one starts almost immediately and polls
+            # continuously so it can catch a live instance regardless of
+            # exactly when the crash-loop happens.
+            chroot /mnt/rootfs /bin/sh -c '\
+                sleep 2; \
+                kfound=0; \
+                round=0; \
+                while [ "$round" -lt 300 ]; do \
+                    round=$((round + 1)); \
+                    for p in /proc/[0-9]*; do \
+                        if [ -r "$p/comm" ]; then \
+                            c=$(cat "$p/comm" 2>/dev/null); \
+                            if [ "$c" = "kwin_wayland" ] && [ "$kfound" = "0" ]; then \
+                                { \
+                                    echo "=== EARLY KWIN_WAYLAND ENVIRON (round $round) ==="; \
+                                    cat "$p/environ" 2>/dev/null | tr "\\0" "\\n"; \
+                                } >>/dev/ttyS0; \
+                                kfound=1; \
+                            fi; \
+                        fi; \
+                    done; \
+                    if [ "$kfound" = "1" ]; then break; fi; \
+                    sleep 0.1; \
+                done; \
+                echo "=== EARLY SCAN DONE: kfound=$kfound ===" >>/dev/ttyS0' &
+
+            # One-off diagnostic scanner: polls for /tmp/kwin-gdb-out.log
+            # (written by a temporary gdb-wrapped kwin_wayland, installed
+            # as a live-rootfs-only surgical patch -- not a permanent
+            # fix) and dumps it to ttyS0 the moment it's complete.
+            chroot /mnt/rootfs /bin/sh -c '\
+                found=0; \
+                round=0; \
+                while [ "$round" -lt 300 ]; do \
+                    round=$((round + 1)); \
+                    if [ -f /tmp/kwin-gdb-out.log ] && grep -q "===WRAPPER EXIT" /tmp/kwin-gdb-out.log 2>/dev/null; then \
+                        { \
+                            echo "=== KWIN GDB BACKTRACE ==="; \
+                            cat /tmp/kwin-gdb-out.log; \
+                        } >>/dev/ttyS0; \
+                        found=1; \
+                        break; \
+                    fi; \
+                    sleep 0.2; \
+                done; \
+                echo "=== GDB SCAN DONE: found=$found ===" >>/dev/ttyS0' &
+
             chroot /mnt/rootfs /bin/sh -c '\
                 sleep 40; \
                 echo "=== SMECHOS DELAYED DIAG ===" >/dev/ttyS0; \
@@ -4707,6 +5502,22 @@ def phase_live_initramfs(target):
                 journalctl -u plasmalogin --no-pager -n 100 >>/dev/ttyS0 2>&1; \
                 echo "=== KWIN JOURNAL ===" >>/dev/ttyS0; \
                 journalctl _COMM=kwin_wayland_wr --no-pager -n 100 >>/dev/ttyS0 2>&1; \
+                echo "=== KWIN_WAYLAND ENVIRON ===" >>/dev/ttyS0; \
+                kfound=0; \
+                for round in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do \
+                    for p in /proc/[0-9]*; do \
+                        if [ -r "$p/comm" ]; then \
+                            c=$(cat "$p/comm" 2>/dev/null); \
+                            if [ "$c" = "kwin_wayland" ]; then \
+                                cat "$p/environ" 2>/dev/null | tr "\\0" "\\n" >>/dev/ttyS0; \
+                                kfound=1; \
+                            fi; \
+                        fi; \
+                    done; \
+                    if [ "$kfound" = "1" ]; then break; fi; \
+                    sleep 0.1; \
+                done; \
+                echo "kfound=$kfound" >>/dev/ttyS0; \
                 echo "=== COREDUMP ===" >>/dev/ttyS0; \
                 coredumpctl info --no-pager -1 >>/dev/ttyS0 2>&1; \
                 echo "=== CMDLINE ===" >>/dev/ttyS0; \
@@ -4720,11 +5531,32 @@ def phase_live_initramfs(target):
                 su smech -c "DISPLAY=:0 WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/1000 timeout 5 calamares" >>/dev/ttyS0 2>&1; \
                 echo "calamares direct exit: $?" >>/dev/ttyS0; \
                 echo "=== DBUS STATUS ===" >>/dev/ttyS0; \
-                systemctl status dbus-daemon.service dbus-broker.service --no-pager -l >>/dev/ttyS0 2>&1; \
+                systemctl status dbus.service dbus.socket --no-pager -l >>/dev/ttyS0 2>&1; \
                 echo "=== DBUS JOURNAL ===" >>/dev/ttyS0; \
-                journalctl -u dbus-daemon -u dbus-broker --no-pager -n 60 >>/dev/ttyS0 2>&1; \
+                journalctl -u dbus --no-pager -n 60 >>/dev/ttyS0 2>&1; \
                 echo "=== DRI ===" >>/dev/ttyS0; \
                 ls -la /dev/dri >>/dev/ttyS0 2>&1; \
+                echo "=== DMESG (drm/gpu/console/fb) ===" >>/dev/ttyS0; \
+                dmesg | grep -iE "drm|virtio.gpu|fbcon|simpledrm|[[:space:]]fb[0-9]|vt[0-9]|switching to|console" >>/dev/ttyS0 2>&1; \
+                echo "=== DMESG (last 200 lines, full) ===" >>/dev/ttyS0; \
+                dmesg | tail -200 >>/dev/ttyS0 2>&1; \
+                echo "=== SYSTEMCTL LIST-JOBS ===" >>/dev/ttyS0; \
+                systemctl list-jobs --no-pager >>/dev/ttyS0 2>&1; \
+                echo "=== UDEV TRIGGER STATUS ===" >>/dev/ttyS0; \
+                systemctl status systemd-udev-trigger.service --no-pager -l >>/dev/ttyS0 2>&1; \
+                echo "=== UDEV SETTLE STATUS ===" >>/dev/ttyS0; \
+                systemctl status systemd-udev-settle.service --no-pager -l >>/dev/ttyS0 2>&1; \
+                echo "=== UDEVADM QUEUE ===" >>/dev/ttyS0; \
+                timeout 3 udevadm control --ping >>/dev/ttyS0 2>&1; echo "ping exit: $?" >>/dev/ttyS0; \
+                echo "=== PS AUX (glob-based -- ps itself is not present) ===" >>/dev/ttyS0; \
+                for p in /proc/[0-9]*; do \
+                    if [ -r "$p/comm" ]; then \
+                        pid=${p#/proc/}; \
+                        comm=$(cat "$p/comm" 2>/dev/null); \
+                        cmdline=$(tr "\\0" " " < "$p/cmdline" 2>/dev/null); \
+                        echo "$pid  $comm  $cmdline" >>/dev/ttyS0; \
+                    fi; \
+                done; \
                 echo "=== DIAG END ===" >>/dev/ttyS0' &
 
             exec switch_root /mnt/rootfs /sbin/init
@@ -5155,6 +5987,37 @@ def phase_iso_live_smechos(target):
 
     live_dir = os.path.join(work, "live")
     ensure(live_dir)
+
+    # Regenerate the dynamic linker cache against the final target rootfs.
+    # Confirmed directly (real boot + a custom kwin_wayland wrapper that
+    # captured its stdout/stderr): /etc/ld.so.cache never existed in this
+    # rootfs at all -- ldconfig's own binary gets copied into the target for
+    # later runtime use (see phase_bootstrap_userland_glibc) but was never
+    # actually RUN against the target during the build. Without the cache,
+    # dlopen() of a bare soname (e.g. Mesa's DRI loader pulling in
+    # libLLVM.so.18.1) can't find anything outside the dynamic linker's tiny
+    # hardcoded default search list, even when the file is physically
+    # present under /usr/lib/x86_64-linux-gnu -- that path is only ever
+    # searched via the cache. This is what silently broke Mesa's GBM/DRI
+    # loading and, by extension, kwin_wayland, independent of whatever
+    # library files are actually present. Do this last, right before
+    # packing, so it reflects every phase's final library set regardless of
+    # which phases actually ran (stamp-skipped or not).
+    ld_so_conf = os.path.join(target, "etc", "ld.so.conf")
+    ld_so_conf_d = os.path.join(target, "etc", "ld.so.conf.d")
+    ensure(ld_so_conf_d)
+    if not os.path.exists(ld_so_conf):
+        with open(ld_so_conf, "w") as f:
+            f.write("include /etc/ld.so.conf.d/*.conf\n")
+    multiarch_conf = os.path.join(ld_so_conf_d, "x86_64-linux-gnu.conf")
+    if not os.path.exists(multiarch_conf):
+        with open(multiarch_conf, "w") as f:
+            f.write("/usr/local/lib\n/usr/lib/x86_64-linux-gnu\n/lib/x86_64-linux-gnu\n")
+    ldconfig = shutil.which("ldconfig")
+    if not ldconfig:
+        err("ldconfig not found on host -- needed to seed the target's ld.so.cache.")
+    run([ldconfig, "-r", target], check=False)
+    log("Regenerated ld.so.cache against the final target rootfs.", color=GREEN)
 
     # Squashfs the target root (exclude /boot — kernel lives separately in the ISO)
     log("Creating squashfs of root filesystem (this takes a while)...")

@@ -190,8 +190,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends libpam0g-dev &&
 RUN apt-get update && apt-get install -y --no-install-recommends libsensors-dev libpcap-dev && \
     rm -rf /var/lib/apt/lists/*
 
+# fontconfig-config + fonts-dejavu-core: already present transitively via
+# some other package's dependency chain (confirmed via dpkg -l), but listed
+# explicitly here too so that stays true on purpose rather than by accident
+# -- see the fontconfig copy step in _bootstrap_glibc_runtime for why this
+# matters (zero fonts anywhere in the target = every piece of UI text
+# renders as a tofu box, confirmed via a real boot).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    fontconfig-config fonts-dejavu-core && \
+    rm -rf /var/lib/apt/lists/*
+
 # kwin (the compositor) computes RandR mode timings via libxcvt.
 RUN apt-get update && apt-get install -y --no-install-recommends libxcvt-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# xrdb: kcminit's X resource-merge step forks it unconditionally (Xwayland
+# session or not) to apply Xresources settings -- confirmed via a real boot
+# + strace attached to the actual hung kcminit_startup process: it forks a
+# child that execve()s an EMPTY path (["", "-quiet", "-merge",
+# "/tmp/kcminit.XXXXXX"]), which fails ENOENT because nothing ever resolved
+# xrdb's location, since the binary was never installed anywhere in this
+# pipeline at all -- not even in this build container (confirmed via `which
+# xrdb` here before this line existed: not found; only a bash-completion
+# script referencing it was ever pulled in transitively). Provided by
+# x11-xserver-utils on Debian/Ubuntu.
+RUN apt-get update && apt-get install -y --no-install-recommends x11-xserver-utils && \
     rm -rf /var/lib/apt/lists/*
 
 # libdisplay-info's meson build reads vendor names from hwdata's pnp.ids
