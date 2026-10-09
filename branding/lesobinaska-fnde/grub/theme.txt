@@ -1,0 +1,56 @@
+# SmechOS "Lesobinaska" GRUB theme -- Founder Name Day Edition (RC4/FNDE).
+# Palette matches branding/lesobinaska-fnde/wallpaper.png: night sky, moon,
+# treeline. The dark translucent panel baked into background.png (roughly
+# x=422-1497, y=281-865 at 1920x1080) is where this theme's boot_menu box
+# sits.
+
+title-text: ""
+desktop-image: "background.png"
+desktop-color: "#0a0a1c"
+
+terminal-font: "Terminal Regular 16"
+
++ boot_menu {
+    left = 24%
+    top = 30%
+    width = 52%
+    height = 50%
+
+    item_font = "Terminal Regular 20"
+    item_color = "#f0f2fa"
+    selected_item_font = "Terminal Bold 20"
+    selected_item_color = "#fffaE6"
+
+    item_height = 42
+    item_padding = 10
+    item_spacing = 6
+    item_icon_space = 10
+
+    # Flat-color selection highlight, same reasoning as the Peritos theme --
+    # no pixmap assets exist for this theme.
+    scrollbar = false
+}
+
++ label {
+    left = 24%
+    top = 83%
+    width = 52%
+    height = 30
+    text = "Lesobinaska -- Founder Name Day Edition  ·  2026-11-30"
+    align = "center"
+    color = "#d8d2ff"
+    font = "Terminal Regular 16"
+}
+
++ progress_bar {
+    id = "__timeout__"
+    left = 24%
+    top = 89%
+    width = 52%
+    height = 18
+    fg_color = "#6b5ca8"
+    bg_color = "#0f0d1e"
+    border_color = "#d8d2ff"
+    text = "@TIMEOUT_NOTIFICATION_MIDDLE@"
+    font = "Terminal Regular 14"
+}

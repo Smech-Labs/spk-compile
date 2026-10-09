@@ -1,0 +1,18 @@
+#!/bin/sh
+# Not advertised anywhere -- no man page, no mention in --help listings.
+# Find it or don't.
+cat <<'EOF'
+
+ Lesobinaska -- SmechOS's first family built on its own toolchain.
+ Shipped 2026-11-30, the Founder Name Day Edition.
+
+ A real x86_64-smechos-linux-gnu cross-toolchain: binutils, a stage-1
+ gcc, glibc from source, a stage-2 gcc linked against it. Then LLVM,
+ because Mesa's radeonsi needed a target-side llvm-config. Then Clang,
+ because intel_clc needed Clang's C++ API too. Then RTTI, because
+ nothing in this chain was ever going to be one clean step.
+
+ Peritos proved SmechOS could exist. Lesobinaska proved it could stand
+ on its own.
+
+EOF

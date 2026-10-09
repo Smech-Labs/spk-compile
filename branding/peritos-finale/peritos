@@ -1,0 +1,13 @@
+#!/bin/sh
+# Not advertised anywhere -- no man page, no mention in --help listings.
+# Find it or don't.
+cat <<'EOF'
+
+ Peritos -- SmechOS's first family, est. 2026-06-25.
+
+ Three RCs, one cross-country toolchain argument about glibc,
+ and a GLIBC_2.42 cfgetispeed bug that took way too long to find.
+
+ Thanks for the ride. Lesobinaska's up next.
+
+EOF

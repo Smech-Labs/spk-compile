@@ -1,0 +1,67 @@
+# SmechOS "Peritos Finale" GRUB theme -- Founder Anniversary Edition only.
+# Palette matches branding/peritos-finale/wallpaper.png: vibrant purple ->
+# magenta -> orange gradient, gold/pink accent. The dark translucent panel
+# baked into background.png (roughly x=422-1497, y=302-886 at 1920x1080) is
+# where this theme's boot_menu box sits, so menu text stays legible against
+# the busy confetti background regardless of selection state.
+
+title-text: ""
+desktop-image: "background.png"
+desktop-color: "#2a1a42"
+
+terminal-font: "Unifont Regular 16"
+
++ boot_menu {
+    left = 24%
+    top = 32%
+    width = 52%
+    height = 50%
+
+    # Unifont Regular 16 is the ONLY font this ISO actually ships
+    # (confirmed via `strings isoroot/boot/grub/fonts/unicode.pf2`) --
+    # "Terminal Regular/Bold" was never a real font, which is why a real
+    # QEMU boot test showed a solid black menu box and tofu glyphs on the
+    # label/progress bar instead of legible text. No 20pt/bold variant
+    # exists to fall back to, so every font reference here is pinned to
+    # the one size that's actually present.
+    item_font = "Unifont Regular 16"
+    item_color = "#f0f2f7"
+    selected_item_font = "Unifont Regular 16"
+    selected_item_color = "#ffffff"
+
+    item_height = 42
+    item_padding = 10
+    item_spacing = 6
+    item_icon_space = 10
+
+    # Flat-color selection highlight -- no pixmap assets exist for this
+    # theme, so deliberately not referencing selected_item_pixmap_style or
+    # a scrollbar bitmap (either would silently fail to render, or in some
+    # GRUB builds refuse to parse, without the matching image files).
+    selected_item_color = "#ffffff"
+    scrollbar = false
+}
+
++ label {
+    left = 24%
+    top = 85%
+    width = 52%
+    height = 30
+    text = "Peritos -- Founder Anniversary Edition  ·  Est. 2026-06-25"
+    align = "center"
+    color = "#ffdd59"
+    font = "Unifont Regular 16"
+}
+
++ progress_bar {
+    id = "__timeout__"
+    left = 24%
+    top = 90%
+    width = 52%
+    height = 18
+    fg_color = "#ff7640"
+    bg_color = "#1a1226"
+    border_color = "#ffdd59"
+    text = "@TIMEOUT_NOTIFICATION_MIDDLE@"
+    font = "Unifont Regular 16"
+}
