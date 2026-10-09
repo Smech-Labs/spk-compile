@@ -36,11 +36,42 @@ import os
 import sys
 import subprocess
 import shutil
+import socket
 import urllib.request
 import time
 import textwrap
 import struct
 import zlib
+
+# ── Network: force IPv4 ──────────────────────────────────────────────────────
+#
+# This build host's outbound IPv6 is a routing black hole, not a slow or
+# flaky path -- confirmed directly with a raw TCP connect to a real
+# destination address (gitlab.freedesktop.org's Fastly-fronted IPv6
+# endpoint): zero response of any kind (no RST, no ICMP unreachable) for as
+# long as the attempt is left running. `curl` against the exact same URL
+# succeeds in under a second because it races IPv4 and IPv6 concurrently
+# (Happy Eyeballs) and just uses whichever answers first; Python's
+# socket.create_connection() has no such racing -- it walks getaddrinfo()'s
+# result list in order and tries each sequentially, and getaddrinfo()
+# returns IPv6 addresses first by default. With 4+ dead IPv6 addresses each
+# eating a full per-attempt timeout before ever reaching a working IPv4
+# one, a single download() call was measured taking minutes just to fall
+# through to an address that actually works.
+#
+# This is every download in the whole pipeline (download() uses
+# urllib.request under the hood) on every real build, not a one-off fluke --
+# worth fixing at the root rather than re-discovering it per phase. Monkey-
+# patching socket.getaddrinfo() to drop AF_INET6 results is the standard,
+# well-known fix for exactly this class of problem. Global and permanent
+# for this process's lifetime (not scoped to download() specifically): there
+# is no legitimate need for outbound IPv6 anywhere else in this script
+# either, and forcing IPv4 is a harmless, strictly-safer default even on a
+# host where IPv6 happens to work fine.
+_real_getaddrinfo = socket.getaddrinfo
+def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    return _real_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+socket.getaddrinfo = _ipv4_only_getaddrinfo
 
 # ── Version & constants ───────────────────────────────────────────────────────
 
@@ -55,6 +86,102 @@ DEFAULT_TARGET = "/mnt/smechos_build_root"
 # extracted/built).
 BUILD_TMP  = "/mnt/smechos_build_tmp"
 STAMP_DIR  = "/mnt/spk-compile-sources/.stamps"  # persistent across reboots
+
+# Debian/Ubuntu's multiarch library path convention, inherited from the
+# build container (not upstream glibc's own default, and not what Fedora
+# or Arch use). Declared as a contract in SABI.md section 2, not just an
+# accident of the container image -- reference this constant rather than
+# hardcoding the literal string, so a future triplet change (e.g. once the
+# RC4 cross-toolchain/custom-glibc work lands) is a one-line change here
+# instead of a many-site hunt.
+MULTIARCH_TRIPLET = "x86_64-linux-gnu"
+
+# RC4/FNDE cross-toolchain (crosstool-ng 1.27.0, built 2026-09-30/10-01):
+# binutils 2.43.1 + GCC 14.2.0 + glibc 2.41, all compiled from checksum-
+# verified upstream source (see SABI.md section 1). Verified end-to-end via
+# verify_toolchain.sh -- compiles and correctly *runs* C/C++, static and
+# dynamic. Wired into phase_kernel, phase_wayland, phase_wayland_protocols,
+# and phase_libinput so far (opt-in per meson_install() call via
+# cross_file=); Mesa/Qt6/KDE conversion is still in progress, same
+# incremental approach.
+#
+# Same reproducibility problem as CROSS_LLVM_WORKDIR below, same fix:
+# env-var override with a locally-convenient default, so this machine
+# keeps working unchanged with no env vars set, but that default is not a
+# claim this path is universal. Building this toolchain from scratch takes
+# hours (crosstool-ng compiling its own binutils/gcc/glibc); downloading
+# the published release and pointing SMECHOS_TOOLCHAIN_PREFIX at the
+# unpacked directory skips that entirely -- see
+# https://github.com/Smech-Labs/smechos-toolchain/releases/latest.
+CROSS_TRIPLET = "x86_64-smechos-linux-gnu"
+CROSS_TOOLCHAIN_PREFIX = os.environ.get(
+    "SMECHOS_TOOLCHAIN_PREFIX",
+    f"/home/smech/x-tools/{CROSS_TRIPLET}")
+CROSS_TOOLCHAIN_BIN = f"{CROSS_TOOLCHAIN_PREFIX}/bin"
+
+# Mesa's radeonsi driver has a hard build-time dependency on a target-machine
+# llvm-config (dependency('llvm', method:'config-tool'), required whenever
+# gallium-drivers includes radeonsi) -- under cross-compilation Meson looks
+# for the HOST(=target) machine's LLVM, which the container's own apt-installed
+# llvm-20-dev never provides for CROSS_TRIPLET. Built separately via CMake
+# (not part of the crosstool-ng toolchain itself): LLVM+Clang 20.1.2 -- the
+# exact version Dockerfile.build installs natively, confirmed by reading its
+# own comment, so Mesa's existing LLVM-major-version-gated patches
+# (_patch_mesa_clc_clang_api etc.) stay correctly gated -- cross-compiled
+# with version-matched native llvm-tblgen/clang-tblgen, scoped to X86+AMDGPU
+# targets only (radeonsi/amdgpu's actual needs, not all-targets).
+#
+# Clang is included (not just bare LLVM) because Mesa's intel_clc tool --
+# needed for Anv/Iris's internal shaders (with_intel_clc = with_intel_vk or
+# with_gallium_iris, true in our config regardless of ray-tracing) -- uses
+# Clang's C++ AST/driver API directly (clc_helpers.cpp), not just libLLVM.
+# An earlier attempt to sidestep this by disabling intel-rt was based on a
+# wrong assumption: -Dintel-rt only gates ray-tracing specifically, NOT
+# intel_clc itself, which Anv/Iris have always needed (see Dockerfile.build's
+# libclang-20-dev install, already required for the native build). With
+# Clang cross-built, intel-rt is left at its default (auto/enabled) in
+# phase_mesa -- no reason left to disable it.
+# Task #72: these three constants used to be flat hardcoded strings
+# pointing into one person's home directory -- real, working, on this one
+# machine, and silently broken for literally anyone else who cloned this
+# repo. bootstrap_cross_llvm.py (repo root) is the actual, verified recipe
+# that produces these two workdirs from a clean checkout -- its own
+# SMECHOS_LLVM_WORKDIR / SMECHOS_SPIRV_TRANSLATOR_WORKDIR env vars are the
+# same ones read here, so running that script once and exporting those two
+# vars is what makes this reproducible elsewhere. The literal defaults
+# below are kept only so this machine keeps working unchanged with no env
+# vars set -- they are not a claim that this path is universal.
+CROSS_LLVM_WORKDIR = os.environ.get(
+    "SMECHOS_LLVM_WORKDIR",
+    "/home/smech/smechos-work/llvm-cross-workdir")
+CROSS_LLVM_BUILD = f"{CROSS_LLVM_WORKDIR}/cross-build"
+CROSS_LLVM_CONFIG = f"{CROSS_LLVM_BUILD}/bin/llvm-config"
+
+# Mesa's with_clc path (true whenever Anv/Iris are enabled, see the
+# intel_clc comment above) also hard-requires SPIRV-LLVM-Translator
+# version-locked to CROSS_LLVM_CONFIG's exact LLVM version -- cross-built
+# separately against the CROSS_LLVM_BUILD CMake package (LLVMConfig.cmake),
+# not part of the LLVM/Clang build itself. Its .pc file lives at the build
+# dir root, not a standard lib/pkgconfig path.
+CROSS_SPIRV_TRANSLATOR_WORKDIR = os.environ.get(
+    "SMECHOS_SPIRV_TRANSLATOR_WORKDIR",
+    "/home/smech/smechos-work/spirv-translator-workdir")
+CROSS_SPIRV_TRANSLATOR_BUILD = f"{CROSS_SPIRV_TRANSLATOR_WORKDIR}/build"
+
+# Bug #29: clc_helpers.cpp also directly #includes real Clang C++ API
+# headers (<clang/Config/config.h> first, confirmed real others follow
+# once this one resolves), not just LLVM's. Meson's own LLVM dependency
+# resolution (CMake package / llvm-config based) only knows about LLVM's
+# include dirs -- confirmed by reading the actual compile command, which
+# already carries two correct -isystem flags for llvm/include and
+# cross-build/include with no equivalent for clang anywhere. Clang is a
+# sibling LLVM monorepo subproject with its own, separate include tree;
+# nothing auto-discovers it. Two dirs needed: the real source headers
+# (CROSS_CLANG_SRC_INCLUDE) and the CMake-generated ones like config.h
+# itself, which land under CROSS_LLVM_BUILD/tools/clang/include (same
+# cross-build tree as LLVM's own generated headers, just a clang/
+# subdirectory of it -- not a separate constant).
+CROSS_CLANG_SRC_INCLUDE = f"{CROSS_LLVM_WORKDIR}/llvm-project-llvmorg-20.1.2/clang/include"
 
 # Source versions
 LINUX_VER      = "6.12.16"
@@ -89,11 +216,139 @@ LINUX_FIRMWARE_VER = "20260910"
 # the one Debian/Ubuntu's grub-common package ships pre-built.
 UNIFONT_VER = "17.0.05"
 WAYLAND_PROTO_VER = "1.48"
-WAYLAND_VER       = "1.24.0"
+# RC4/FNDE: pinned to match the container's own native wayland-scanner
+# (apt-installed, 1.25.0) exactly -- wayland's own meson.build (src/
+# meson.build) requires an external native wayland-scanner whose version
+# equals meson.project_version() whenever meson.is_cross_build() is true
+# (`dependency('wayland-scanner', native: true, version: meson.project_
+# version())`), rather than falling back to the one it just built as part
+# of this same build (that branch is only taken when NOT cross-building).
+# Since phase_wayland always passes a cross-file (even though this
+# migration is same-arch, not a real cross-arch build -- see
+# _meson_cross_file()'s docstring), is_cross_build() reads true regardless,
+# so the pinned version here must track whatever native wayland-scanner the
+# build container actually ships, confirmed directly: building 1.24.0
+# against the container's real 1.25.0 wayland-scanner failed configure with
+# "Found 1.25.0 but need: '1.24.0'".
+WAYLAND_VER       = "1.25.0"
 LIBINPUT_VER      = "1.28.0"
 LIBEIS_VER        = "1.4.0"
 BITCOIN_VER       = "28.0"
 SGMINER_VER       = "5.6.1"
+
+# RC4/FNDE cross-sysroot dependency chain (phase_cross_deps): every one of
+# these was verified cross-building cleanly for CROSS_TRIPLET in an isolated
+# workdir before being folded in here -- versions pinned to exactly what was
+# verified, not "whatever's latest" at integration time.
+ZLIB_VER        = "1.3.1"
+ZSTD_VER        = "1.5.6"
+FREETYPE_VER    = "2.13.2"
+EXPAT_VER       = "2.6.2"
+FONTCONFIG_VER  = "2.15.0"
+LIBFFI_VER      = "3.4.6"
+XORGPROTO_VER   = "2024.1"
+XTRANS_VER      = "1.5.0"
+LIBXAU_VER      = "1.0.11"
+LIBXDMCP_VER    = "1.1.5"
+XCBPROTO_VER    = "1.17.0"
+LIBXCB_VER      = "1.17.0"
+LIBXKBCOMMON_VER = "1.7.0"
+LIBX11_VER      = "1.8.10"
+XCBUTIL_VER     = "0.4.1"
+XCBUTILIMAGE_VER = "0.4.1"
+XCBUTILKEYSYMS_VER = "0.4.1"
+XCBUTILRENDERUTIL_VER = "0.3.10"
+XCBUTILWM_VER   = "0.4.2"
+XCBUTILCURSOR_VER = "0.1.5"
+LIBXEXT_VER     = "1.3.6"
+LIBXFIXES_VER   = "6.0.1"
+LIBXSHMFENCE_VER = "1.3.2"
+LIBXXF86VM_VER  = "1.1.5"
+LIBXRENDER_VER  = "0.9.11"
+LIBXRANDR_VER   = "1.5.4"
+LIBPCIACCESS_VER = "0.17"
+LIBDRM_VER      = "2.4.123"
+SPIRV_HEADERS_TAG = "vulkan-sdk-1.3.296.0"
+SPIRV_TOOLS_TAG   = "vulkan-sdk-1.3.296.0"
+ELFUTILS_VER    = "0.192"
+HARFBUZZ_VER    = "9.0.0"
+DBUS_VER        = "1.16.2"
+# libxkbcommon's -Denable-x11=true registry feature hard-requires
+# libxml-2.0 at build time (missed on the first integration pass --
+# surfaced as a real meson ERROR, not a silent feature downgrade).
+LIBXML2_VER     = "2.13.5"
+# phase_libinput's meson.build hard-requires both of these (no meson option
+# to disable either) -- missed on the first integration pass for the same
+# reason libxml2 was: not discovered until the actual consumer (libinput)
+# was built for real against this chain, surfaced as a real meson ERROR
+# ("Dependency 'mtdev' not found"), not a silent feature downgrade.
+MTDEV_VER       = "1.1.6"
+LIBEVDEV_VER    = "1.13.5"
+# systemd's own meson setup explicitly passes -Dkmod=enabled (a real,
+# intentional requirement -- module loading is core systemd functionality,
+# not an optional nice-to-have like the util-linux features disabled
+# above), but libkmod wasn't in this chain at all -- confirmed real: meson
+# failed outright with "Dependency 'libkmod' not found".
+KMOD_VER        = "34"
+# systemd's src/shared/acl-util.c hard-#includes <acl/libacl.h> -- real,
+# load-bearing functionality (systemd-logind grants per-seat device ACLs
+# on things like /dev/dri/* and /dev/input/* for the active login
+# session; that's the actual mechanism that lets a desktop user touch
+# their own GPU/input devices without being in a "video"/"input" group),
+# not an optional extra like the compression backends above. Confirmed
+# real: systemd's build failed outright with "acl/libacl.h: No such file
+# or directory". libacl itself depends on libattr (extended attributes).
+ATTR_VER        = "2.5.2"
+ACL_VER         = "2.3.2"
+# systemd's src/shared/seccomp-util.h hard-#includes <seccomp.h> for real
+# unit sandboxing functionality (SystemCallFilter= and similar directives
+# in .service files) -- same "load-bearing, not optional" judgment as
+# acl above, not a throwaway extra like the compression backends.
+SECCOMP_VER     = "2.6.0"
+# Bug #22: src/shared/pam-util.h hard-#includes <security/pam_appl.h>.
+# Not optional -- PLM's entire login flow (the _pam_ensure_line /
+# _pam_make_optional patching done earlier this session) only means
+# anything if a real libpam actually exists to read those service files.
+# Modern glibc never shipped PAM itself; it's always been its own
+# project (linux-pam/linux-pam), same category of gap as libcrypt but
+# load-bearing rather than optional -- cross-built, not disabled.
+LINUX_PAM_VER   = "1.7.3"
+# Bug #23, found building linux-pam above: its own meson.build does
+# `dependency('libcrypt','libxcrypt', required: false)` then, if that
+# fails, falls through to `cc.find_library('crypt')` with no required:
+# false guard at all -- an unconditional hard failure, confirmed via
+# direct read of meson.build:250-252. Unlike systemd's libcrypt-util.c
+# (bug #21, genuinely dlopen'd/optional there), pam_unix's own password
+# hashing needs a real crypt() to link against -- there's no feature
+# flag to disable this one. Cross-built properly, same as PAM itself.
+LIBXCRYPT_VER   = "4.5.2"
+# First real bug of phase_qt_deps's first ever test run: qtbase's own
+# QRegularExpression (src/corelib/text/qregularexpression.cpp) is a thin
+# wrapper around pcre2 directly -- not an optional backend the way
+# systemd's journalctl -g pattern search was (pcre2 was correctly
+# disabled there, bug #24 -- that's a different call site with a real
+# feature flag and a real fallback; this one has neither). Qt has no
+# alternative regex engine to fall back to, and QRegularExpression is
+# used pervasively across Qt/KDE (validators, syntax highlighting, URL
+# parsing) -- load-bearing, cross-built, not disabled, same judgment as
+# PAM/libxcrypt above.
+PCRE2_VER       = "10.49"
+# phase_qt_deps's second bug: qbackingstorerhisupport.cpp's QT_CONFIG(vulkan)
+# guard let it through (FEATURE_vulkan resolved ON, found via the
+# container during cross-configure), but qrhi_platform.h's own, stricter
+# guard on QRhiVulkanInitParams -- `QT_CONFIG(vulkan) &&
+# __has_include(<vulkan/vulkan.h>)` -- correctly didn't declare it,
+# because genuinely no vulkan.h/libvulkan.so exist anywhere in {target}.
+# Not a Qt bug (this dual-guard is intentional upstream, just never
+# exercised when vulkan.h is actually present like it normally would be).
+# Mesa already cross-built real Vulkan ICD drivers earlier in this chain
+# (-Dvulkan-drivers=amd,intel,virtio, phase_mesa) -- the loader itself was
+# just never cross-built to go with them. Load-bearing, not optional:
+# disabling Vulkan in Qt would leave Mesa's own driver investment
+# unreachable from any Qt/QtQuick app. Cross-built, matching the tags both
+# projects actually use (vulkan-sdk-X.Y.Z, verified real via the GitHub
+# tags API before writing this, not a guessed version string).
+VULKAN_SDK_TAG  = "vulkan-sdk-1.4.363.0"
 
 # Download URLs (KDE URLs are resolved dynamically at build time — see _resolve_kde_versions)
 LINUX_URL    = f"https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-{LINUX_VER}.tar.xz"
@@ -109,6 +364,53 @@ WAYLAND_URL       = f"https://gitlab.freedesktop.org/wayland/wayland/-/archive/{
 LIBINPUT_URL      = f"https://gitlab.freedesktop.org/libinput/libinput/-/archive/{LIBINPUT_VER}/libinput-{LIBINPUT_VER}.tar.gz"
 LIBEIS_URL        = f"https://gitlab.freedesktop.org/libeis/libeis/-/releases/{LIBEIS_VER}/downloads/libeis-{LIBEIS_VER}.tar.xz"
 OPENRC_URL   = f"https://github.com/OpenRC/openrc/archive/refs/tags/{OPENRC_VER}.tar.gz"
+
+# phase_cross_deps package URLs, in the exact dependency order they build.
+ZLIB_URL        = f"https://zlib.net/fossils/zlib-{ZLIB_VER}.tar.gz"
+ZSTD_URL        = f"https://github.com/facebook/zstd/releases/download/v{ZSTD_VER}/zstd-{ZSTD_VER}.tar.gz"
+FREETYPE_URL    = f"https://download.savannah.gnu.org/releases/freetype/freetype-{FREETYPE_VER}.tar.xz"
+EXPAT_URL       = f"https://github.com/libexpat/libexpat/releases/download/R_{EXPAT_VER.replace('.', '_')}/expat-{EXPAT_VER}.tar.xz"
+FONTCONFIG_URL  = f"https://www.freedesktop.org/software/fontconfig/release/fontconfig-{FONTCONFIG_VER}.tar.xz"
+LIBFFI_URL      = f"https://github.com/libffi/libffi/releases/download/v{LIBFFI_VER}/libffi-{LIBFFI_VER}.tar.gz"
+XORGPROTO_URL   = f"https://www.x.org/releases/individual/proto/xorgproto-{XORGPROTO_VER}.tar.xz"
+XTRANS_URL      = f"https://www.x.org/releases/individual/lib/xtrans-{XTRANS_VER}.tar.xz"
+LIBXAU_URL      = f"https://www.x.org/releases/individual/lib/libXau-{LIBXAU_VER}.tar.xz"
+LIBXDMCP_URL    = f"https://www.x.org/releases/individual/lib/libXdmcp-{LIBXDMCP_VER}.tar.xz"
+XCBPROTO_URL    = f"https://xcb.freedesktop.org/dist/xcb-proto-{XCBPROTO_VER}.tar.xz"
+LIBXCB_URL      = f"https://xcb.freedesktop.org/dist/libxcb-{LIBXCB_VER}.tar.xz"
+LIBXKBCOMMON_URL = f"https://xkbcommon.org/download/libxkbcommon-{LIBXKBCOMMON_VER}.tar.xz"
+LIBX11_URL      = f"https://www.x.org/releases/individual/lib/libX11-{LIBX11_VER}.tar.xz"
+XCBUTIL_URL     = f"https://xcb.freedesktop.org/dist/xcb-util-{XCBUTIL_VER}.tar.xz"
+XCBUTILIMAGE_URL = f"https://xcb.freedesktop.org/dist/xcb-util-image-{XCBUTILIMAGE_VER}.tar.xz"
+XCBUTILKEYSYMS_URL = f"https://xcb.freedesktop.org/dist/xcb-util-keysyms-{XCBUTILKEYSYMS_VER}.tar.xz"
+XCBUTILRENDERUTIL_URL = f"https://xcb.freedesktop.org/dist/xcb-util-renderutil-{XCBUTILRENDERUTIL_VER}.tar.xz"
+XCBUTILWM_URL   = f"https://xcb.freedesktop.org/dist/xcb-util-wm-{XCBUTILWM_VER}.tar.xz"
+XCBUTILCURSOR_URL = f"https://xcb.freedesktop.org/dist/xcb-util-cursor-{XCBUTILCURSOR_VER}.tar.xz"
+LIBXEXT_URL     = f"https://www.x.org/releases/individual/lib/libXext-{LIBXEXT_VER}.tar.xz"
+LIBXFIXES_URL   = f"https://www.x.org/releases/individual/lib/libXfixes-{LIBXFIXES_VER}.tar.xz"
+LIBXSHMFENCE_URL = f"https://www.x.org/releases/individual/lib/libxshmfence-{LIBXSHMFENCE_VER}.tar.xz"
+LIBXXF86VM_URL  = f"https://www.x.org/releases/individual/lib/libXxf86vm-{LIBXXF86VM_VER}.tar.xz"
+LIBXRENDER_URL  = f"https://www.x.org/releases/individual/lib/libXrender-{LIBXRENDER_VER}.tar.xz"
+LIBXRANDR_URL   = f"https://www.x.org/releases/individual/lib/libXrandr-{LIBXRANDR_VER}.tar.xz"
+LIBPCIACCESS_URL = f"https://xorg.freedesktop.org/archive/individual/lib/libpciaccess-{LIBPCIACCESS_VER}.tar.gz"
+LIBDRM_URL      = f"https://dri.freedesktop.org/libdrm/libdrm-{LIBDRM_VER}.tar.xz"
+SPIRV_HEADERS_URL = f"https://github.com/KhronosGroup/SPIRV-Headers/archive/refs/tags/{SPIRV_HEADERS_TAG}.tar.gz"
+SPIRV_TOOLS_URL   = f"https://github.com/KhronosGroup/SPIRV-Tools/archive/refs/tags/{SPIRV_TOOLS_TAG}.tar.gz"
+ELFUTILS_URL    = f"https://sourceware.org/elfutils/ftp/{ELFUTILS_VER}/elfutils-{ELFUTILS_VER}.tar.bz2"
+HARFBUZZ_URL    = f"https://github.com/harfbuzz/harfbuzz/releases/download/{HARFBUZZ_VER}/harfbuzz-{HARFBUZZ_VER}.tar.xz"
+DBUS_URL        = f"https://dbus.freedesktop.org/releases/dbus/dbus-{DBUS_VER}.tar.xz"
+LIBXML2_URL     = f"https://download.gnome.org/sources/libxml2/2.13/libxml2-{LIBXML2_VER}.tar.xz"
+MTDEV_URL       = f"https://bitmath.se/org/code/mtdev/mtdev-{MTDEV_VER}.tar.bz2"
+LIBEVDEV_URL    = f"https://www.freedesktop.org/software/libevdev/libevdev-{LIBEVDEV_VER}.tar.xz"
+KMOD_URL        = f"https://www.kernel.org/pub/linux/utils/kernel/kmod/kmod-{KMOD_VER}.tar.xz"
+ATTR_URL        = f"https://download.savannah.nongnu.org/releases/attr/attr-{ATTR_VER}.tar.gz"
+ACL_URL         = f"https://download.savannah.nongnu.org/releases/acl/acl-{ACL_VER}.tar.xz"
+SECCOMP_URL     = f"https://github.com/seccomp/libseccomp/releases/download/v{SECCOMP_VER}/libseccomp-{SECCOMP_VER}.tar.gz"
+LINUX_PAM_URL   = f"https://github.com/linux-pam/linux-pam/releases/download/v{LINUX_PAM_VER}/Linux-PAM-{LINUX_PAM_VER}.tar.xz"
+LIBXCRYPT_URL   = f"https://github.com/besser82/libxcrypt/releases/download/v{LIBXCRYPT_VER}/libxcrypt-{LIBXCRYPT_VER}.tar.xz"
+PCRE2_URL       = f"https://github.com/PCRE2Project/pcre2/releases/download/pcre2-{PCRE2_VER}/pcre2-{PCRE2_VER}.tar.gz"
+VULKAN_HEADERS_URL = f"https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/{VULKAN_SDK_TAG}.tar.gz"
+VULKAN_LOADER_URL  = f"https://github.com/KhronosGroup/Vulkan-Loader/archive/refs/tags/{VULKAN_SDK_TAG}.tar.gz"
 BITCOIN_URL  = f"https://bitcoincore.org/bin/bitcoin-core-{BITCOIN_VER}/bitcoin-{BITCOIN_VER}.tar.gz"
 SGMINER_URL  = f"https://github.com/sgminer-dev/sgminer/archive/refs/tags/{SGMINER_VER}.tar.gz"
 # Plasma + KF6 URLs are set by _resolve_kde_versions() before each build
@@ -304,24 +606,40 @@ def download(url, dest, retries=5, backoff=(5, 15, 30, 60, 60)):
     # lands on a different mirror next time (no URL rewriting needed), so
     # retry with backoff rather than failing the whole multi-hour build
     # over one bad mirror pick.
+    #
+    # urlretrieve has NO timeout of its own -- socket.getdefaulttimeout()
+    # is None unless set globally, so a connection that stalls (SYN sent,
+    # nothing ever comes back -- a routing black hole, not an active
+    # refusal) hangs this call indefinitely, never reaching the retry/
+    # backoff logic below at all. Confirmed directly: a real tarball URL
+    # (gitlab.freedesktop.org, wayland-1.24.0.tar.gz) that `curl` fetched
+    # in under a second instead hung this function for 5+ minutes with no
+    # error, no retry log line, nothing -- not a slow mirror, a genuine
+    # unbounded hang. A per-attempt socket timeout is what makes the
+    # existing retry loop actually reachable.
     part = dest + ".part"
     last_err = None
-    for attempt in range(1, retries + 1):
-        try:
-            log(f"Downloading {os.path.basename(dest)}"
-                + (f" (attempt {attempt}/{retries})" if attempt > 1 else "") + "...")
-            urllib.request.urlretrieve(url, part)
-            os.rename(part, dest)
-            log(f"Saved: {dest}", color=GREEN)
-            return
-        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
-            last_err = e
-            if os.path.exists(part):
-                os.remove(part)
-            if attempt < retries:
-                delay = backoff[min(attempt - 1, len(backoff) - 1)]
-                log(f"Download failed ({e}) -- retrying in {delay}s", color=YELLOW)
-                time.sleep(delay)
+    _prev_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(60)
+    try:
+        for attempt in range(1, retries + 1):
+            try:
+                log(f"Downloading {os.path.basename(dest)}"
+                    + (f" (attempt {attempt}/{retries})" if attempt > 1 else "") + "...")
+                urllib.request.urlretrieve(url, part)
+                os.rename(part, dest)
+                log(f"Saved: {dest}", color=GREEN)
+                return
+            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+                last_err = e
+                if os.path.exists(part):
+                    os.remove(part)
+                if attempt < retries:
+                    delay = backoff[min(attempt - 1, len(backoff) - 1)]
+                    log(f"Download failed ({e}) -- retrying in {delay}s", color=YELLOW)
+                    time.sleep(delay)
+    finally:
+        socket.setdefaulttimeout(_prev_timeout)
     err(f"download failed after {retries} attempts: {url} ({last_err})")
 
 def extract(tarball, dest, strip=1):
@@ -357,7 +675,7 @@ def build_env(target):
         f"{prefix}/lib/x86_64-linux-musl/pkgconfig:"
         f"{prefix}/lib/pkgconfig:"
         f"{prefix}/share/pkgconfig:"
-        "/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig:/usr/lib/pkgconfig"
+        f"/usr/lib/{MULTIARCH_TRIPLET}/pkgconfig:/usr/share/pkgconfig:/usr/lib/pkgconfig"
     )
     e["CFLAGS"]          = f"-I{prefix}/include"
     e["CXXFLAGS"]        = f"-I{prefix}/include"
@@ -383,8 +701,8 @@ def build_env_glibc(target):
     prefix = f"{target}/usr"
     e["PATH"] = f"{prefix}/bin:{e.get('PATH', '/usr/local/bin:/usr/bin:/bin')}"
     e["PKG_CONFIG_PATH"] = (
-        f"{prefix}/lib/x86_64-linux-gnu/pkgconfig:{prefix}/lib/pkgconfig:{prefix}/share/pkgconfig:"
-        "/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig:/usr/lib/pkgconfig"
+        f"{prefix}/lib/{MULTIARCH_TRIPLET}/pkgconfig:{prefix}/lib/pkgconfig:{prefix}/share/pkgconfig:"
+        f"/usr/lib/{MULTIARCH_TRIPLET}/pkgconfig:/usr/share/pkgconfig:/usr/lib/pkgconfig"
     )
     # -std=gnu17 (C only, NOT CXXFLAGS): GCC 14 switched its DEFAULT C
     # dialect from gnu17 to gnu23, and that switch (not C89-vs-C99 age) is
@@ -400,8 +718,8 @@ def build_env_glibc(target):
     # loosening CXXFLAGS the same way would undermine that.
     e["CFLAGS"]   = f"-I{prefix}/include -std=gnu17 -fpermissive"
     e["CXXFLAGS"] = f"-I{prefix}/include"
-    e["LDFLAGS"]  = f"-L{prefix}/lib/x86_64-linux-gnu -L{prefix}/lib"
-    e["LD_LIBRARY_PATH"] = f"{prefix}/lib/x86_64-linux-gnu:{prefix}/lib"
+    e["LDFLAGS"]  = f"-L{prefix}/lib/{MULTIARCH_TRIPLET} -L{prefix}/lib"
+    e["LD_LIBRARY_PATH"] = f"{prefix}/lib/{MULTIARCH_TRIPLET}:{prefix}/lib"
     # kdoctools' meinproc6 (a real, target-installed but container-executed
     # binary, invoked un-chrooted like everything else in this build) looks
     # up its own DTD/catalog files via QStandardPaths::GenericDataLocation,
@@ -425,6 +743,104 @@ _USE_GLIBC = False
 def active_env(target):
     """Return the right build environment for the currently running profile."""
     return build_env_glibc(target) if _USE_GLIBC else build_env(target)
+
+def _meson_cross_file():
+    """Generate (once per process) a Meson cross-file pointing at the
+    RC4/FNDE cross-toolchain (CROSS_TRIPLET), for meson-based phases
+    (Wayland, wayland-protocols, libinput, and eventually Mesa/Qt6/KDE).
+
+    No exe_wrapper is declared: host and target are both x86_64/Linux (this
+    migration crosses glibc/toolchain identity, not CPU architecture), so
+    binaries built against the new glibc run directly on this host --
+    already verified end-to-end by verify_toolchain.sh. Meson's own
+    compiler sanity-check during `meson setup` therefore succeeds without
+    needing qemu-user or any other execution wrapper, unlike a real
+    cross-arch (e.g. ARM-on-x86) cross-file.
+
+    llvm-config is pinned to CROSS_LLVM_CONFIG (the separately cross-built
+    LLVM 20.1.2 -- see its own comment near CROSS_TRIPLET) so Mesa's
+    dependency('llvm', method:'config-tool') resolves against the target's
+    own LLVM under cross-compilation instead of the container's native one.
+    Harmless for every other meson-based phase (Wayland, libinput, systemd),
+    none of which query an llvm-config dependency at all.
+    """
+    path = os.path.join(BUILD_TMP, "meson-cross-smechos.ini")
+    if os.path.exists(path):
+        return path
+    ensure(BUILD_TMP)
+    with open(path, "w") as f:
+        f.write(textwrap.dedent(f"""\
+            [binaries]
+            c = '{CROSS_TRIPLET}-gcc'
+            cpp = '{CROSS_TRIPLET}-g++'
+            ar = '{CROSS_TRIPLET}-ar'
+            strip = '{CROSS_TRIPLET}-strip'
+            ranlib = '{CROSS_TRIPLET}-ranlib'
+            pkg-config = 'pkg-config'
+            llvm-config = '{CROSS_LLVM_CONFIG}'
+
+            [host_machine]
+            system = 'linux'
+            cpu_family = 'x86_64'
+            cpu = 'x86_64'
+            endian = 'little'
+        """))
+    return path
+
+def _cmake_cross_toolchain_file():
+    """Generate (once per process) a CMake toolchain file pointing at the
+    RC4/FNDE cross-toolchain (CROSS_TRIPLET), for CMake-based cross phases
+    (Qt6's cross pass; same content phase_cross_deps's SPIRV-Tools step
+    writes inline).
+
+    Same same-arch reasoning as _meson_cross_file()'s own docstring: this
+    migration crosses glibc/toolchain identity, not CPU architecture, so
+    CMAKE_CROSSCOMPILING_EMULATOR is explicitly blanked rather than left to
+    CMake's default QEMU-wrapper guess -- cross-built binaries (including
+    build-time codegen tools CMake needs to run mid-build) execute directly
+    on this host.
+    """
+    path = os.path.join(BUILD_TMP, "cmake-cross-smechos.cmake")
+    if os.path.exists(path):
+        return path
+    ensure(BUILD_TMP)
+    with open(path, "w") as f:
+        f.write(textwrap.dedent(f"""\
+            set(CMAKE_SYSTEM_NAME Linux)
+            set(CMAKE_SYSTEM_PROCESSOR x86_64)
+            set(CMAKE_C_COMPILER   {CROSS_TOOLCHAIN_BIN}/{CROSS_TRIPLET}-gcc)
+            set(CMAKE_CXX_COMPILER {CROSS_TOOLCHAIN_BIN}/{CROSS_TRIPLET}-g++)
+            set(CMAKE_AR           {CROSS_TOOLCHAIN_BIN}/{CROSS_TRIPLET}-ar)
+            set(CMAKE_RANLIB       {CROSS_TOOLCHAIN_BIN}/{CROSS_TRIPLET}-ranlib)
+            set(CMAKE_STRIP        {CROSS_TOOLCHAIN_BIN}/{CROSS_TRIPLET}-strip)
+            set(CMAKE_CROSSCOMPILING_EMULATOR "")
+        """))
+    return path
+
+def _qt6_cross_env(target):
+    """Environment for phase_qt_deps's cross pass: resolve every dependency
+    (freetype, fontconfig, libxcb, libxkbcommon, wayland, Mesa's libEGL/
+    libGL, ...) ONLY against what phase_cross_deps/phase_wayland/phase_mesa
+    already installed into {target}/usr -- same restrictive PKG_CONFIG_LIBDIR
+    + PKG_CONFIG_SYSROOT_DIR pattern as _cross_deps_env() (see that
+    function's own comment for why PKG_CONFIG_SYSROOT_DIR is safe here):
+    every .pc file in this restricted lookup set was configured with
+    --prefix=/usr, the real deploy path, same convention cross-deps used
+    throughout, so sysroot-prefixing them back to {target}/usr resolves
+    correctly with no container-vs-target ambiguity.
+    """
+    prefix = f"{target}/usr"
+    e = dict(os.environ)
+    e["PATH"] = f"{CROSS_TOOLCHAIN_BIN}:{e.get('PATH', '/usr/local/bin:/usr/bin:/bin')}"
+    e["PKG_CONFIG_LIBDIR"] = f"{prefix}/lib/pkgconfig:{prefix}/share/pkgconfig"
+    e["PKG_CONFIG_PATH"] = ""
+    e["PKG_CONFIG_SYSROOT_DIR"] = target
+    e["CFLAGS"]   = f"-I{prefix}/include"
+    e["CXXFLAGS"] = f"-I{prefix}/include"
+    e["LDFLAGS"]  = f"-L{prefix}/lib -Wl,-rpath-link,{prefix}/lib"
+    ensure(BUILD_TMP)
+    e["TMPDIR"] = BUILD_TMP
+    return e
 
 def build_env_bitcoin(target):
     """build_env_glibc() with a conservative CPU baseline for old LGA775
@@ -569,7 +985,7 @@ def cmake_install(src_dir, prefix, extra_args=None, env=None, build_dir=None, pk
     # These tools have no RUNPATH so LD_LIBRARY_PATH must be set in the env.
     build_env = dict(env) if env else dict(os.environ)
     prefix_lib = f"{prefix}/lib"
-    prefix_arch_lib = f"{prefix}/lib/x86_64-linux-gnu"
+    prefix_arch_lib = f"{prefix}/lib/{MULTIARCH_TRIPLET}"
     # LD_LIBRARY_PATH: runtime loader path for build-time tools (no RUNPATH)
     existing_ldp = build_env.get("LD_LIBRARY_PATH", "")
     if prefix_lib not in existing_ldp:
@@ -594,7 +1010,7 @@ def cmake_install(src_dir, prefix, extra_args=None, env=None, build_dir=None, pk
          "-DCMAKE_SKIP_BUILD_RPATH=FALSE",
          "-DCMAKE_BUILD_WITH_INSTALL_RPATH=FALSE",
          "-DCMAKE_INSTALL_RPATH_USE_LINK_PATH=FALSE",
-         "-DCMAKE_INSTALL_RPATH=/usr/lib/x86_64-linux-gnu",
+         f"-DCMAKE_INSTALL_RPATH=/usr/lib/{MULTIARCH_TRIPLET}",
          # This rootfs's Qt6 was built with QT_INSTALL_PLUGINS=/usr/plugins
          # (non-multiarch), not the lib/<triplet>/plugins path KDE's ECM/
          # KDECMakeSettings computes by default from CMAKE_INSTALL_LIBDIR.
@@ -622,7 +1038,13 @@ def cmake_install(src_dir, prefix, extra_args=None, env=None, build_dir=None, pk
     if pkg_name:
         _record_component_manifest(target_root, pkg_name, target_root, _before, pkg_version)
 
-def meson_install(src_dir, prefix, extra_args=None, env=None, build_dir=None, pkg_name=None, pkg_version="0.0.0"):
+def meson_install(src_dir, prefix, extra_args=None, env=None, build_dir=None, pkg_name=None, pkg_version="0.0.0", cross_file=None):
+    """cross_file: optional path to a Meson cross-file (see
+    _meson_cross_file()) -- when given, the package is built with the
+    RC4/FNDE cross-toolchain instead of natively. Opt-in per call so every
+    existing meson_install() caller keeps building natively until it's
+    deliberately converted, same incremental approach as phase_kernel/
+    phase_wayland/phase_wayland_protocols/phase_libinput."""
     bd = build_dir or os.path.join(src_dir, "build")
     if os.path.exists(bd):
         shutil.rmtree(bd)
@@ -661,6 +1083,11 @@ def meson_install(src_dir, prefix, extra_args=None, env=None, build_dir=None, pk
     host_env["PATH"] = (
         os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
         + f":{prefix}/bin:{prefix}/libexec")
+    if cross_file:
+        # Cross-compiler bin dir goes first so the bare names in the
+        # cross-file's [binaries] section (e.g. x86_64-smechos-linux-gnu-gcc)
+        # resolve to the RC4/FNDE toolchain, not any same-named host tool.
+        host_env["PATH"] = f"{CROSS_TOOLCHAIN_BIN}:{host_env['PATH']}"
     # PKG_CONFIG_PATH (unlike PATH/LD_LIBRARY_PATH above) is safe to point at
     # the target prefix too: pkg-config only ever reads .pc text files, it
     # never dynamically links against what they describe, so this can't
@@ -671,11 +1098,18 @@ def meson_install(src_dir, prefix, extra_args=None, env=None, build_dir=None, pk
     # apt-installed/host location, so later meson-based packages that
     # legitimately depend on them (e.g. xkbcommon's wayland support needing
     # wayland-client/wayland-protocols) can't find them without this.
+    # RC4/FNDE: this used to unconditionally overwrite PKG_CONFIG_PATH from
+    # bare os.environ, discarding anything the caller had already set on
+    # `env` (e.g. phase_mesa adding CROSS_SPIRV_TRANSLATOR_BUILD, whose .pc
+    # file lives outside any target/container search path at all) -- the
+    # caller's own setup was silently thrown away before meson ever ran.
+    # Prepend onto whatever the caller actually passed in instead.
+    _caller_pkg_config_path = host_env.get(
+        "PKG_CONFIG_PATH",
+        f"/usr/lib/{MULTIARCH_TRIPLET}/pkgconfig:/usr/share/pkgconfig:/usr/lib/pkgconfig")
     host_env["PKG_CONFIG_PATH"] = (
-        f"{prefix}/lib/x86_64-linux-gnu/pkgconfig:{prefix}/lib/pkgconfig:{prefix}/share/pkgconfig:"
-        + os.environ.get(
-            "PKG_CONFIG_PATH",
-            "/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig:/usr/lib/pkgconfig"))
+        f"{prefix}/lib/{MULTIARCH_TRIPLET}/pkgconfig:{prefix}/lib/pkgconfig:{prefix}/share/pkgconfig:"
+        + _caller_pkg_config_path)
     # PKG_CONFIG_SYSROOT_DIR was tried here and reverted: it globally
     # prepends the sysroot to *every* resolved .pc file's absolute paths,
     # which fixed Qt6's own .pc files (their Cflags/-I bakes in the real
@@ -689,9 +1123,10 @@ def meson_install(src_dir, prefix, extra_args=None, env=None, build_dir=None, pk
     # _fix_target_pc_prefix() instead, which corrects the target's own .pc
     # files in place (Qt6 specifically, so far) rather than reinterpreting
     # every .pc file's paths at lookup time.
+    cross_setup_args = [f"--cross-file={cross_file}"] if cross_file else []
     run(["meson", "setup", bd, src_dir,
          "--prefix=/usr", "--buildtype=release",
-         ] + (extra_args or []), env=host_env)
+         ] + cross_setup_args + (extra_args or []), env=host_env)
     run(["ninja", "-C", bd, "-j", nproc()], env=host_env)
     install_env = dict(host_env)
     install_env["DESTDIR"] = target_root
@@ -959,7 +1394,21 @@ def phase_inittab(target):
     log("inittab written.", color=GREEN)
 
 def phase_kernel(target):
-    log_phase("kernel", f"Compile Linux {LINUX_VER}")
+    """Compile Linux using the RC4/FNDE cross-toolchain (CROSS_TRIPLET), not
+    the build container's native host gcc.
+
+    The kernel build system is the right first phase to convert for exactly
+    the reason Linux's own Makefile already solves the host/target split
+    cleanly: HOSTCC (build-time-only tools like scripts/mod/modpost,
+    Kconfig) stays the container's native compiler automatically whenever
+    it's left unset, while CC for the actual kernel/module objects becomes
+    $(CROSS_COMPILE)gcc once CROSS_COMPILE is set -- no manual host/target
+    tool separation needed here, unlike Qt6/KDE's moc/uic/rcc problem.
+    ARCH=x86_64 is technically already the uname-detected default since the
+    cross triplet targets the same architecture, but is passed explicitly
+    for clarity and to match standard cross-compile convention.
+    """
+    log_phase("kernel", f"Compile Linux {LINUX_VER} (cross: {CROSS_TRIPLET})")
     before_snapshot = _snapshot_tree(target)
     src     = sources(target)
     tarball = os.path.join(src, f"linux-{LINUX_VER}.tar.xz")
@@ -970,8 +1419,10 @@ def phase_kernel(target):
     env = dict(os.environ)
     env.pop("CC", None)
     env.pop("CXX", None)
+    env["PATH"] = f"{CROSS_TOOLCHAIN_BIN}:{env.get('PATH', '/usr/local/bin:/usr/bin:/bin')}"
+    cross_args = ["ARCH=x86_64", f"CROSS_COMPILE={CROSS_TRIPLET}-"]
 
-    run(["make", "defconfig"], cwd=bd, env=env)
+    run(["make", *cross_args, "defconfig"], cwd=bd, env=env)
 
     # Append sovereign feature set
     #
@@ -1020,10 +1471,30 @@ def phase_kernel(target):
         CONFIG_SQUASHFS_COMPILE_DECOMP_SINGLE=y
         CONFIG_SQUASHFS_XATTR=y
         CONFIG_OVERLAY_FS=y
+        # Confirmed missing entirely from x86_64_defconfig's baseline (not
+        # even a module) via a real kexec test tonight: a kernel built
+        # without this cannot see an NVMe drive at all -- the primary/only
+        # storage controller on nearly every x86_64 machine sold since
+        # ~2016. =y (built-in), not =m, for the same reason SQUASHFS/
+        # OVERLAY_FS above are =y: this has to be available before any
+        # modprobe-capable userspace exists to find the root disk at all.
+        CONFIG_BLK_DEV_NVME=y
+        # Also absent from baseline, found in the same audit: without this,
+        # Calamares' own "erase disk and install, with encryption" option
+        # produces a system that can't boot afterward -- same class of bug
+        # as the NVMe gap, just hit via a different common install path
+        # instead of different common hardware. =y for the identical
+        # built-in-before-modprobe-exists reason.
+        CONFIG_DM_CRYPT=y
+        # Many distro installers (Calamares's LVM option included) default
+        # new volumes to thin-provisioned pools; without this an LVM+thin
+        # root is exactly as unbootable as the unencrypted-NVMe and
+        # encrypted-root cases above.
+        CONFIG_DM_THIN_PROVISIONING=y
     """)
     with open(os.path.join(bd, ".config"), "a") as f:
         f.write(extras)
-    run(["make", "olddefconfig"], cwd=bd, env=env)
+    run(["make", *cross_args, "olddefconfig"], cwd=bd, env=env)
     # -Wno-error=unused-but-set-variable: a harmless set-but-unused local in
     # drivers/gpu/drm/amd/amdgpu/amdgpu_gart.c, not a real bug, disabled
     # rather than patching source. This warning has existed forever in GCC,
@@ -1040,21 +1511,26 @@ def phase_kernel(target):
     # unconditionally passing this flag was breaking the very first
     # compile (scripts/mod/empty.o) with "no option
     # '-Wunterminated-string-initialization'" -- gate it on the real
-    # detected version instead of assuming GCC 16.
-    gcc_ver_str = subprocess.run(["gcc", "-dumpversion"], capture_output=True,
-                                  text=True, check=True).stdout.strip()
+    # detected version instead of assuming GCC 16. Checked against the
+    # actual target compiler (CROSS_TRIPLET-gcc) now, not the container's
+    # native `gcc` -- the kernel's own object files are what this flag
+    # gates, and those are now built by the cross-compiler, currently
+    # GCC 14.2.0, same conclusion (< 15) as the prior native-gcc check.
+    gcc_ver_str = subprocess.run([f"{CROSS_TRIPLET}-gcc", "-dumpversion"],
+                                  capture_output=True, text=True, check=True,
+                                  env=env).stdout.strip()
     gcc_major = int(gcc_ver_str.split(".")[0])
     kcflags = "-Wno-error=unused-but-set-variable"
     if gcc_major >= 15:
         kcflags += " -Wno-error=unterminated-string-initialization"
-    run(["make", "-j", nproc(), f"KCFLAGS={kcflags}", "bzImage", "modules"],
+    run(["make", *cross_args, "-j", nproc(), f"KCFLAGS={kcflags}", "bzImage", "modules"],
         cwd=bd, env=env)
 
     boot = os.path.join(target, "boot")
     ensure(boot)
     shutil.copy2(os.path.join(bd, "arch/x86/boot/bzImage"),
                  os.path.join(boot, "vmlinuz"))
-    run(["make", f"INSTALL_MOD_PATH={target}", "modules_install"],
+    run(["make", *cross_args, f"INSTALL_MOD_PATH={target}", "modules_install"],
         cwd=bd, env=env, sudo=(os.geteuid() != 0))
     # modules_install alone does not reliably regenerate modules.dep/modules.alias
     # for a cross-target INSTALL_MOD_PATH -- confirmed missing entirely on a real
@@ -1238,10 +1714,34 @@ def phase_grub(target):
     _record_component_manifest(target, "grub", target, before_snapshot, pkg_version=GRUB_VER)
 
 def phase_qt_deps(target):
-    log_phase("qt-deps", f"Compile Qt6 {QT6_VER} modules")
+    """Cross-compile Qt6 against CROSS_TRIPLET, into the real target sysroot
+    phase_cross_deps/phase_wayland/phase_mesa already populated.
+
+    Unlike Mesa/Wayland/libinput (plain CC/CXX-swap via a cross-file is
+    enough -- same architecture, no real host/target split needed), Qt's own
+    CMake build system treats any CMAKE_TOOLCHAIN_FILE/CMAKE_SYSTEM_NAME as
+    a genuine cross-compile and hard-requires QT_HOST_PATH: a *separately,
+    natively* built Qt install providing that module's own build-time tools
+    (moc/rcc/qmltyperegistrar/syncqt/qsb/...), which get invoked mid-build
+    to generate code for the target build. Confirmed directly in isolated
+    verification -- there is no way around this for Qt6 specifically.
+
+    So each module here gets two passes: a native "host" build/install into
+    a shared host_install prefix (accumulates across modules, same as the
+    isolated verification's shared $HOSTINSTALL -- qtshadertools' host pass
+    finds qtbase's host moc via CMAKE_PREFIX_PATH=host_install, and so on),
+    then a cross build/install via DESTDIR into the real target/usr, with
+    QT_HOST_PATH pointing back at that host_install.
+    """
+    log_phase("qt-deps", f"Compile Qt6 {QT6_VER} modules (cross: {CROSS_TRIPLET})")
     src = sources(target)
-    env = active_env(target)
     prefix = f"{target}/usr"
+    host_install = os.path.join(BUILD_TMP, "qt6-host-install")
+    toolchain_file = _cmake_cross_toolchain_file()
+    cross_env = _qt6_cross_env(target)
+    _host_bin = "/usr/local/bin:/usr/bin:/bin"
+    cmake_bin = shutil.which("cmake", path=_host_bin) or "cmake"
+    ninja_bin = shutil.which("ninja", path=_host_bin) or "ninja"
 
     # Wipe old Qt installation so build tools don't load stale sonames
     for pattern in [f"{prefix}/lib/libQt6*.so*",
@@ -1278,8 +1778,31 @@ def phase_qt_deps(target):
         # main-loop integration (GTK-interop event dispatching), which
         # nothing in the Plasma/Wayland stack this profile builds
         # actually needs.
+        # Bug #1 of phase_qt_deps's first real test: "unicode/ucol.h: No
+        # such file or directory" building qcollator.cpp. CMakeCache.txt
+        # showed exactly the same container-auto-detect pattern as every
+        # "found via the container's own pkg-config/find_package, unusable
+        # by the cross compiler" bug this whole project has hit --
+        # ICU_INCLUDE_DIR=/usr/include and libicui18n.so resolved to the
+        # Fedora host's own ICU 77.1, nothing cross-built or in {target} at
+        # all (confirmed: no libicu* anywhere under target). ICU only
+        # exists as a toggleable FEATURE_icu in the first place because Qt
+        # ships a real non-ICU collation fallback (QCollator falls back to
+        # the platform's own locale collation) -- not a hard requirement,
+        # and cross-building ICU from scratch (a large, slow dependency in
+        # its own right) isn't worth it for a profile that doesn't need
+        # ICU-specific locale behavior.
+        # Bug #4: "png.h: No such file or directory" building
+        # qpnghandler.cpp -- FEATURE_system_png resolved ON via the exact
+        # same container-auto-detect pattern as ICU above, but unlike ICU
+        # this one needs no cross-build at all: qtbase already ships its
+        # own 3rdparty/libpng copy (confirmed real, same tree already
+        # building BundledLibjpeg successfully for the jpeg handler a few
+        # hundred steps earlier in this same log). Force the bundled copy
+        # instead of the (absent) system one.
         ("qtbase",        ["-DFEATURE_testlib=ON", "-DFEATURE_fontconfig=ON",
-                            "-DFEATURE_xcb=ON", "-DFEATURE_glib=OFF"]),
+                            "-DFEATURE_xcb=ON", "-DFEATURE_glib=OFF",
+                            "-DFEATURE_icu=OFF", "-DFEATURE_system_png=OFF"]),
         ("qtshadertools", []),
         ("qtdeclarative", []),
         ("qtsvg",         []),
@@ -1296,20 +1819,72 @@ def phase_qt_deps(target):
         url     = f"{QT6_BASE_URL}/{fname}"
         tarball = os.path.join(src, fname)
         download(url, tarball)
-        bd = os.path.join(BUILD_TMP, f"qt6-{name}")
-        shutil.rmtree(bd, ignore_errors=True)
-        shutil.rmtree(os.path.join(BUILD_TMP, f"qt6-{name}-build"), ignore_errors=True)
-        extract(tarball, bd)
-        cmake_install(bd, prefix,
-            extra_args=[f"-DCMAKE_PREFIX_PATH={prefix}",
-                        "-DCMAKE_INSTALL_LIBDIR=lib",
-                        "-DBUILD_TESTING=OFF",
-                        "-DQT_BUILD_TESTS=OFF",
-                        "-DQT_BUILD_EXAMPLES=OFF"] + extra,
-            env=env,
-            build_dir=os.path.join(BUILD_TMP, f"qt6-{name}-build"),
-            pkg_name=f"qt6-{name}", pkg_version=QT6_VER)
-        log(f"Qt6/{name} done.", color=GREEN)
+        srcdir = os.path.join(BUILD_TMP, f"qt6-{name}")
+        shutil.rmtree(srcdir, ignore_errors=True)
+        extract(tarball, srcdir)
+
+        # --- native host pass: this module's own moc/rcc/etc, for QT_HOST_PATH ---
+        log(f"Qt6/{name}: native host pass", color=YELLOW)
+        host_bd = os.path.join(BUILD_TMP, f"qt6-{name}-host-build")
+        shutil.rmtree(host_bd, ignore_errors=True)
+        run([cmake_bin, "-S", srcdir, "-B", host_bd,
+             "-G", "Ninja",
+             f"-DCMAKE_INSTALL_PREFIX={host_install}",
+             f"-DCMAKE_PREFIX_PATH={host_install}",
+             "-DCMAKE_BUILD_TYPE=Release",
+             "-DCMAKE_INSTALL_LIBDIR=lib",
+             "-DBUILD_TESTING=OFF", "-DQT_BUILD_TESTS=OFF", "-DQT_BUILD_EXAMPLES=OFF"])
+        run([ninja_bin, "-C", host_bd, f"-j{nproc()}"])
+        run([ninja_bin, "-C", host_bd, "install"])
+        log(f"Qt6/{name} native host pass done.", color=GREEN)
+
+        # --- cross pass: the real build, linked against the cross sysroot ---
+        log(f"Qt6/{name}: cross pass", color=YELLOW)
+        cross_bd = os.path.join(BUILD_TMP, f"qt6-{name}-build")
+        shutil.rmtree(cross_bd, ignore_errors=True)
+        run([cmake_bin, "-S", srcdir, "-B", cross_bd,
+             "-G", "Ninja",
+             f"-DCMAKE_TOOLCHAIN_FILE={toolchain_file}",
+             f"-DQT_HOST_PATH={host_install}",
+             f"-DCMAKE_PREFIX_PATH={prefix};{target}",
+             f"-DCMAKE_EXE_LINKER_FLAGS=-Wl,-rpath-link,{prefix}/lib",
+             f"-DCMAKE_SHARED_LINKER_FLAGS=-Wl,-rpath-link,{prefix}/lib",
+             "-DCMAKE_BUILD_TYPE=Release",
+             "-DCMAKE_INSTALL_PREFIX=/usr",
+             "-DCMAKE_INSTALL_LIBDIR=lib",
+             "-DBUILD_TESTING=OFF", "-DQT_BUILD_TESTS=OFF", "-DQT_BUILD_EXAMPLES=OFF",
+             # Same KDE/ECM plugin+QML placement fix cmake_install() applies
+             # for every other CMake-based phase (see its own comment) --
+             # Qt6's own CMake build honors these two variable names
+             # directly, so it matters here too, not just for later KF6
+             # packages.
+             "-DKDE_INSTALL_PLUGINDIR=/usr/plugins",
+             "-DKDE_INSTALL_QMLDIR=/usr/qml",
+             # Bug found linking qtdeclarative's bin/qml, qmlscene, etc:
+             # real undefined references to __glDispatch* and a missing
+             # libGLdispatch.so.0 -- confirmed these came from
+             # /usr/lib64/libGLX.so and /usr/lib64/libOpenGL.so, the
+             # CONTAINER's own glvnd install, not anything in {target}.
+             # CMake's FindOpenGL module defaults to GLVND preference
+             # (the split libOpenGL.so/libGLX.so pair) whenever glvnd is
+             # present on the system doing the detecting -- it found the
+             # container's, not realizing the target has no glvnd at all
+             # (deliberately disabled for Mesa, bug #31: SmechOS only
+             # ships Mesa, nothing to dispatch between). The target's
+             # real cross-built libGL.so.1.2.0 is the classic single-
+             # library style, confirmed present and correctly linked
+             # (readelf-verified) back when the mesa chain finished.
+             # OpenGL_GL_PREFERENCE=LEGACY is CMake's own real variable
+             # for telling FindOpenGL to look for that instead.
+             "-DOpenGL_GL_PREFERENCE=LEGACY",
+             ] + extra, env=cross_env)
+        run([ninja_bin, "-C", cross_bd, f"-j{nproc()}"], env=cross_env)
+        before_snapshot = _snapshot_tree(target)
+        run([cmake_bin, "--install", cross_bd],
+            env=dict(cross_env, DESTDIR=target), sudo=(os.geteuid() != 0))
+        _record_component_manifest(target, f"qt6-{name}", target, before_snapshot,
+                                    pkg_version=QT6_VER)
+        log(f"Qt6/{name} cross pass done.", color=GREEN)
 
         if name == "qtbase":
             # FEATURE_xcb silently auto-disables (no build failure) if even one
@@ -1332,7 +1907,7 @@ def phase_qt_deps(target):
     # KF6 tools embed RUNPATH pointing to the arch-specific lib dir (e.g.
     # lib/x86_64-linux-gnu) but Qt is installed to lib/ directly.  Symlink
     # all Qt shared libs into the arch dir so dynamic linker finds them.
-    arch_libdir = f"{prefix}/lib/x86_64-linux-gnu"
+    arch_libdir = f"{prefix}/lib/{MULTIARCH_TRIPLET}"
     ensure(arch_libdir)
     for sopath in glob.glob(f"{prefix}/lib/libQt6*.so*"):
         dest = os.path.join(arch_libdir, os.path.basename(sopath))
@@ -1370,8 +1945,478 @@ def phase_cmake_bootstrap(target):
     result = subprocess.run(["/usr/local/bin/cmake", "--version"], capture_output=True, text=True)
     log(f"cmake bootstrap: {result.stdout.strip().splitlines()[0]}", color=GREEN)
 
+def _cross_deps_env(target):
+    """Environment for phase_cross_deps: every package in this phase builds
+    with CROSS_TRIPLET and must resolve its own deps ONLY against what this
+    same phase has already installed into {target}/usr -- PKG_CONFIG_LIBDIR
+    (restrictive: no host fallback at all), not PKG_CONFIG_PATH (additive,
+    falls through to the container). That additive fallback is exactly how
+    qtbase silently linked against the *container's* harfbuzz/libdbus
+    during isolated verification this session -- a real bug that stayed
+    invisible until a much later, unrelated link step finally required full
+    symbol resolution. This phase exists specifically so phase_mesa (and
+    eventually phase_qt_deps) have real cross-built versions of these
+    already sitting in {target}/usr by the time they run, instead of
+    falling through to the container the same way.
+    """
+    prefix = f"{target}/usr"
+    e = dict(os.environ)
+    e["CC"]  = f"{CROSS_TRIPLET}-gcc"
+    e["CXX"] = f"{CROSS_TRIPLET}-g++"
+    e["AR"]      = f"{CROSS_TRIPLET}-ar"
+    e["RANLIB"]  = f"{CROSS_TRIPLET}-ranlib"
+    e["STRIP"]   = f"{CROSS_TRIPLET}-strip"
+    e["PATH"] = f"{CROSS_TOOLCHAIN_BIN}:{e.get('PATH', '/usr/local/bin:/usr/bin:/bin')}"
+    e["PKG_CONFIG_LIBDIR"] = f"{prefix}/lib/pkgconfig:{prefix}/share/pkgconfig"
+    e["PKG_CONFIG_PATH"] = ""
+    # Unlike meson_install()'s broader PKG_CONFIG_SYSROOT_DIR revert
+    # (reverted there because its PKG_CONFIG_PATH mixes container-only and
+    # target-only .pc files, which SYSROOT_DIR can't tell apart -- see that
+    # function's own comment), THIS phase's PKG_CONFIG_LIBDIR is fully
+    # restricted to {target}/usr -- every .pc file resolvable here is one
+    # this same phase just built, every one of them configured with
+    # --prefix=/usr (the real final deploy path, not the staging path).
+    # Hit this for real: libxcb's own configure asks xcb-proto's .pc file
+    # for its xcbincludedir variable and got back the unprefixed
+    # "/usr/share/xcb" -- correct once actually deployed, but xcb-proto's
+    # files are physically sitting at {target}/usr/share/xcb on THIS build
+    # host right now. Safe to turn on here specifically because there's no
+    # container-vs-target ambiguity in this phase's restricted lookup set.
+    e["PKG_CONFIG_SYSROOT_DIR"] = target
+    e["CFLAGS"]   = f"-I{prefix}/include"
+    e["CPPFLAGS"] = f"-I{prefix}/include"
+    e["LDFLAGS"]  = f"-L{prefix}/lib -Wl,-rpath-link,{prefix}/lib"
+    ensure(BUILD_TMP)
+    e["TMPDIR"] = BUILD_TMP
+    return e
+
+def phase_cross_deps(target):
+    """Cross-build the full low-level dependency chain phase_mesa (and
+    eventually phase_qt_deps) actually need, directly into {target}/usr
+    with CROSS_TRIPLET -- not a side workdir. Every one of these was first
+    verified cross-building cleanly in an isolated workdir before being
+    folded in here; this is that same verified sequence, in the same
+    dependency order, now writing into the real rootfs.
+
+    Deliberately one consolidated phase (same precedent as phase_kde, which
+    builds many KF6/Plasma packages internally rather than one phase per
+    package) instead of ~30 near-identical phase list entries.
+    """
+    log_phase("cross-deps", "Cross-build dependency chain for Mesa/Qt6 (zlib..dbus)")
+    before_snapshot = _snapshot_tree(target)
+    src    = sources(target)
+    prefix = f"{target}/usr"
+    env    = _cross_deps_env(target)
+
+    def fetch(url, filename=None):
+        out = os.path.join(src, filename or os.path.basename(url))
+        download(url, out)
+        return out
+
+    def build_autotools(name, url, configure_args=None):
+        log(f"cross-deps: {name}", color=YELLOW)
+        bd = os.path.join(BUILD_TMP, f"crossdeps-{name}")
+        shutil.rmtree(bd, ignore_errors=True)
+        extract(fetch(url), bd)
+        # --libdir=/usr/lib explicitly: several of these (libffi confirmed
+        # directly, hit it during this phase's own first integration test
+        # run) default to /usr/lib64 on a 64-bit host's own GNUInstallDirs
+        # detection -- every other package in this chain, and every -L/
+        # -rpath-link flag this phase sets, consistently assumes a flat
+        # /usr/lib, so a package landing in lib64 instead silently stops
+        # being found by anything relying on bare -L{prefix}/lib (its own
+        # .pc file still resolves correctly via pkg-config, which is why
+        # this doesn't fail loudly -- it just creates exactly the kind of
+        # linker-time land-mine libffi's lib64 default caused in isolated
+        # verification earlier this session).
+        run(["./configure", "--prefix=/usr", "--libdir=/usr/lib",
+             f"--host={CROSS_TRIPLET}",
+             "--disable-static"] + (configure_args or []), cwd=bd, env=env)
+        run(["make", f"-j{nproc()}"], cwd=bd, env=env)
+        # LDFLAGS as a `make` command-line variable, not just the inherited
+        # environment -- autotools substitutes LDFLAGS into the generated
+        # Makefile literally at ./configure time; an env-only LDFLAGS on
+        # this later `make install` step would not override that baked-in
+        # value (hit this for real with elfutils in isolated verification:
+        # identical "undefined reference to ZSTD_*/gz*" failures persisted
+        # across multiple attempts until LDFLAGS was passed here explicitly).
+        run(["make", "install", f"DESTDIR={target}", f"LDFLAGS={env['LDFLAGS']}"],
+            cwd=bd, env=env)
+        # Delete .la files immediately after install, every package, no
+        # exceptions. Real failure hit building libX11: libtool choked
+        # trying to validate '/usr/lib/libXau.la' -- the absolute *final
+        # deploy* path baked into libXau's own .la file at its configure
+        # time (same "prefix=/usr baked in, not sysroot-aware" problem as
+        # the earlier .pc-file issues, but .la cross-references are
+        # resolved by libtool itself, which doesn't consult
+        # PKG_CONFIG_SYSROOT_DIR at all -- that fix doesn't reach this).
+        # Standard practice in real distro build systems (Yocto, Buildroot)
+        # for exactly this fragility: .la files are a legacy libtool
+        # build-time convenience, not needed at runtime (the .so's own
+        # DT_NEEDED entries are what the dynamic linker actually uses) --
+        # delete them rather than trying to keep libtool's cross-reference
+        # bookkeeping correct across a repeatedly-rebuilt staging root.
+        for _la in glob.glob(f"{target}/usr/lib/*.la"):
+            os.remove(_la)
+
+    def build_meson(name, url, extra_args=None, cross_file=None):
+        log(f"cross-deps: {name}", color=YELLOW)
+        bd = os.path.join(BUILD_TMP, f"crossdeps-{name}")
+        shutil.rmtree(bd, ignore_errors=True)
+        src_dir = os.path.join(BUILD_TMP, f"crossdeps-{name}-src")
+        shutil.rmtree(src_dir, ignore_errors=True)
+        extract(fetch(url), src_dir)
+        meson_install(src_dir, prefix, extra_args=extra_args, env=env,
+                      build_dir=bd, cross_file=cross_file or _meson_cross_file())
+
+    # ── zlib / zstd: hand-rolled, neither uses a standard GNU ./configure ──
+    log("cross-deps: zlib", color=YELLOW)
+    bd = os.path.join(BUILD_TMP, "crossdeps-zlib")
+    shutil.rmtree(bd, ignore_errors=True)
+    extract(fetch(ZLIB_URL), bd)
+    zlib_env = dict(env)
+    run(["./configure", "--prefix=/usr"], cwd=bd, env=zlib_env)
+    run(["make", f"-j{nproc()}"], cwd=bd, env=zlib_env)
+    run(["make", "install", f"DESTDIR={target}"], cwd=bd, env=zlib_env)
+
+    log("cross-deps: zstd", color=YELLOW)
+    bd = os.path.join(BUILD_TMP, "crossdeps-zstd")
+    shutil.rmtree(bd, ignore_errors=True)
+    extract(fetch(ZSTD_URL), bd)
+    # zstd's own Makefile phony install target is "libzstd", not
+    # "libzstd.so" -- a plain `make libzstd.so` silently builds nothing
+    # (not a build error, just the wrong target name), confirmed the hard
+    # way in isolated verification.
+    run(["make", f"-j{nproc()}", "-C", "lib", "libzstd"], cwd=bd, env=env)
+    run(["make", "-C", "lib", "install", f"DESTDIR={target}", "PREFIX=/usr"],
+        cwd=bd, env=env)
+
+    # ── autotools chain, strict dependency order ──
+    build_autotools("freetype", FREETYPE_URL,
+                     ["--without-harfbuzz", "--without-png", "--without-bzip2"])
+    build_autotools("expat", EXPAT_URL, ["--without-docbook"])
+    build_autotools("fontconfig", FONTCONFIG_URL,
+                     ["--disable-docs", "--enable-libxml2=no"])
+    build_autotools("libffi", LIBFFI_URL)
+    # libffi's own Makefile.am computes an internal MULTIOSDIR/
+    # toolexeclibdir from the cross-compiler's own multilib spec for its
+    # core .so install step specifically -- confirmed directly, twice, that
+    # this overrides the generic --libdir=/usr/lib passed to every package
+    # in this phase (every other install path -- man/doc/pkgconfig --
+    # respected it; only the actual libffi.so/.la/.a did not, landing in
+    # {prefix}/lib/../lib64 regardless). Same root cause hit in isolated
+    # verification earlier this session; same fix -- move it into {prefix}
+    # /lib after the fact, since no configure/make flag was found that
+    # actually overrides libffi's own internal computation.
+    _ffi_lib64 = os.path.normpath(f"{prefix}/lib/../lib64")
+    if os.path.isdir(_ffi_lib64) and _ffi_lib64 != f"{prefix}/lib":
+        for _f in glob.glob(f"{_ffi_lib64}/libffi*"):
+            run(["mv", _f, f"{prefix}/lib/"], sudo=(os.geteuid() != 0))
+        if not os.listdir(_ffi_lib64):
+            os.rmdir(_ffi_lib64)
+        log("cross-deps: moved libffi out of lib64 into lib", color=GREEN)
+    # The move above fixes where the .so physically lives, but libffi.pc's
+    # own Libs: line uses a SEPARATE "toolexeclibdir" variable (not plain
+    # libdir), which libffi's own ./configure baked as "${libdir}/../lib64"
+    # independent of where the file actually ended up -- confirmed real,
+    # not hypothetical: `pkg-config --libs libffi` still reported
+    # -L.../lib/../lib64, so anything linking against libffi via
+    # pkg-config (phase_wayland's libwayland-client.so first to hit it)
+    # failed with "cannot find -lffi" even after the .so was moved.
+    _ffi_pc = f"{prefix}/lib/pkgconfig/libffi.pc"
+    if os.path.exists(_ffi_pc):
+        with open(_ffi_pc) as f:
+            _ffi_pc_txt = f.read()
+        _ffi_pc_fixed = _ffi_pc_txt.replace(
+            "toolexeclibdir=${libdir}/../lib64", "toolexeclibdir=${libdir}")
+        if _ffi_pc_fixed != _ffi_pc_txt:
+            with open(_ffi_pc, "w") as f:
+                f.write(_ffi_pc_fixed)
+            log("cross-deps: fixed libffi.pc toolexeclibdir to match the "
+                "real (moved) lib location", color=GREEN)
+    build_autotools("xorgproto", XORGPROTO_URL)
+    build_autotools("xtrans", XTRANS_URL)
+    build_autotools("libXau", LIBXAU_URL)
+    build_autotools("libXdmcp", LIBXDMCP_URL)
+    build_autotools("xcb-proto", XCBPROTO_URL)
+    build_autotools("libxcb", LIBXCB_URL,
+                     ["--enable-xkb", "--enable-render", "--enable-shm",
+                      "--enable-randr", "--enable-xfixes", "--enable-sync",
+                      "--enable-xinerama"])
+    build_autotools("libxml2", LIBXML2_URL,
+                     ["--without-python", "--without-lzma"])
+    build_meson("libxkbcommon", LIBXKBCOMMON_URL,
+                extra_args=["-Denable-x11=true", "-Denable-wayland=false",
+                            "-Denable-docs=false", "-Denable-tools=false",
+                            "-Ddefault_library=shared"])
+    build_autotools("libX11", LIBX11_URL)
+    build_autotools("xcb-util", XCBUTIL_URL)
+    build_autotools("xcb-util-image", XCBUTILIMAGE_URL)
+    build_autotools("xcb-util-keysyms", XCBUTILKEYSYMS_URL)
+    build_autotools("xcb-util-renderutil", XCBUTILRENDERUTIL_URL)
+    build_autotools("xcb-util-wm", XCBUTILWM_URL)
+    build_autotools("xcb-util-cursor", XCBUTILCURSOR_URL)
+    build_autotools("libXext", LIBXEXT_URL)
+    build_autotools("libXfixes", LIBXFIXES_URL)
+    build_autotools("libxshmfence", LIBXSHMFENCE_URL)
+    build_autotools("libXxf86vm", LIBXXF86VM_URL)
+    build_autotools("libXrender", LIBXRENDER_URL)
+    build_autotools("libXrandr", LIBXRANDR_URL)
+    build_autotools("libpciaccess", LIBPCIACCESS_URL)
+    # libinput hard-requires both (no meson option to disable either) --
+    # confirmed real, not hypothetical: `meson setup` for libinput failed
+    # outright with "Dependency 'mtdev' not found" once actually run
+    # against this chain for the first time.
+    build_autotools("mtdev", MTDEV_URL)
+    build_autotools("libevdev", LIBEVDEV_URL)
+    # systemd's meson setup explicitly requests -Dkmod=enabled (real
+    # module-loading support, not an optional feature) -- confirmed real,
+    # not hypothetical: `meson setup` for systemd failed outright with
+    # "Dependency 'libkmod' not found" once actually run against this
+    # chain for the first time.
+    #
+    # Hand-rolled (not build_autotools), and more involved than every
+    # other package in this phase, because kmod's upstream release
+    # tarball is a real packaging mistake: it's a plain archive of a
+    # maintainer's own git checkout, including several files that are
+    # actually *symlinks into that maintainer's own system* --
+    # build-aux/{compile,config.guess,config.sub,depcomp,install-sh,
+    # ltmain.sh,missing,test-driver} all pointed at
+    # /usr/share/automake-1.17/* (confirmed broken: that exact path
+    # doesn't exist on this container), and m4/gtk-doc.m4 /
+    # libkmod/docs/gtk-doc.make likewise pointed at gtk-doc files this
+    # container never installs. ./configure died immediately with
+    # "cannot find required auxiliary files" as a direct result. The fix
+    # is to delete all of those dangling symlinks and let autoreconf
+    # regenerate real ones for THIS system -- confirmed working end to
+    # end. kmod's own autogen.sh is never actually invoked (it only
+    # *prints* a suggested configure line unless given a special arg), so
+    # it's not a shortcut here; its outline (gtkdocize, then autoreconf)
+    # is just confirmation of the same two steps needed manually. gtkdocize
+    # itself also isn't installed on this container -- a one-line no-op
+    # stub on PATH satisfies autoreconf's automatic gtkdocize invocation
+    # (triggered by GTK_DOC_CHECK appearing in configure.ac) without
+    # needing the real gtk-doc-tools package for a doc-generation feature
+    # this profile has no use for anyway.
+    #
+    # zstd/zlib compression support use the chain's own already-cross-
+    # built libs; xz/openssl are genuinely optional (confirmed: dropping
+    # --with-xz avoided adding liblzma as yet another new dependency for
+    # a second, non-essential compression format) and left off; scdoc
+    # (manpages) isn't installed either, hence --disable-manpages.
+    log("cross-deps: kmod", color=YELLOW)
+    _kmod_bd = os.path.join(BUILD_TMP, "crossdeps-kmod")
+    shutil.rmtree(_kmod_bd, ignore_errors=True)
+    extract(fetch(KMOD_URL), _kmod_bd)
+    for _dangling in (
+            "m4/gtk-doc.m4", "libkmod/docs/gtk-doc.make",
+            "build-aux/compile", "build-aux/config.guess", "build-aux/config.sub",
+            "build-aux/depcomp", "build-aux/install-sh", "build-aux/ltmain.sh",
+            "build-aux/missing", "build-aux/test-driver"):
+        _p = os.path.join(_kmod_bd, _dangling)
+        if os.path.islink(_p):
+            os.remove(_p)
+    with open(os.path.join(_kmod_bd, "m4", "gtk-doc.m4"), "w") as f:
+        f.write("AC_DEFUN([GTK_DOC_CHECK],[\n"
+                "  AM_CONDITIONAL([ENABLE_GTK_DOC], false)\n"
+                "])\n")
+    ensure(os.path.join(_kmod_bd, "libkmod", "docs"))
+    run(["touch", "libkmod/docs/gtk-doc.make"], cwd=_kmod_bd)
+    _gtkdocize_stub_dir = os.path.join(BUILD_TMP, "kmod-stub-bin")
+    ensure(_gtkdocize_stub_dir)
+    _gtkdocize_stub = os.path.join(_gtkdocize_stub_dir, "gtkdocize")
+    with open(_gtkdocize_stub, "w") as f:
+        f.write("#!/bin/sh\nexit 0\n")
+    os.chmod(_gtkdocize_stub, 0o755)
+    kmod_env = dict(env)
+    kmod_env["PATH"] = f"{_gtkdocize_stub_dir}:{env['PATH']}"
+    run(["autoreconf", "--force", "--install", "--symlink"], cwd=_kmod_bd, env=kmod_env)
+    run(["./configure", "--prefix=/usr", "--libdir=/usr/lib",
+         f"--host={CROSS_TRIPLET}", "--disable-static",
+         "--with-zlib", "--with-zstd", "--without-xz", "--without-openssl",
+         "--disable-manpages"],
+        cwd=_kmod_bd, env=env)
+    run(["make", f"-j{nproc()}"], cwd=_kmod_bd, env=env)
+    run(["make", "install", f"DESTDIR={target}", f"LDFLAGS={env['LDFLAGS']}"],
+        cwd=_kmod_bd, env=env, sudo=(os.geteuid() != 0))
+    for _la in glob.glob(f"{target}/usr/lib/*.la"):
+        os.remove(_la)
+    build_autotools("attr", ATTR_URL)
+    build_autotools("acl", ACL_URL)
+    build_autotools("seccomp", SECCOMP_URL)
+    # --enable-obsolete-api=glibc installs the glibc-compatible libcrypt.so
+    # name/symbol set (not just libxcrypt.so) -- that's the exact name
+    # linux-pam's meson.build looks for via cc.find_library('crypt')
+    # immediately below. --enable-hashes left at its 'all' default, which
+    # already includes descrypt -- required for obsolete-api compat per
+    # libxcrypt's own configure --help, so not worth narrowing.
+    build_autotools("libxcrypt", LIBXCRYPT_URL, ["--enable-obsolete-api=glibc"])
+    # Linux-PAM switched to Meson around 1.6.0 -- no ./configure exists in
+    # the release tarball at all, confirmed by inspection. logind/elogind
+    # are explicitly disabled below: systemd itself isn't built yet at this
+    # point in the chain, so a dependency the other direction would be
+    # circular; pam_unix's own password hashing doesn't need it. docs/
+    # audit/selinux/nis/pwaccess are the same "genuinely optional, no
+    # xmlto/docbook/libaudit/libselinux in this chain" judgment applied to
+    # systemd's own sibling options earlier in this phase.
+    build_meson("linux-pam", LINUX_PAM_URL, extra_args=[
+        "-Ddocs=disabled",
+        "-Daudit=disabled",
+        "-Dselinux=disabled",
+        "-Dnis=disabled",
+        "-Deconf=disabled",
+        "-Dlogind=disabled",
+        "-Delogind=disabled",
+        "-Dpwaccess=disabled",
+        "-Dexamples=false",
+    ])
+    # --enable-jit: real runtime perf win for QRegularExpression-heavy UI
+    # code (input validators, syntax highlighting) -- x86_64 fully
+    # supports PCRE2's JIT compiler. Unicode support is already Qt's own
+    # default (no --disable-unicode passed), confirmed via configure
+    # --help before assuming it.
+    # Bug (phase_qt_deps #2b, found at qtdeclarative's link step): only the
+    # 8-bit variant was built by default -- real linker errors confirmed
+    # `libQt6Core.so` itself needs pcre2_match_16/_compile_16/etc, the
+    # 16-bit codepoint API, because QRegularExpression operates on QString
+    # (UTF-16 internally), not 8-bit data. --enable-pcre2-16 is a real,
+    # separate build output (libpcre2-16.so), not implied by the default
+    # 8-bit build -- confirmed via ./configure --help.
+    build_autotools("pcre2", PCRE2_URL, ["--enable-jit", "--enable-pcre2-16"])
+
+    # Vulkan-Headers: header-only, a plain CMake install step. Needed first
+    # so Vulkan-Loader's own `find_package(VulkanHeaders ... CONFIG)` can
+    # find it via CMAKE_PREFIX_PATH=target's own prefix.
+    log("cross-deps: vulkan-headers", color=YELLOW)
+    # Bug #1's exact cache-collision class, again: VULKAN_HEADERS_URL and
+    # VULKAN_LOADER_URL both end in the identical "vulkan-sdk-1.4.363.0.tar.gz"
+    # (same tag, two different Khronos repos) -- explicit distinct
+    # filenames here, not fetch()'s url-basename default, or the second
+    # download silently reuses the first's cached file.
+    vh_bd = os.path.join(BUILD_TMP, "crossdeps-vulkan-headers")
+    shutil.rmtree(vh_bd, ignore_errors=True)
+    vh_src = os.path.join(BUILD_TMP, "crossdeps-vulkan-headers-src")
+    shutil.rmtree(vh_src, ignore_errors=True)
+    extract(fetch(VULKAN_HEADERS_URL, filename="vulkan-headers-sdk-1.4.363.0.tar.gz"), vh_src)
+    run(["cmake", "-S", vh_src, "-B", vh_bd, "-G", "Ninja",
+         f"-DCMAKE_INSTALL_PREFIX={prefix}"], env=env)
+    run(["ninja", "-C", vh_bd, "install"], env=env, sudo=(os.geteuid() != 0))
+
+    # Vulkan-Loader: defaults already match this profile exactly
+    # (BUILD_WSI_XCB/XLIB/XLIB_XRANDR/WAYLAND_SUPPORT all ON, DirectFB
+    # OFF, confirmed via direct read of its CMakeLists.txt) -- same
+    # x11+wayland platform set phase_mesa already builds for.
+    log("cross-deps: vulkan-loader", color=YELLOW)
+    vl_bd = os.path.join(BUILD_TMP, "crossdeps-vulkan-loader")
+    shutil.rmtree(vl_bd, ignore_errors=True)
+    vl_src = os.path.join(BUILD_TMP, "crossdeps-vulkan-loader-src")
+    shutil.rmtree(vl_src, ignore_errors=True)
+    extract(fetch(VULKAN_LOADER_URL, filename="vulkan-loader-sdk-1.4.363.0.tar.gz"), vl_src)
+    run(["cmake", "-S", vl_src, "-B", vl_bd, "-G", "Ninja",
+         f"-DCMAKE_TOOLCHAIN_FILE={_cmake_cross_toolchain_file()}",
+         f"-DCMAKE_PREFIX_PATH={prefix}",
+         f"-DCMAKE_INSTALL_PREFIX={prefix}",
+         "-DBUILD_TESTS=OFF"], env=env)
+    run(["ninja", "-C", vl_bd], env=env)
+    run(["ninja", "-C", vl_bd, "install"], env=env, sudo=(os.geteuid() != 0))
+
+    build_meson("libdrm", LIBDRM_URL,
+                extra_args=["-Dintel=enabled", "-Dradeon=enabled",
+                            "-Damdgpu=enabled", "-Dnouveau=enabled",
+                            "-Dvmwgfx=enabled"])
+
+    # ── SPIRV-Headers (header-only) + SPIRV-Tools (cmake) ──
+    log("cross-deps: SPIRV-Headers", color=YELLOW)
+    hdr_src = os.path.join(BUILD_TMP, "crossdeps-spirv-headers-src")
+    shutil.rmtree(hdr_src, ignore_errors=True)
+    extract(fetch(SPIRV_HEADERS_URL), hdr_src)
+    ensure(f"{prefix}/include")
+    run(["cp", "-r", os.path.join(hdr_src, "include", "spirv"), f"{prefix}/include/"],
+        sudo=(os.geteuid() != 0))
+
+    log("cross-deps: SPIRV-Tools", color=YELLOW)
+    spv_src = os.path.join(BUILD_TMP, "crossdeps-spirv-tools-src")
+    shutil.rmtree(spv_src, ignore_errors=True)
+    # SPIRV_HEADERS_URL and SPIRV_TOOLS_URL share the same tag
+    # (vulkan-sdk-1.3.296.0), and GitHub's tag-archive URLs are named
+    # after the tag, not the repo -- os.path.basename(url) collides on
+    # "vulkan-sdk-1.3.296.0.tar.gz" for both, so fetch()'s cache-by-
+    # destination-path check silently served SPIRV-Headers' own tarball
+    # here instead of downloading SPIRV-Tools (confirmed directly: the
+    # cmake build only produced SPIRV-Headers' own trivial
+    # spirv_headers_simple_test target, no libSPIRV-Tools, no
+    # spirv-tools.pc -- every prior test run had this bug silently).
+    # An explicit, disambiguated filename is the fix.
+    extract(fetch(SPIRV_TOOLS_URL, filename=f"SPIRV-Tools-{SPIRV_TOOLS_TAG}.tar.gz"),
+            spv_src)
+    # external/ is SPIRV-Tools' git submodule mount point for spirv-headers
+    # -- a GitHub archive tarball never includes it (git doesn't track
+    # empty directories, and archive tarballs don't pull submodule
+    # content), so it has to be created before symlinking into it.
+    ensure(os.path.join(spv_src, "external"))
+    os.symlink(hdr_src, os.path.join(spv_src, "external", "spirv-headers"),
+               target_is_directory=True)
+    spv_cross_cmake = os.path.join(BUILD_TMP, "crossdeps-spirv-tools.cmake")
+    with open(spv_cross_cmake, "w") as f:
+        f.write(textwrap.dedent(f"""\
+            set(CMAKE_SYSTEM_NAME Linux)
+            set(CMAKE_SYSTEM_PROCESSOR x86_64)
+            set(CMAKE_C_COMPILER   {CROSS_TOOLCHAIN_BIN}/{CROSS_TRIPLET}-gcc)
+            set(CMAKE_CXX_COMPILER {CROSS_TOOLCHAIN_BIN}/{CROSS_TRIPLET}-g++)
+            set(CMAKE_AR           {CROSS_TOOLCHAIN_BIN}/{CROSS_TRIPLET}-ar)
+            set(CMAKE_RANLIB       {CROSS_TOOLCHAIN_BIN}/{CROSS_TRIPLET}-ranlib)
+            """))
+    spv_bd = os.path.join(BUILD_TMP, "crossdeps-spirv-tools-build")
+    shutil.rmtree(spv_bd, ignore_errors=True)
+    run(["cmake", "-S", spv_src, "-B", spv_bd, "-G", "Ninja",
+         f"-DCMAKE_TOOLCHAIN_FILE={spv_cross_cmake}",
+         "-DCMAKE_BUILD_TYPE=Release",
+         "-DCMAKE_INSTALL_PREFIX=/usr",
+         "-DSPIRV_SKIP_TESTS=ON", "-DSPIRV_SKIP_EXECUTABLES=OFF",
+         f"-DSPIRV-Headers_SOURCE_DIR={hdr_src}"], env=env)
+    run(["ninja", "-C", spv_bd], env=env)
+    run(["ninja", "-C", spv_bd, "install"],
+        env=dict(env, DESTDIR=target), sudo=(os.geteuid() != 0))
+
+    build_autotools("elfutils", ELFUTILS_URL,
+                     ["--disable-debuginfod", "--disable-libdebuginfod"])
+    build_meson("harfbuzz", HARFBUZZ_URL,
+                extra_args=["-Dicu=disabled", "-Dglib=disabled",
+                            "-Dgobject=disabled", "-Dtests=disabled",
+                            "-Ddocs=disabled", "-Dfreetype=enabled"])
+    # dbus dropped autotools entirely as of this release line -- its
+    # tarball ships only meson.build/CMakeLists.txt, no configure script
+    # (confirmed by inspecting the extracted source tree after
+    # build_autotools's `./configure` failed with FileNotFoundError).
+    build_meson("dbus", DBUS_URL,
+                extra_args=["-Dx11_autolaunch=disabled", "-Dsystemd=disabled",
+                            "-Dmodular_tests=disabled", "-Dinstalled_tests=false"])
+
+    _record_component_manifest(target, "cross-deps", target, before_snapshot)
+    log("cross-deps: full chain installed into target/usr", color=GREEN)
+
 def phase_mesa(target):
     log_phase("mesa", f"Compile Mesa {MESA_VER}")
+    # Task #72: fail loudly and early if the LLVM/Clang/SPIRV-Translator
+    # cross-build prerequisites aren't present, instead of several hundred
+    # ninja steps into a real build with a cryptic missing-header error
+    # (that's exactly how bugs #28/#29 first surfaced). Point whoever hits
+    # this at the actual fix -- run bootstrap_cross_llvm.py once -- rather
+    # than a bare file-not-found.
+    for _name, _path in (
+        ("CROSS_LLVM_CONFIG", CROSS_LLVM_CONFIG),
+        ("CROSS_CLANG_SRC_INCLUDE", CROSS_CLANG_SRC_INCLUDE),
+        ("CROSS_SPIRV_TRANSLATOR_BUILD/LLVMSPIRVLib.pc",
+         os.path.join(CROSS_SPIRV_TRANSLATOR_BUILD, "LLVMSPIRVLib.pc")),
+    ):
+        if not os.path.exists(_path):
+            err(f"{_name} not found at {_path!r}. phase_mesa needs a "
+                f"cross-built LLVM/Clang/SPIRV-Translator prerequisite that "
+                f"spk-compile.py does not build itself -- run "
+                f"bootstrap_cross_llvm.py once (see its own docstring), then "
+                f"export SMECHOS_LLVM_WORKDIR / "
+                f"SMECHOS_SPIRV_TRANSLATOR_WORKDIR to point at its output "
+                f"before retrying.")
     src     = sources(target)
     tarball = os.path.join(src, f"mesa-{MESA_VER}.tar.xz")
     download(MESA_URL, tarball)
@@ -1389,9 +2434,18 @@ def phase_mesa(target):
     # build the other way. Only apply them if the installed toolchain is
     # genuinely >= 22, so this self-corrects if the pinned LLVM version ever
     # changes without anyone remembering to touch this gate.
+    #
+    # RC4/FNDE: this MUST check CROSS_LLVM_CONFIG specifically, not a bare
+    # "llvm-config" lookup -- under cross-compilation, Mesa's clc_helpers.cpp
+    # compiles against the CROSS-built LLVM/Clang headers (20.1.2), not
+    # whatever version happens to be on the ambient PATH (the container's
+    # native LLVM is 22.x). Checking the wrong one here would apply the
+    # LLVM-22-targeted patches against LLVM 20 headers -- exactly the
+    # breakage this comment already warns about, just triggered by a stale
+    # version check instead of a real version mismatch.
     _llvm_major = 0
     try:
-        _llvm_ver_out = subprocess.run(["llvm-config", "--version"],
+        _llvm_ver_out = subprocess.run([CROSS_LLVM_CONFIG, "--version"],
             capture_output=True, text=True, check=True).stdout.strip()
         _llvm_major = int(_llvm_ver_out.split(".")[0])
     except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
@@ -1432,11 +2486,61 @@ def phase_mesa(target):
     # cfgetispeed@GLIBC_2.42"). Same root cause as the meson/ninja
     # env fixes above, just showing up in linker flags instead of PATH/
     # LD_LIBRARY_PATH this time. Strip the target -I/-L entirely for Mesa.
+    # RC4/FNDE: Mesa now cross-compiles against CROSS_TRIPLET, with radeonsi's
+    # llvm-config dependency resolved against CROSS_LLVM_CONFIG (a separately
+    # cross-built LLVM 20.1.2 -- see its comment near CROSS_TRIPLET, and
+    # _meson_cross_file()'s llvm-config entry). Stripping target -I/-L here
+    # matters even more under cross-compilation than it did natively: Mesa's
+    # cross-built binaries expect the new cross-glibc ABI, and any
+    # not-yet-converted earlier phase's libraries under {target}/usr/lib/
+    # {MULTIARCH_TRIPLET} are still built against the OLD (container) glibc
+    # identity -- linking against those would mix two incompatible glibc
+    # ABIs in one binary, worse than the original host-vs-target mismatch
+    # this stripping was first added to avoid.
     mesa_env = dict(active_env(target))
-    mesa_env["CFLAGS"]   = "-std=gnu17 -fpermissive"
-    mesa_env["CXXFLAGS"] = ""
-    mesa_env["LDFLAGS"]  = ""
+    # Bug #27: src/util/compress.c failed with "zlib.h: No such file or
+    # directory" even though zlib was cross-built into {target}/usr/include
+    # back in phase_cross_deps, and genuinely is found via pkg-config
+    # (HAVE_ZLIB=1 shows up in the actual compile flags). Root cause: zlib's
+    # own .pc file famously ships no Cflags line at all -- confirmed by
+    # reading it -- relying entirely on zlib.h already being on the
+    # compiler's default search path, which is only true for a native build
+    # against the system's own /usr/include. This project doesn't use
+    # --sysroot (see Dockerfile.build's own header), so the cross compiler's
+    # default search path is crosstool-ng's own sysroot, not {target}. The
+    # blanket CFLAGS/LDFLAGS strip above this comment was written to kill a
+    # LINKER problem specifically (-L{target}/lib/{MULTIARCH_TRIPLET}
+    # resolving glibc itself from the wrong, container-linked copy -- see
+    # the comment above) -- a library (-L) concern, not a header (-I) one.
+    # A header carries no ABI; only linked .so/.a files do. Keeping -I here
+    # while leaving LDFLAGS/library paths stripped fixes the real gap
+    # without reopening the real risk this stripping exists to prevent.
+    mesa_env["CFLAGS"]   = f"-std=gnu17 -fpermissive -I{target}/usr/include"
+    mesa_env["CXXFLAGS"] = (f"-I{target}/usr/include "
+                             f"-isystem{CROSS_CLANG_SRC_INCLUDE} "
+                             f"-isystem{CROSS_LLVM_BUILD}/tools/clang/include")
+    # Bug #30: once clc_helpers.cpp's headers all resolved (bugs #28/#29),
+    # linking intel_clc failed outright on -lz/-lzstd/-lSPIRV-Tools* --
+    # real files, confirmed sitting in plain {target}/usr/lib (NOT the old
+    # MULTIARCH_TRIPLET subdir that's actually the risk -- verified via a
+    # direct find before touching this). The original LDFLAGS="" here was
+    # never "no target libs at all", it was "not the specific multiarch
+    # subdir that still holds container-glibc-linked libraries from
+    # not-yet-converted phases" (see this function's own long comment
+    # above). zlib/zstd/SPIRV-Tools all cross-built clean into the plain
+    # path earlier in phase_cross_deps -- same "headers carry no ABI risk,
+    # but this one's libraries don't either, because they were built by
+    # THIS cross toolchain, not inherited from the container" reasoning,
+    # just one step further than the CFLAGS fix above.
+    mesa_env["LDFLAGS"]  = f"-L{target}/usr/lib"
+    mesa_env["PATH"] = f"{CROSS_TOOLCHAIN_BIN}:{os.path.dirname(CROSS_LLVM_CONFIG)}:{mesa_env.get('PATH', '/usr/local/bin:/usr/bin:/bin')}"
+    # SPIRV-LLVM-Translator's .pc file lives at its build dir root (not a
+    # lib/pkgconfig subdir -- CMake's default export location for this
+    # project), so it needs its own explicit PKG_CONFIG_PATH entry rather
+    # than reusing the target/container paths meson_install() already sets.
+    mesa_env["PKG_CONFIG_PATH"] = f"{CROSS_SPIRV_TRANSLATOR_BUILD}:{mesa_env.get('PKG_CONFIG_PATH', '')}"
     meson_install(bd, f"{target}/usr",
+        cross_file=_meson_cross_file(),
         extra_args=[
             "-Dgallium-drivers=radeonsi,nouveau,iris,crocus,r300,svga,virgl,zink,swrast",
             "-Dvulkan-drivers=amd,intel,virtio",
@@ -1444,20 +2548,40 @@ def phase_mesa(target):
             "-Dopengl=true", "-Dgles1=enabled", "-Dgles2=enabled",
             "-Dshared-glapi=enabled",
             "-Dplatforms=x11,wayland",
-            "-Dglvnd=enabled", "-Db_lto=false",
-            # Intel ray-tracing (GRL) pulls in the intel-clc compiler, which
-            # uses internal clang::driver::Driver/llvm::Target C++ APIs that
-            # genuinely changed between whatever LLVM Mesa 24.3.4 was built
-            # against and LLVM 22.x on this host (Driver::GetResourcesPath
-            # removed, Target::createTargetMachine's first param changed
-            # from const char* to const llvm::Triple&) -- a real upstream
-            # API break, not an environment issue. Ray tracing acceleration
-            # is irrelevant to both VirtIO GPU (virgl/venus) and basic
-            # Intel integrated graphics (e.g. the NUC7PJYHN's i915) -- the
-            # rest of the intel Vulkan driver builds and works fine without
-            # it, so disable just this piece rather than dropping intel
-            # from vulkan-drivers entirely.
-            "-Dintel-rt=disabled",
+            # Bug #31: "glvnd/libglxabi.h: No such file or directory" --
+            # same container-auto-detect pattern as bug class #1 (meson's
+            # dependency('libglvnd', required: true because this was force-
+            # enabled) found the container's own libglvnd-dev via pkg-
+            # config, but the header never threaded through to the cross
+            # compiler). Checked meson.build:561-572 and src/glx/meson.build
+            # first: glvnd is libglvnd's vendor-neutral GL *dispatch* shim,
+            # relevant only when multiple competing GL implementations
+            # (e.g. proprietary NVIDIA alongside Mesa) need to coexist on
+            # one system and pick a winner per-app. SmechOS only ever ships
+            # Mesa -- nothing to dispatch between -- and GLX's own
+            # meson.build has a real, complete non-glvnd code path
+            # (`if not with_glvnd:`), confirmed by reading it: this isn't
+            # an all-or-nothing Mesa requirement, just an extra indirection
+            # layer this profile has no use for. x11 stays enabled in
+            # -Dplatforms above for XWayland's sake; only the glvnd
+            # dispatch shim on top of it is what's unneeded here.
+            "-Dglvnd=disabled", "-Db_lto=false",
+            # Our cross-built LLVM is static-only (LLVM_BUILD_LLVM_DYLIB=OFF)
+            # -- without this, Meson also probes for a shared libLLVM-20.so
+            # that doesn't exist, and that probe's hard error (not a graceful
+            # "not found") was enough to fail the whole LLVM dependency
+            # resolution, independent of whether the static modules all
+            # resolved correctly.
+            "-Dshared-llvm=disabled",
+            # intel-rt (ray tracing) previously disabled here on the theory
+            # that it alone pulled in intel_clc's clang::driver C++ API
+            # usage -- that premise was wrong (see the CROSS_LLVM_BUILD
+            # comment near CROSS_TRIPLET): intel_clc is needed by Anv/Iris
+            # unconditionally, ray tracing or not, and was already being
+            # built that way in the native (pre-cross) pipeline all along.
+            # With Clang now cross-built alongside LLVM specifically to
+            # support intel_clc, there's no remaining reason to disable
+            # ray tracing -- left at its default (auto/enabled).
         ],
         env=mesa_env,
         build_dir=os.path.join(BUILD_TMP, "mesa-build"),
@@ -2214,8 +3338,55 @@ def _kde_pkg(name, version, base_url, target, env, profile="smechos-plasma-live"
     _mark_done(profile, stamp)
     log(f"{name} {version} done.", color=GREEN)
 
+def _patch_wayland_scanner_cross(srcdir):
+    """wayland's own src/meson.build hard-requires an EXTERNAL native
+    wayland-scanner (matching meson.project_version() exactly, via pkg-
+    config) whenever meson.is_cross_build() is true, rather than using the
+    wayland-scanner it just built as part of this same build (that branch
+    is only taken when NOT cross-building). Since phase_wayland always
+    passes a cross-file -- even though this migration is same-arch, not a
+    real cross-arch build (see _meson_cross_file()'s docstring) --
+    is_cross_build() reads true regardless, forcing the external-dependency
+    path unconditionally.
+
+    The project's own meson.build already draws exactly the distinction
+    needed one scope up (meson.can_run_host_binaries(), lines ~75-80, gating
+    whether the just-built scanner gets registered as an override) -- this
+    patch just extends that same, already-present reasoning to the one
+    remaining branch that didn't have it. Confirmed real, not hypothetical:
+    building against the container's actual native wayland-scanner (1.25.0,
+    found via a native-machine pkg-config lookup our cross env can't cleanly
+    sysroot-scope without also breaking the host/target lookup -- see
+    phase_wayland's PKG_CONFIG_SYSROOT_DIR comment) resolved its reported
+    "wayland_scanner" pkgconfig variable through the SAME sysroot prefix
+    meant for target dependencies, pointing at a target/usr/bin/
+    wayland-scanner that was never installed there (nothing ever would be --
+    it's a container-side build tool, not a target deliverable).
+    """
+    path = os.path.join(srcdir, "src", "meson.build")
+    with open(path) as f:
+        txt = f.read()
+    old = "if meson.is_cross_build() or not get_option('scanner')"
+    new = "if (meson.is_cross_build() and not meson.can_run_host_binaries()) or not get_option('scanner')"
+    if old not in txt:
+        err("_patch_wayland_scanner_cross: expected wayland-scanner "
+            "cross-build condition not found in src/meson.build (wayland "
+            "source changed?)")
+    with open(path, "w") as f:
+        f.write(txt.replace(old, new))
+    log("Patched wayland/src/meson.build: use the just-built wayland-scanner "
+        "for this same build instead of requiring an external native one, "
+        "when host binaries can run directly (true for this same-arch "
+        "migration).", color=GREEN)
+
 def phase_wayland(target):
-    log_phase("wayland", f"Build wayland {WAYLAND_VER}")
+    """Build Wayland using the RC4/FNDE cross-toolchain via a Meson
+    cross-file (see _meson_cross_file()). First meson-based phase
+    converted -- wayland-scanner itself still needs to run at *build* time
+    (it's invoked by later phases to generate protocol headers), which
+    works here precisely because target binaries execute directly on this
+    host (same-architecture migration, not a real cross-arch case)."""
+    log_phase("wayland", f"Build wayland {WAYLAND_VER} (cross: {CROSS_TRIPLET})")
     before_snapshot = _snapshot_tree(target)
     src     = sources(target)
     tarball = os.path.join(src, f"wayland-{WAYLAND_VER}.tar.gz")
@@ -2226,11 +3397,26 @@ def phase_wayland(target):
     # gitlab archive nests under wayland-<ver>/
     inner = os.path.join(bd, f"wayland-{WAYLAND_VER}")
     srcdir = inner if os.path.isdir(inner) else bd
+    _patch_wayland_scanner_cross(srcdir)
     builddir = os.path.join(bd, "build")
     env = os.environ.copy()
-    env["PKG_CONFIG_PATH"] = "/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig"
+    env["PATH"] = f"{CROSS_TOOLCHAIN_BIN}:{env.get('PATH', '/usr/local/bin:/usr/bin:/bin')}"
+    # Real bug, not a hypothetical: this previously pointed at the bare
+    # container paths (/usr/lib/{MULTIARCH_TRIPLET}/pkgconfig, no {target}
+    # prefix at all), so meson's dependency('libffi') lookup never reached
+    # phase_cross_deps' actual cross-built libffi.pc -- confirmed directly,
+    # libwayland's src/connection.c (wl_closure's libffi-based marshalling)
+    # failed with a bare "ffi.h: No such file or directory" compile error.
+    # PKG_CONFIG_SYSROOT_DIR matters here for the same reason it does in
+    # _cross_deps_env()/_qt6_cross_env(): every cross-deps .pc file was
+    # configured with --prefix=/usr (the real deploy path), so pkg-config
+    # needs the sysroot prefix to resolve those paths back under {target}.
+    prefix = f"{target}/usr"
+    env["PKG_CONFIG_PATH"] = f"{prefix}/lib/pkgconfig:{prefix}/share/pkgconfig"
+    env["PKG_CONFIG_SYSROOT_DIR"] = target
     run(["meson", "setup", builddir, srcdir,
          f"--prefix={target}/usr",
+         f"--cross-file={_meson_cross_file()}",
          "--buildtype=release",
          "-Ddocumentation=false",
          "-Dtests=false"], env=env)
@@ -2241,7 +3427,7 @@ def phase_wayland(target):
     log(f"wayland-scanner: {result.stderr.strip() or result.stdout.strip()}", color=GREEN)
 
 def phase_wayland_protocols(target):
-    log_phase("wayland-protocols", f"Build wayland-protocols {WAYLAND_PROTO_VER}")
+    log_phase("wayland-protocols", f"Build wayland-protocols {WAYLAND_PROTO_VER} (cross: {CROSS_TRIPLET})")
     before_snapshot = _snapshot_tree(target)
     src     = sources(target)
     tarball = os.path.join(src, f"wayland-protocols-{WAYLAND_PROTO_VER}.tar.gz")
@@ -2253,18 +3439,36 @@ def phase_wayland_protocols(target):
     srcdir = inner if os.path.isdir(inner) else bd
     builddir = os.path.join(bd, "build")
     env = active_env(target)
-    extra = f"{target}/usr/lib/x86_64-linux-gnu/pkgconfig:{target}/usr/lib/pkgconfig:{target}/usr/share/pkgconfig"
+    env["PATH"] = f"{CROSS_TOOLCHAIN_BIN}:{env.get('PATH', '/usr/local/bin:/usr/bin:/bin')}"
+    extra = f"{target}/usr/lib/{MULTIARCH_TRIPLET}/pkgconfig:{target}/usr/lib/pkgconfig:{target}/usr/share/pkgconfig"
     env["PKG_CONFIG_PATH"] = extra + ":" + env.get("PKG_CONFIG_PATH", "")
+    # Without this, any .pc file found above still reports its unprefixed
+    # --prefix=/usr Cflags/Libs paths (e.g. "-I/usr/include/foo") -- the
+    # compiler would then look on the CONTAINER's own /usr/include, not
+    # {target}/usr/include, silently resolving the wrong (wrong-glibc)
+    # headers/libs for anything that happens to exist in both places. Same
+    # bug class, same fix, as phase_wayland's own PKG_CONFIG_SYSROOT_DIR
+    # (see its comment) -- just hadn't been triggered yet here.
+    env["PKG_CONFIG_SYSROOT_DIR"] = target
     run(["meson", "setup", builddir, srcdir,
          f"--prefix={target}/usr",
-         "--buildtype=release"], env=env)
+         f"--cross-file={_meson_cross_file()}",
+         "--buildtype=release",
+         # wayland-protocols' default `tests=true` compiles a throwaway
+         # test-build binary for every single protocol (700+ build steps,
+         # confirmed directly -- most of this phase's real build time with
+         # tests left on) purely to sanity-check the generated headers
+         # compile; this phase ships the protocol XML/headers themselves,
+         # not those test binaries, so there's nothing to lose by skipping
+         # them.
+         "-Dtests=false"], env=env)
     run(["ninja", "-C", builddir], env=env)
     run(["ninja", "-C", builddir, "install"], env=env)
     _record_component_manifest(target, "wayland-protocols", target, before_snapshot, pkg_version=WAYLAND_PROTO_VER)
     log(f"wayland-protocols {WAYLAND_PROTO_VER} installed", color=GREEN)
 
 def phase_libinput(target):
-    log_phase("libinput", f"Build libinput {LIBINPUT_VER}")
+    log_phase("libinput", f"Build libinput {LIBINPUT_VER} (cross: {CROSS_TRIPLET})")
     before_snapshot = _snapshot_tree(target)
     src     = sources(target)
     tarball = os.path.join(src, f"libinput-{LIBINPUT_VER}.tar.gz")
@@ -2276,8 +3480,16 @@ def phase_libinput(target):
     srcdir = inner if os.path.isdir(inner) else bd
     builddir = os.path.join(bd, "build")
     env = active_env(target)
+    env["PATH"] = f"{CROSS_TOOLCHAIN_BIN}:{env.get('PATH', '/usr/local/bin:/usr/bin:/bin')}"
+    # active_env()'s own PKG_CONFIG_PATH already puts {target}/usr's
+    # pkgconfig dirs first, but without SYSROOT_DIR any .pc file found
+    # there still reports its unprefixed --prefix=/usr Cflags/Libs paths --
+    # same bug class as phase_wayland/phase_wayland_protocols (see their
+    # comments), just hadn't been triggered yet here.
+    env["PKG_CONFIG_SYSROOT_DIR"] = target
     run(["meson", "setup", builddir, srcdir,
          f"--prefix={target}/usr",
+         f"--cross-file={_meson_cross_file()}",
          "--buildtype=release",
          "-Ddocumentation=false",
          "-Dtests=false",
@@ -2317,7 +3529,7 @@ def _symlink_arch_libs(target):
     The linker gets -L lib/ but DT_NEEDED entries reference SONAMEs like libKF6Service.so.6
     which live in lib/x86_64-linux-gnu/. Without these symlinks the linker can't resolve
     transitive deps and --no-undefined fails."""
-    arch_dir = os.path.join(target, "usr/lib/x86_64-linux-gnu")
+    arch_dir = os.path.join(target, f"usr/lib/{MULTIARCH_TRIPLET}")
     top_dir  = os.path.join(target, "usr/lib")
     if not os.path.isdir(arch_dir):
         return
@@ -2325,7 +3537,7 @@ def _symlink_arch_libs(target):
         if ".so" in fname and fname.startswith("lib"):
             dest = os.path.join(top_dir, fname)
             if not os.path.lexists(dest):
-                symlink(os.path.join("x86_64-linux-gnu", fname), dest)
+                symlink(os.path.join(MULTIARCH_TRIPLET, fname), dest)
 
 def _build_xkbregistry(target, profile="smechos-plasma-live"):
     """Rebuild libxkbcommon 1.6.0 with xkbregistry enabled (not in Ubuntu packages)."""
@@ -2364,27 +3576,28 @@ def phase_kde(target):
     # were present. Both need their real, ABI-matched runtime .so copied
     # into the target once -- same as phase_xwayland_deps already does for
     # binaries the target rootfs never had either.
-    for libname, glob_pat in (("libical", "/usr/lib/x86_64-linux-gnu/libical*.so*"),
-                               ("libhunspell", "/usr/lib/x86_64-linux-gnu/libhunspell*.so*"),
-                               ("libsecret", "/usr/lib/x86_64-linux-gnu/libsecret*.so*"),
-                               ("libnm", "/usr/lib/x86_64-linux-gnu/libnm.so*"),
-                               ("libmm-glib", "/usr/lib/x86_64-linux-gnu/libmm-glib.so*"),
-                               ("libxcb-xtest", "/usr/lib/x86_64-linux-gnu/libxcb-xtest.so*"),
-                               ("libavcodec", "/usr/lib/x86_64-linux-gnu/libavcodec.so*"),
-                               ("libavutil", "/usr/lib/x86_64-linux-gnu/libavutil.so*"),
-                               ("libavformat", "/usr/lib/x86_64-linux-gnu/libavformat.so*"),
-                               ("libavfilter", "/usr/lib/x86_64-linux-gnu/libavfilter.so*"),
-                               ("libswscale", "/usr/lib/x86_64-linux-gnu/libswscale.so*"),
-                               ("libva", "/usr/lib/x86_64-linux-gnu/libva*.so*"),
-                               ("libfreerdp", "/usr/lib/x86_64-linux-gnu/libfreerdp*.so*"),
-                               ("libwinpr", "/usr/lib/x86_64-linux-gnu/libwinpr*.so*"),
-                               ("libopencv_core", "/usr/lib/x86_64-linux-gnu/libopencv_core.so*"),
-                               ("libopencv_imgproc", "/usr/lib/x86_64-linux-gnu/libopencv_imgproc.so*"),
-                               ("libZXing", "/usr/lib/x86_64-linux-gnu/libZXing.so*")):
+    for libname, glob_pat in ((n, f"/usr/lib/{MULTIARCH_TRIPLET}/{pat}") for n, pat in (
+                               ("libical", "libical*.so*"),
+                               ("libhunspell", "libhunspell*.so*"),
+                               ("libsecret", "libsecret*.so*"),
+                               ("libnm", "libnm.so*"),
+                               ("libmm-glib", "libmm-glib.so*"),
+                               ("libxcb-xtest", "libxcb-xtest.so*"),
+                               ("libavcodec", "libavcodec.so*"),
+                               ("libavutil", "libavutil.so*"),
+                               ("libavformat", "libavformat.so*"),
+                               ("libavfilter", "libavfilter.so*"),
+                               ("libswscale", "libswscale.so*"),
+                               ("libva", "libva*.so*"),
+                               ("libfreerdp", "libfreerdp*.so*"),
+                               ("libwinpr", "libwinpr*.so*"),
+                               ("libopencv_core", "libopencv_core.so*"),
+                               ("libopencv_imgproc", "libopencv_imgproc.so*"),
+                               ("libZXing", "libZXing.so*"))):
         stamp = f"kde-{libname}-runtime"
         if _phase_done(_profile, stamp):
             continue
-        arch_libdir = os.path.join(target, "usr", "lib", "x86_64-linux-gnu")
+        arch_libdir = os.path.join(target, "usr", "lib", MULTIARCH_TRIPLET)
         ensure(arch_libdir)
         copied = 0
         for f in glob.glob(glob_pat):
@@ -2478,7 +3691,7 @@ def phase_kde(target):
     # build root's multiarch cmake path — they carry wrong versions (e.g. 6.6.0)
     # that cmake prefers over our freshly built KF6_VER ones.
     if not _phase_done(_profile, "kde-cmake-purge"):
-        multiarch_cmake = os.path.join(target, "usr/lib/x86_64-linux-gnu/cmake")
+        multiarch_cmake = os.path.join(target, f"usr/lib/{MULTIARCH_TRIPLET}/cmake")
         if os.path.isdir(multiarch_cmake):
             for entry in os.listdir(multiarch_cmake):
                 if any(entry.startswith(p) for p in ("KF6", "KDE", "KDecoration", "Plasma", "KWin")):
@@ -2927,7 +4140,7 @@ def _merge_qt_plugin_trees(target):
     /usr/plugins, matching the "host runtime, documented" skip-if-exists
     convention used throughout this pipeline).
     """
-    ecm_plugins_dir = os.path.join(target, "usr", "lib", "x86_64-linux-gnu", "plugins")
+    ecm_plugins_dir = os.path.join(target, "usr", "lib", MULTIARCH_TRIPLET, "plugins")
     qt_plugins_dir = os.path.join(target, "usr", "plugins")
     if not os.path.isdir(ecm_plugins_dir) or not os.path.isdir(qt_plugins_dir):
         return
@@ -2972,6 +4185,29 @@ def phase_plasma_configure(target):
     "postlogin", pam_passwdqc, system-auth) despite this rootfs being
     Debian/Ubuntu ABI throughout -- that mismatch is the root cause behind
     several of the fixes below, not something introduced here.
+
+    PAM audit status across PLM's five shipped service files (see
+    SABI.md section 5 for the declared policy this follows), as of the
+    RC4/SABI-SAPI formalization pass:
+      - postlogin, system-auth, password-auth: stubbed unconditionally
+        below (comment-only, zero real lines) so their "include" directives
+        stop hard-aborting the PAM stack. Low-risk, mirrors an
+        already-boot-verified pattern.
+      - plasmalogin-autologin: actively patched below (pam_systemd.so,
+        a real account-phase line) -- this is the only service file
+        actually exercised by a real boot so far, since SmechOS currently
+        autologins straight to desktop.
+      - plasmalogin-greeter: audited, NOT patched. Its shipped account
+        phase already has a real line ("account required pam_permit.so"),
+        used above as the model for autologin's own fix -- no gap found.
+      - plasmalogin (plain, interactive/password-based login): NOT
+        verified via any real boot in this project -- only autologin has
+        actually been tested end-to-end. password-auth is now stubbed
+        proactively since that's the file this service includes instead of
+        system-auth, but the rest of its stack is unaudited. Treat
+        interactive login as an open verification gap, not a confirmed-
+        working path, until it's actually boot-tested.
+      - systemd-user, systemd-run0: not audited in this pass.
     """
     log_phase("plasma-configure", "Configure display manager (PLM, fallback SDDM)")
     _merge_qt_plugin_trees(target)
@@ -3161,6 +4397,24 @@ def phase_plasma_configure(target):
                 f.write("# Intentionally minimal -- see phase_plasma_configure "
                          "in spk-compile.py for why this needs to exist at all.\n")
 
+        # --- password-auth: guarantee it exists ---------------------------
+        # Third authselect-style filename in the same missing-include family
+        # as postlogin/system-auth above. Plain "plasmalogin" (interactive,
+        # password-based login -- NOT the autologin path this rootfs
+        # actually boots through today) includes "password-auth" instead of
+        # "system-auth" in its auth/account/password stacks. Never actually
+        # exercised via a real boot in this project (only autologin has
+        # been), but stubbing it now closes the gap before it's hit for the
+        # first time -- e.g. once Calamares commits a real password-based
+        # user account and someone logs in without autologin. Same
+        # comment-only-stub treatment as the two files above: an include
+        # with zero lines contributes nothing but stops the hard PAM_ABORT.
+        password_auth = os.path.join(pam_dir, "password-auth")
+        if not os.path.exists(password_auth):
+            with open(password_auth, "w") as f:
+                f.write("# Intentionally minimal -- see phase_plasma_configure "
+                         "in spk-compile.py for why this needs to exist at all.\n")
+
         # --- plasmalogin-autologin: add pam_systemd.so -------------------
         # Even with auth fixed, the shipped session stack (ending in
         # "session include system-auth", whose own session stack is just
@@ -3175,6 +4429,26 @@ def phase_plasma_configure(target):
         if os.path.exists(autologin_pam):
             _pam_ensure_line(autologin_pam, r"^session\s+optional\s+pam_systemd\.so",
                               "session    optional    pam_systemd.so")
+
+            # --- plasmalogin-autologin: soften pam_selinux.so ------------
+            # phase_systemd no longer copies pam_selinux.so from the host
+            # container at all (see that phase's own comment) -- now that
+            # linux-pam is cross-built from source (bug #22) instead of
+            # container-provided, a host-container-linked pam_selinux.so
+            # would be a real dlopen() ABI mismatch against this target's
+            # from-scratch glibc, not a safe no-op. Softening its session
+            # line with "-" means a missing/failed-to-load module no longer
+            # fails the whole stack, matching the already-stubbed postlogin/
+            # system-auth convention elsewhere in this same function.
+            # NOT YET VERIFIED VIA A REAL BOOT -- same open-gap category as
+            # plasmalogin itself per SABI.md section 5; the exact control
+            # syntax PLM's shipped template uses for this line was not
+            # re-confirmed here (no live copy of the file was available to
+            # grep while making this fix), so the regex below matches on
+            # "pam_selinux.so" regardless of the control-field syntax
+            # preceding it rather than a guessed literal string.
+            _pam_make_optional(autologin_pam,
+                                r"^session\s+\S+\s+pam_selinux\.so.*$")
 
             # --- plasmalogin-autologin: give the account phase a real
             # terminal entry ---------------------------------------------
@@ -3288,11 +4562,11 @@ def phase_plasma_configure(target):
 def phase_kwin_deps(target):
     log_phase("kwin-deps", "Copy KWin compositor dependencies from host")
     libs = [
-        "/usr/lib/x86_64-linux-gnu/libdrm.so.2",
-        "/usr/lib/x86_64-linux-gnu/libxkbcommon.so.0",
-        "/usr/lib/x86_64-linux-gnu/libinput.so.10",
-        "/usr/lib/x86_64-linux-gnu/libevdev.so.2",
-        "/usr/lib/x86_64-linux-gnu/libmtdev.so.1",
+        f"/usr/lib/{MULTIARCH_TRIPLET}/libdrm.so.2",
+        f"/usr/lib/{MULTIARCH_TRIPLET}/libxkbcommon.so.0",
+        f"/usr/lib/{MULTIARCH_TRIPLET}/libinput.so.10",
+        f"/usr/lib/{MULTIARCH_TRIPLET}/libevdev.so.2",
+        f"/usr/lib/{MULTIARCH_TRIPLET}/libmtdev.so.1",
     ]
     dst = os.path.join(target, "usr", "lib")
     ensure(dst)
@@ -3362,7 +4636,7 @@ def phase_xwayland_deps(target):
         shutil.copy2("/usr/bin/xkbcomp", tmp)
         shutil.copytree("/usr/share/X11/xkb", os.path.join(tmp, "xkb"), dirs_exist_ok=True)
         for lib in extra_libs:
-            real = os.path.realpath(f"/lib/x86_64-linux-gnu/{lib}")
+            real = os.path.realpath(f"/lib/{MULTIARCH_TRIPLET}/{lib}")
             shutil.copy2(real, os.path.join(tmp, os.path.basename(real)))
     else:
         # Not already in a matching container (e.g. running spk-compile.py
@@ -3392,14 +4666,14 @@ def phase_xwayland_deps(target):
             for lib in extra_libs:
                 proc = subprocess.run(
                     ["podman", "exec", container, "bash", "-c",
-                     f"readlink -f /lib/x86_64-linux-gnu/{lib}"],
+                     f"readlink -f /lib/{MULTIARCH_TRIPLET}/{lib}"],
                     capture_output=True, text=True, check=True)
                 real = proc.stdout.strip()
                 run(["podman", "cp", f"{container}:{real}", os.path.join(tmp, os.path.basename(real))])
         finally:
             run(["podman", "rm", "-f", container], check=False)
 
-    arch_libdir = os.path.join(target, "usr", "lib", "x86_64-linux-gnu")
+    arch_libdir = os.path.join(target, "usr", "lib", MULTIARCH_TRIPLET)
     ensure(arch_libdir)
     ensure(os.path.join(target, "usr", "bin"))
     ensure(os.path.join(target, "usr", "share", "X11"))
@@ -3432,7 +4706,7 @@ def phase_qt6uitools(target):
     if os.path.exists(os.path.join(target, "usr", "lib", "libQt6UiTools.so")):
         log("Qt6UITools already present.", color=GREEN)
         return
-    for candidate in ["/usr/lib/x86_64-linux-gnu/libQt6UiTools.so",
+    for candidate in [f"/usr/lib/{MULTIARCH_TRIPLET}/libQt6UiTools.so",
                       "/usr/lib/libQt6UiTools.so"]:
         if os.path.exists(candidate):
             shutil.copy2(candidate, os.path.join(target, "usr", "lib"))
@@ -3761,7 +5035,7 @@ def phase_bundle_packages(target):
         "usr/lib/libGL.so.1", "usr/lib/libEGL.so.1",
         "usr/lib/libgbm.so.1", "usr/lib/libglapi.so.0",
         "usr/lib/libvulkan.so.1",
-        "usr/lib/x86_64-linux-gnu/dri", "usr/lib/x86_64-linux-gnu/gallium-pipe",
+        f"usr/lib/{MULTIARCH_TRIPLET}/dri", f"usr/lib/{MULTIARCH_TRIPLET}/gallium-pipe",
         "usr/share/vulkan", "usr/share/glvnd",
     ])
 
@@ -3812,9 +5086,9 @@ def phase_bundle_packages(target):
         "usr/bin/plasmashell", "usr/bin/kwin_wayland",
         "usr/bin/sddm", "usr/bin/startplasma-wayland",
         "usr/bin/krunner", "usr/bin/kscreen-doctor",
-        "usr/lib/x86_64-linux-gnu/libPlasma.so.7",
+        f"usr/lib/{MULTIARCH_TRIPLET}/libPlasma.so.7",
         "usr/lib/libPlasmaQuick.so.7",
-        "usr/lib/x86_64-linux-gnu/plugins/kwin",
+        f"usr/lib/{MULTIARCH_TRIPLET}/plugins/kwin",
         "usr/share/plasma", "usr/share/sddm",
         "usr/share/applications/org.kde.plasmashell.desktop",
         "etc/sddm.conf.d",
@@ -3840,7 +5114,7 @@ def phase_bundle_packages(target):
     # without it the script backend fails immediately at runtime.
     tar_paths("packagekit-spk", [
         "usr/libexec/packagekitd",
-        "usr/lib/x86_64-linux-gnu/packagekit-backend",
+        f"usr/lib/{MULTIARCH_TRIPLET}/packagekit-backend",
         "usr/lib/packagekit-backend",
         "usr/bin/spk",
         "usr/share/dbus-1/system-services/org.freedesktop.PackageKit.service",
@@ -4024,10 +5298,12 @@ def _bootstrap_glibc_runtime(target):
 
     This is a deliberate, already-documented project decision, not a new
     independence gap: phase_bootstrap_userland_glibc's own docstring says
-    "against host glibc", and building glibc itself from source remains
-    explicitly out of scope for now (see the SABI/SAPI notes) -- every
-    from-scratch-style distro bootstraps from *some* host toolchain's
-    libc. What was missing was just actually copying it into the image.
+    "against host glibc", and building glibc itself from source is tracked
+    as in-progress work targeting a future release, not this one -- see
+    SABI.md section 1 ("libc and toolchain floor") for the full contract
+    and current status. Every from-scratch-style distro bootstraps from
+    *some* host toolchain's libc at first. What was missing here was just
+    actually copying it into the image.
     """
     before_snapshot = _snapshot_tree(target)
     # {target}/lib is routinely a real, already-populated directory by this
@@ -4077,10 +5353,10 @@ def _bootstrap_glibc_runtime(target):
     ensure(lib64_dir)
     interp_link = os.path.join(lib64_dir, "ld-linux-x86-64.so.2")
     if not os.path.islink(interp_link) and not os.path.exists(interp_link):
-        symlink("../lib/x86_64-linux-gnu/ld-linux-x86-64.so.2", interp_link)
+        symlink(f"../lib/{MULTIARCH_TRIPLET}/ld-linux-x86-64.so.2", interp_link)
 
-    host_multiarch = "/usr/lib/x86_64-linux-gnu"
-    dst_multiarch = os.path.join(target, "usr", "lib", "x86_64-linux-gnu")
+    host_multiarch = f"/usr/lib/{MULTIARCH_TRIPLET}"
+    dst_multiarch = os.path.join(target, "usr", "lib", MULTIARCH_TRIPLET)
     ensure(dst_multiarch)
     copied = 0
     for name in os.listdir(host_multiarch):
@@ -4343,8 +5619,8 @@ def _bootstrap_glibc_runtime(target):
     # not left alongside) whenever the host's version differs -- the
     # SONAME symlink (libdbus-1.so.3) stays ABI-stable for every other
     # consumer already linked against it.
-    host_libdbus_dir = "/usr/lib/x86_64-linux-gnu"
-    target_libdbus_dir = os.path.join(target, "usr", "lib", "x86_64-linux-gnu")
+    host_libdbus_dir = f"/usr/lib/{MULTIARCH_TRIPLET}"
+    target_libdbus_dir = os.path.join(target, "usr", "lib", MULTIARCH_TRIPLET)
     host_libdbus_versioned = None
     for name in os.listdir(host_libdbus_dir):
         if name.startswith("libdbus-1.so.") and name[len("libdbus-1.so."):].split(".")[0].isdigit():
@@ -4532,14 +5808,23 @@ def _resolve_systemd_version():
     return "261.1"
 
 def phase_systemd(target):
-    """Compile systemd from source (with libcap + util-linux deps)."""
+    """Compile systemd from source (with libcap + util-linux deps), now
+    cross-compiled with the RC4/FNDE toolchain (CROSS_TRIPLET) -- except
+    gperf, deliberately left native: it's a pure build-time code generator
+    invoked by systemd's own build to emit hash-table C source, never
+    linked into any target binary, so its own ABI is irrelevant and
+    cross-compiling it would only add risk for no benefit."""
     systemd_ver = _resolve_systemd_version()
-    log_phase("systemd", f"Compile systemd {systemd_ver} from source")
+    log_phase("systemd", f"Compile systemd {systemd_ver} from source (cross: {CROSS_TRIPLET})")
     src    = sources(target)
     env    = build_env_glibc(target)
     prefix = f"{target}/usr"
+    cross_env = dict(env)
+    cross_env["CC"] = f"{CROSS_TRIPLET}-gcc"
+    cross_env["CXX"] = f"{CROSS_TRIPLET}-g++"
+    cross_env["PATH"] = f"{CROSS_TOOLCHAIN_BIN}:{cross_env.get('PATH', '/usr/local/bin:/usr/bin:/bin')}"
 
-    # ── gperf (needed for systemd hash table generation) ──────────────────────
+    # ── gperf (build-time only -- stays NATIVE, see docstring) ────────────────
     before_snapshot = _snapshot_tree(target)
     gperf_ver = "3.1"
     gperf_url = f"https://ftp.gnu.org/gnu/gperf/gperf-{gperf_ver}.tar.gz"
@@ -4564,12 +5849,32 @@ def phase_systemd(target):
     bd = os.path.join(BUILD_TMP, "libcap")
     shutil.rmtree(bd, ignore_errors=True)
     extract(tarball, bd)
-    cap_env = dict(env)
+    cap_env = dict(cross_env)
     cap_env["prefix"] = prefix
-    run(["make", "-j", nproc(), f"prefix={prefix}", "lib=lib",
-         "GOLANG=no", "PYTHON=no"], cwd=bd, env=cap_env)
-    run(["make", "install", f"prefix={prefix}", "lib=lib",
-         "GOLANG=no", "PYTHON=no"], cwd=bd, env=cap_env,
+    # libcap's own Make.Rules has "CC := $(CROSS_COMPILE)gcc" -- an
+    # immediate (":=") assignment, which GNU Make evaluates at parse time
+    # using whatever CROSS_COMPILE already is, then overrides any later
+    # environment CC. Setting env["CC"] alone (as the pre-cross phase did)
+    # is silently ignored; CROSS_COMPILE must be passed as a make
+    # command-line variable instead, exactly like phase_kernel's
+    # cross_args convention.
+    cross_compile_arg = f"CROSS_COMPILE={CROSS_TRIPLET}-"
+    # libcap's own Make.Rules auto-detects PAM_CAP via a bare shell test
+    # against the CONTAINER's own unprefixed /usr/include/security/
+    # pam_modules.h (`PAM_CAP ?= $(shell if [ -f /usr/include/security/
+    # pam_modules.h ]; ...)`) -- no sysroot/cross-awareness at all, and
+    # the container does have libpam dev headers installed, so this
+    # silently auto-enables building pam_cap.so with the CROSS compiler
+    # against headers that only exist on the container, not under
+    # {target}. Confirmed real: failed with a bare "security/pam_modules.h:
+    # No such file or directory". SABI.md section 5's own already-declared
+    # policy is that PAM modules are container-provided, not cross-built,
+    # so PAM_CAP=no here isn't a workaround -- it's the correct value for
+    # a policy this project already committed to.
+    run(["make", cross_compile_arg, "-j", nproc(), f"prefix={prefix}", "lib=lib",
+         "GOLANG=no", "PYTHON=no", "PAM_CAP=no"], cwd=bd, env=cap_env)
+    run(["make", cross_compile_arg, "install", f"prefix={prefix}", "lib=lib",
+         "GOLANG=no", "PYTHON=no", "PAM_CAP=no"], cwd=bd, env=cap_env,
         sudo=(os.geteuid() != 0))
     _record_component_manifest(target, "libcap", target, before_snapshot, pkg_version=libcap_ver)
     log("libcap installed.", color=GREEN)
@@ -4595,11 +5900,50 @@ def phase_systemd(target):
     # safer choice here: worth the extra build time to not silently miss
     # another one.
     run(["./configure", f"--prefix={prefix}",
+         f"--host={CROSS_TRIPLET}",
          "--enable-libmount", "--enable-libblkid",
          "--enable-libuuid",
-         "--without-python", "--disable-nls"], cwd=bd, env=env)
-    run(["make", "-j", nproc()], cwd=bd, env=env)
-    run(["make", "install"], cwd=bd, env=env, sudo=(os.geteuid() != 0))
+         # liblastlog2 defaults to enabled (part of util-linux's own
+         # "build everything" default state) and hard-requires sqlite3,
+         # which isn't in phase_cross_deps's chain -- confirmed real:
+         # configure died outright with "liblastlog2 selected, but
+         # required sqlite3 library not available". It replaces the
+         # traditional flat-file /var/log/lastlog with a sqlite3-backed
+         # one; login-tracking isn't a feature this profile needs, and
+         # pam_lastlog2 is disabled by the same flag, so this doesn't
+         # silently lose anything this profile's PAM stack (SABI.md
+         # section 5) actually uses.
+         "--disable-liblastlog2",
+         # util-linux's own `--with-systemd` default ("check") auto-
+         # detects libsystemd via a bare `pkg-config --exists` text check,
+         # which succeeds against the CONTAINER's libsystemd.pc regardless
+         # of whether the cross-compiler can actually see those headers --
+         # it can't (a crosstool-ng cross-gcc has its own sysroot, not the
+         # container's /usr/include). Confirmed real: configure reported
+         # "checking for libsystemd... yes", then the actual build died
+         # with "systemd/sd-journal.h: No such file or directory". Also
+         # genuinely unavailable for a structural reason, not just this
+         # header-visibility issue: libsystemd itself hasn't been cross-
+         # built into {target}/usr yet at this point -- it's built LATER
+         # in this same phase_systemd(), after util-linux. Journal-based
+         # login records (login-utils/lslogins' only use of this) are an
+         # optional nice-to-have, not a feature this profile depends on.
+         "--without-systemd",
+         # Same bug class as --without-systemd above: `--with-tinfo=auto`
+         # detected the CONTAINER's tinfo.pc (confirmed present via
+         # `pkg-config --exists tinfo`) and reported "checking for
+         # tinfo... yes", but ncurses/tinfo isn't cross-built into
+         # {target}/usr at all -- confirmed real: the actual link step for
+         # hexdump failed with "cannot find -ltinfo". Unlike the earlier
+         # --disable-all-programs lesson (silently dropped whole programs,
+         # discovered only at boot), this is a single optional library
+         # feature (hexdump's color-highlighted output) on one program,
+         # not a program disappearing -- a much narrower, safe scope
+         # decision, same as --disable-nls/--without-python above.
+         "--without-tinfo",
+         "--without-python", "--disable-nls"], cwd=bd, env=cross_env)
+    run(["make", "-j", nproc()], cwd=bd, env=cross_env)
+    run(["make", "install"], cwd=bd, env=cross_env, sudo=(os.geteuid() != 0))
     _record_component_manifest(target, "util-linux", target, before_snapshot, pkg_version=ul_ver)
     log("util-linux (full program set + libmount/libblkid/libuuid) installed.",
         color=GREEN)
@@ -4623,20 +5967,109 @@ def phase_systemd(target):
             # (see Dockerfile.build). No new build dependency needed, just
             # this flag.
             "-Dpam=enabled",
+            # Bug #25: ninja got to step 1752/2577 before failing on
+            # test-bus-marshal.c.o with "dbus/dbus-arch-deps.h: No such
+            # file or directory" -- a TEST binary (TEST_CODE=1, confirmed
+            # in the actual compile invocation) pulling in the container's
+            # own unprefixed /usr/include/dbus-1.0, /usr/include/glib-2.0,
+            # and /usr/include/sysprof-6, used only to cross-validate
+            # sd-bus's wire format against the real reference dbus library.
+            # Same container-leak pattern as bug class #1, but chasing each
+            # test's own leaked dependency one at a time would be a bad use
+            # of time -- these ~1800 test binaries can't even run on this
+            # host anyway (they're built with the cross compiler, nothing
+            # here executes them), same reasoning already applied to
+            # wayland-protocols's -Dtests=false earlier in this chain.
+            # meson_options.txt's own 'tests' option is a combo
+            # ['true','unsafe','false'], not a plain feature -- 'false' is
+            # the real value, not 'disabled'.
+            "-Dtests=false",
             "-Daudit=disabled",
             "-Dselinux=disabled",
             "-Dlibcryptsetup=disabled",
             "-Dlibcryptsetup-plugins=disabled",
             "-Dgcrypt=disabled",
+            # OpenSSL defaulted to "auto" (no explicit flag existed for it
+            # at all before this) and got auto-detected via the same
+            # container-fallback path as every other "found via pkg-config,
+            # unusable by the cross compiler" bug this session -- confirmed
+            # real: "openssl/bio.h: No such file or directory" pulled in via
+            # src/shared/tpm2-util.h -> crypto-util.h. Unlike acl/seccomp,
+            # OpenSSL is a genuinely large library to cross-build correctly
+            # (not a same-afternoon job); its sibling crypto backend
+            # (gcrypt, immediately above) is already disabled, and TPM2
+            # disk-unlock sealing (openssl's only consumer here) is an
+            # optional feature this profile doesn't need -- disabling both
+            # is the consistent call, not a shortcut.
+            "-Dopenssl=disabled",
+            "-Dtpm2=disabled",
+            # Same auto-detect-via-container pattern, next one: "archive.h:
+            # No such file or directory" from src/shared/libarchive-util.c.
+            # libarchive backs sysext/confext/portable-image extraction --
+            # none of which this live/desktop profile uses -- and pulling
+            # it in would reintroduce the exact xz/bzip2 dependency this
+            # chain already deliberately dropped (libarchive needs at
+            # least one real compression backend to be useful). Disabled
+            # for the same reason as those.
+            "-Dlibarchive=disabled",
+            # Bug #21: "crypt.h: No such file or directory" from
+            # src/shared/libcrypt-util.c. Not a link-time dependency --
+            # it's dlopen()'d at runtime (dlopen_libcrypt(), same file) --
+            # but meson still gates the #include behind HAVE_LIBCRYPT,
+            # which it sets by probing for a real libcrypt/libxcrypt dev
+            # package. Modern glibc dropped crypt()/libcrypt entirely (the
+            # replacement is the separate libxcrypt project), and this
+            # from-scratch cross glibc doesn't ship it either. Its only
+            # callers are firstboot/sysusers initial-password hashing and
+            # homed's password-quality checks -- optional profile features,
+            # same call as openssl/tpm2/libarchive above, not a shortcut.
+            "-Dlibcrypt=disabled",
+            # Bug #24, same "found via the container's own pkg-config,
+            # unusable by the cross compiler" pattern as bug class #1:
+            # meson's `dependency('libpcre2-8', required: get_option(...))`
+            # auto-detected the container's own unprefixed pcre2-8.pc and
+            # reported HAVE_PCRE2=1, but the cross sysroot has no pcre2.h,
+            # so the actual compile failed. Only consumers are journalctl's
+            # `-g PATTERN` regex grep and unit-file condition matching
+            # (src/core/load-fragment.c) -- a convenience feature, not
+            # boot-critical, same call as openssl/tpm2/libarchive above.
+            "-Dpcre2=disabled",
             "-Dp11kit=disabled",
             "-Dapparmor=disabled",
             "-Dmicrohttpd=disabled",
             "-Dlibcurl=disabled",
             "-Dlibidn2=disabled",
-            "-Dlibidn=disabled",
             "-Dqrencode=disabled",
             "-Dpolkit=disabled",
             "-Delfutils=disabled",
+            # Same recurring pattern as the util-linux/kmod fixes earlier
+            # this session: "xz" defaults to auto, meson's configure-time
+            # pkg-config check found the CONTAINER's liblzma (not cross-
+            # built, not under {target}), and the real compile then failed
+            # outright on "lzma.h: No such file or directory" in
+            # src/basic/compress.c. journal/coredump xz compression is
+            # optional (zstd, already cross-built and left enabled by
+            # default, covers the same need); not worth adding liblzma as
+            # yet another new chain dependency for it.
+            "-Dxz=disabled",
+            # Same story as xz immediately above, just the next compression
+            # backend systemd's src/basic/compress.c tries in turn once xz
+            # was off -- "lz4.h: No such file or directory", lz4 not in
+            # this chain either. zstd (kept enabled) already covers the
+            # same need; pinning default-compression explicitly avoids any
+            # "auto" ambiguity now that both alternatives are off.
+            "-Dlz4=disabled",
+            # Same story again -- src/basic/compress.c unconditionally
+            # handles exactly five compression backends (confirmed by
+            # reading the file directly: XZ, LZ4, ZSTD, ZLIB, BZIP2, each
+            # gated behind its own #if HAVE_X around both the #include and
+            # the function bodies), and bzip2 is the third one not in this
+            # chain -- "bzlib.h: No such file or directory" once xz and
+            # lz4 were both out of the way. zstd and zlib (both already
+            # cross-built, both left enabled) are the only two backends
+            # this chain actually needs.
+            "-Dbzip2=disabled",
+            "-Ddefault-compression=zstd",
             "-Dkmod=enabled",
             "-Dukify=disabled",
             "-Dbootloader=disabled",
@@ -4645,88 +6078,35 @@ def phase_systemd(target):
             "-Dfallback-hostname=smechos",
             "-Dmode=release",
         ],
-        env=env, build_dir=os.path.join(BUILD_TMP, "systemd-build"),
-        pkg_name="systemd", pkg_version=systemd_ver)
+        env=cross_env, build_dir=os.path.join(BUILD_TMP, "systemd-build"),
+        pkg_name="systemd", pkg_version=systemd_ver,
+        cross_file=_meson_cross_file())
     log(f"systemd {systemd_ver} installed.", color=GREEN)
     before_snapshot = _snapshot_tree(target)
 
-    # liblz4-dev (see Dockerfile.build) satisfies the build-time header
-    # need, but systemd links a real NEEDED liblz4.so.1 once HAVE_LZ4=1 --
-    # the resulting binaries can't even start without it present in the
-    # shipped rootfs. Copy the container's real runtime .so in, same
-    # pattern as the libical/libhunspell/etc. seeds in phase_kde -- this
-    # one has to live here instead since systemd builds far earlier.
-    arch_libdir = os.path.join(target, "usr", "lib", "x86_64-linux-gnu")
+    # Bug #26: all five host-container-copy blocks that used to live here
+    # (liblz4, libkmod, libacl, libseccomp, libarchive) are now stale,
+    # confirmed by reading each one against what's actually true in this
+    # chain today, for two different reasons rather than one:
+    #   - lz4 and libarchive are flatly disabled for this build now
+    #     (-Dlz4=disabled or folded into -Ddefault-compression=zstd, and
+    #     -Dlibarchive=disabled) -- not needed at all, let alone from the
+    #     container.
+    #   - kmod, acl, and seccomp are no longer container-provided at all --
+    #     all three are cross-built from source earlier in phase_cross_deps
+    #     now (bugs #13, #17, #18), landing at their correct target paths
+    #     already. This code was still trying to copy a SECOND, wrong-ABI
+    #     (container-glibc-linked) copy from
+    #     /usr/lib/{MULTIARCH_TRIPLET}/*.so* into a *different* directory
+    #     than where the real cross-built ones live -- redundant even when
+    #     it worked, and now hard-failing outright because the container
+    #     doesn't have these under that path at all. Confirmed real:
+    #     "No liblz4.so* found in the build container" on a run that had
+    #     already gotten through the entire rest of phase_systemd clean.
+    #     Removed rather than patched -- there's nothing left for this
+    #     block to correctly do.
+    arch_libdir = os.path.join(target, "usr", "lib", MULTIARCH_TRIPLET)
     ensure(arch_libdir)
-    # A re-run of this phase after a later step fails (the normal case while
-    # iterating on the build) re-enters here from the top -- these dest
-    # files from the previous attempt are already in place, so copy2 must
-    # overwrite rather than crash on FileExistsError for the symlinks.
-    lz4_copied = 0
-    for f in glob.glob("/usr/lib/x86_64-linux-gnu/liblz4.so*"):
-        dst = os.path.join(arch_libdir, os.path.basename(f))
-        if os.path.lexists(dst):
-            os.remove(dst)
-        shutil.copy2(f, dst, follow_symlinks=False)
-        lz4_copied += 1
-    if lz4_copied == 0:
-        err("No liblz4.so* found in the build container -- is liblz4-dev "
-            "installed? (see Dockerfile.build)")
-    log(f"Copied {lz4_copied} liblz4 runtime file(s) into target rootfs", color=GREEN)
-
-    # libkmod-dev (see Dockerfile.build): -Dkmod=enabled links a real NEEDED
-    # libkmod.so.2 into systemd-udevd. Without it (and without this copy,
-    # same pattern as liblz4 above), udev has no way to auto-load any
-    # module-only (=m) driver for hotplugged/PCI-probed hardware -- confirmed
-    # via boot-test as the reason virtio_gpu, and by extension any real GPU/
-    # NIC/storage driver built as a module, never loads on a live boot.
-    kmod_copied = 0
-    for f in glob.glob("/usr/lib/x86_64-linux-gnu/libkmod.so*"):
-        dst = os.path.join(arch_libdir, os.path.basename(f))
-        if os.path.lexists(dst):
-            os.remove(dst)
-        shutil.copy2(f, dst, follow_symlinks=False)
-        kmod_copied += 1
-    if kmod_copied == 0:
-        err("No libkmod.so* found in the build container -- is libkmod-dev "
-            "installed? (see Dockerfile.build)")
-    log(f"Copied {kmod_copied} libkmod runtime file(s) into target rootfs", color=GREEN)
-
-    acl_copied = 0
-    for f in glob.glob("/usr/lib/x86_64-linux-gnu/libacl.so*"):
-        dst = os.path.join(arch_libdir, os.path.basename(f))
-        if os.path.lexists(dst):
-            os.remove(dst)
-        shutil.copy2(f, dst, follow_symlinks=False)
-        acl_copied += 1
-    if acl_copied == 0:
-        err("No libacl.so* found in the build container -- is libacl1-dev "
-            "installed? (see Dockerfile.build)")
-    log(f"Copied {acl_copied} libacl runtime file(s) into target rootfs", color=GREEN)
-
-    seccomp_copied = 0
-    for f in glob.glob("/usr/lib/x86_64-linux-gnu/libseccomp.so*"):
-        dst = os.path.join(arch_libdir, os.path.basename(f))
-        if os.path.lexists(dst):
-            os.remove(dst)
-        shutil.copy2(f, dst, follow_symlinks=False)
-        seccomp_copied += 1
-    if seccomp_copied == 0:
-        err("No libseccomp.so* found in the build container -- is libseccomp-dev "
-            "installed? (see Dockerfile.build)")
-    log(f"Copied {seccomp_copied} libseccomp runtime file(s) into target rootfs", color=GREEN)
-
-    archive_copied = 0
-    for f in glob.glob("/usr/lib/x86_64-linux-gnu/libarchive.so*"):
-        dst = os.path.join(arch_libdir, os.path.basename(f))
-        if os.path.lexists(dst):
-            os.remove(dst)
-        shutil.copy2(f, dst, follow_symlinks=False)
-        archive_copied += 1
-    if archive_copied == 0:
-        err("No libarchive.so* found in the build container -- is libarchive-dev "
-            "installed? (see Dockerfile.build)")
-    log(f"Copied {archive_copied} libarchive runtime file(s) into target rootfs", color=GREEN)
 
     # PAM module search path mismatch: this rootfs's actual PAM implementation
     # looks for modules in /usr/lib/security (confirmed by pam_cap.so and
@@ -4744,7 +6124,7 @@ def phase_systemd(target):
         src_path = os.path.join(pam_multiarch_dir, pam_mod)
         dst_path = os.path.join(pam_legacy_dir, pam_mod)
         if os.path.exists(src_path) and not os.path.lexists(dst_path):
-            symlink(f"/usr/lib/x86_64-linux-gnu/security/{pam_mod}", dst_path)
+            symlink(f"/usr/lib/{MULTIARCH_TRIPLET}/security/{pam_mod}", dst_path)
     log("pam_systemd.so linked into /usr/lib/security (where this PAM actually looks).",
         color=GREEN)
 
@@ -4768,17 +6148,34 @@ def phase_systemd(target):
     # container that Debian doesn't ship it at all (it's a separate
     # Fedora/authselect-only module name; Debian's nearest equivalent,
     # pam_sepermit.so, isn't referenced by any of PLM's shipped configs).
-    # pam_selinux.so, by contrast, genuinely IS part of Debian's
-    # libpam-modules and IS required (non-optional) in plasmalogin-
-    # autologin's session stack -- included below. With SELinux actually
-    # disabled at the kernel level, pam_selinux.so's own
-    # is_selinux_enabled() check makes it a safe no-op at runtime; it just
-    # needs to dlopen successfully.
-    host_pam_multiarch_dir = "/usr/lib/x86_64-linux-gnu/security"
+    # pam_selinux.so is deliberately NOT in this list, unlike when this
+    # comment was first written. It genuinely IS part of Debian's
+    # libpam-modules and was required (non-optional) in plasmalogin-
+    # autologin's session stack -- the reasoning at the time was that with
+    # SELinux disabled at the kernel level, its is_selinux_enabled() check
+    # makes it a safe no-op, it just needs to dlopen successfully. That
+    # reasoning assumed this host-copy's whole premise: container glibc ==
+    # target glibc, which RC4's cross-toolchain pivot ended. This copy's
+    # source, /usr/lib/{MULTIARCH_TRIPLET}/security on the container, is
+    # linked against the CONTAINER's own glibc -- a real dlopen() ABI
+    # mismatch risk against this from-scratch target glibc now, the same
+    # category of failure already hit with Mesa's intel_clc this session
+    # (GLIBC_PRIVATE symbol versioning). Since linux-pam itself is now
+    # cross-built from source (bug #22), every *other* module in this list
+    # (pam_unix, pam_nologin, pam_env, pam_permit, pam_deny, pam_keyinit,
+    # pam_loginuid, pam_namespace, pam_umask) already exists at dst_path by
+    # the time this runs, so the `not os.path.lexists(dst_path)` guard
+    # below already skips them -- pam_selinux.so was the one real gap,
+    # since Linux-PAM upstream doesn't ship it at all (it's SELinux
+    # userspace's own module). Correct fix isn't copying a wrong-ABI file;
+    # it's not needing the module at all. See the _pam_make_optional call
+    # in phase_plasma_configure for the other half of this fix -- not yet
+    # verified via a real boot, same open-verification-gap category as the
+    # rest of plasmalogin-autologin's PAM stack per SABI.md section 5.
+    host_pam_multiarch_dir = f"/usr/lib/{MULTIARCH_TRIPLET}/security"
     base_pam_mods = ("pam_unix.so", "pam_nologin.so", "pam_env.so",
                       "pam_permit.so", "pam_deny.so", "pam_keyinit.so",
-                      "pam_loginuid.so", "pam_namespace.so", "pam_umask.so",
-                      "pam_selinux.so")
+                      "pam_loginuid.so", "pam_namespace.so", "pam_umask.so")
     base_pam_copied = 0
     for pam_mod in base_pam_mods:
         src_path = os.path.join(host_pam_multiarch_dir, pam_mod)
@@ -5179,9 +6576,11 @@ def phase_calamares(target):
     # ever created them -- confirmed via a real boot test: `calamares` binary
     # itself launches fine (dbus/render-node/messagebus fixes all hold), but
     # immediately bails FATAL: "Slideshow file .../show.qml does not exist or
-    # is not a valid QML file." Real SmechOS branding art doesn't exist yet,
-    # so generate minimal placeholders (pure Python stdlib PNG writer, no new
-    # build dependency) rather than block the installer on branding assets.
+    # is not a valid QML file." _write_minimal_png is the real-asset-missing
+    # fallback (pure Python stdlib PNG writer, no new build dependency) --
+    # same "copy real asset if present, otherwise don't block the build"
+    # pattern phase_patch_metadata already uses for smechos-logo.svg/png
+    # (config/branding/), not a new convention.
     def _write_minimal_png(path, size=256, rgb=(30, 30, 46)):
         w = h = size
         raw = bytearray()
@@ -5197,17 +6596,185 @@ def phase_calamares(target):
         png += chunk(b"IEND", b"")
         with open(path, "wb") as f:
             f.write(png)
-    _write_minimal_png(os.path.join(brand_dir, "smechos.png"), rgb=(137, 180, 250))
-    _write_minimal_png(os.path.join(brand_dir, "show.png"), rgb=(30, 30, 46))
+
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    branding_src = os.path.join(repo_root, "config", "branding")
+    mascot_src = os.path.join(branding_src, "smechos-mascot.png")
+    slideshow_bg_src = os.path.join(branding_src, "smechos-slideshow-bg.png")
+
+    if os.path.exists(mascot_src):
+        shutil.copy2(mascot_src, os.path.join(brand_dir, "smechos.png"))
+        shutil.copy2(mascot_src, os.path.join(brand_dir, "mascot.png"))
+    else:
+        _write_minimal_png(os.path.join(brand_dir, "smechos.png"), rgb=(137, 180, 250))
+        _write_minimal_png(os.path.join(brand_dir, "mascot.png"), rgb=(137, 180, 250))
+        log(f"No {mascot_src} -- using a generated placeholder for the icon "
+            f"and slideshow mascot.", color=YELLOW)
+
+    if os.path.exists(slideshow_bg_src):
+        shutil.copy2(slideshow_bg_src, os.path.join(brand_dir, "show.png"))
+        shutil.copy2(slideshow_bg_src, os.path.join(brand_dir, "slideshow-bg.png"))
+    else:
+        _write_minimal_png(os.path.join(brand_dir, "show.png"), rgb=(30, 30, 46))
+        _write_minimal_png(os.path.join(brand_dir, "slideshow-bg.png"), rgb=(30, 30, 46))
+        log(f"No {slideshow_bg_src} -- using a generated placeholder for the "
+            f"welcome image and slideshow background.", color=YELLOW)
+
+    # Real install slideshow, replacing the placeholder stub above's
+    # sibling content. This project's own branding.desc sets no
+    # slideshowAPI (unlike Calamares' own default example), which means
+    # API 1 applies: a Presentation's `activatedInCalamares` property goes
+    # true while this page is showing, and a Timer bound to it drives
+    # goToNextSlide() -- confirmed directly against Calamares' own default
+    # branding component's show.qml (calamares.slideshow 1.0's real API),
+    # not guessed. Six slides: the SmechOS mascot (see config/branding/
+    # smechos-mascot.png) "speaking" over a crop of the real Lesobinaska
+    # FNDE wallpaper (branding/lesobinaska-fnde/wallpaper.png -- that
+    # directory's own README documents it as a manual, hand-applied
+    # desktop-wallpaper easter egg, deliberately not wired into this file;
+    # reusing the art for the *install slideshow* is a separate, new
+    # integration point, not a change to that existing decision). Speech
+    # bubble is a plain rounded Rectangle, not a Canvas-drawn tail shape --
+    # fewer QML module dependencies, same visual idea proven first as a
+    # Pillow mockup before writing this.
+    #
+    # The Firefox slide says plainly that it's Mozilla's own build, not
+    # SmechOS's -- phase_firefox (this file) genuinely just downloads the
+    # official linux64 tarball today, confirmed by reading it. Compiling
+    # Firefox from source is a real, large undertaking (Rust/cargo,
+    # Mozilla's own ./mach bootstrap, SpiderMonkey, hours even natively)
+    # that doesn't belong in tonight's scope -- the install slideshow
+    # should not claim it's already true.
+    # (title, spoken line) pairs, one Slide per entry. Slide MUST be a
+    # direct child of Presentation -- confirmed against Calamares' own
+    # default branding component's show.qml -- Presentation scans its own
+    # children for Slide-typed items to build slide navigation, so an
+    # earlier draft of this that wrapped each Slide in a Loader/Component
+    # for reuse would have shown zero real slides. Generated as an
+    # explicit block per slide instead, from this plain data list, so the
+    # content stays easy to read/edit without duplicating QML by hand.
+    slideshow_slides = [
+        ("Welcome", "Hi! I'm building SmechOS from real source -- nothing repackaged here."),
+        ("The Toolchain", "Even my own toolchain is ours. glibc, compiled from scratch, just for me."),
+        ("spk", "spk handles it all: installs, upgrades, and compiling straight from source."),
+        ("Open Standards", "No black boxes. Open standards, start to finish -- hardware and software."),
+        ("Firefox", "Firefox is in here too -- for now, Mozilla's own build. Compiling it ourselves is next."),
+        ("Almost There", "Thanks for installing SmechOS! os.smech.xyz"),
+    ]
+    _slide_tpl = textwrap.dedent("""\
+                Slide {
+                    Image {
+                        anchors.fill: parent
+                        source: "slideshow-bg.png"
+                        fillMode: Image.PreserveAspectCrop
+                    }
+
+                    Rectangle {
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.bottom: parent.bottom
+                        height: parent.height * 0.42
+                        gradient: Gradient {
+                            GradientStop { position: 0.0; color: "#00000000" }
+                            GradientStop { position: 1.0; color: "#aa0a0814" }
+                        }
+                    }
+
+                    Text {
+                        id: titleText__N__
+                        text: "__TITLE__"
+                        color: "#deb46e"
+                        font.pixelSize: 26
+                        font.bold: true
+                        x: 40
+                        y: 36
+                    }
+                    Rectangle {
+                        x: 40
+                        y: titleText__N__.y + titleText__N__.height + 4
+                        width: titleText__N__.paintedWidth
+                        height: 3
+                        color: "#deb46e"
+                    }
+
+                    Image {
+                        id: mascotImage__N__
+                        source: "mascot.png"
+                        x: 40
+                        y: parent.height - height - 18
+                        width: 170
+                        height: 170
+                        fillMode: Image.PreserveAspectFit
+                    }
+
+                    Rectangle {
+                        radius: 22
+                        color: "#f5ecd7"
+                        x: mascotImage__N__.x + mascotImage__N__.width - 10
+                        y: parent.height - mascotImage__N__.height + 10
+                        width: Math.min(parent.width - x - 40, bubbleText__N__.paintedWidth + 48)
+                        height: bubbleText__N__.paintedHeight + 36
+
+                        Text {
+                            id: bubbleText__N__
+                            text: "__LINE__"
+                            color: "#1a162a"
+                            font.pixelSize: 17
+                            wrapMode: Text.WordWrap
+                            anchors.fill: parent
+                            anchors.margins: 18
+                            anchors.leftMargin: 24
+                        }
+                    }
+
+                    Text {
+                        text: "SmechOS -- Founder Name Day Edition"
+                        color: "#c8c8d2"
+                        font.pixelSize: 11
+                        x: 40
+                        y: parent.height - 24
+                    }
+                }
+    """)
+    _qml_slides = "\n".join(
+        textwrap.indent(
+            _slide_tpl.replace("__N__", str(_i))
+                       .replace("__TITLE__", _title)
+                       .replace("__LINE__", _line),
+            "        ")
+        for _i, (_title, _line) in enumerate(slideshow_slides)
+    )
+
     with open(os.path.join(brand_dir, "show.qml"), "w") as f:
         f.write(textwrap.dedent("""\
             import QtQuick 2.0
-            Item {
+            import calamares.slideshow 1.0
+
+            Presentation
+            {
                 id: presentation
-                function activate() {}
-                function deactivate() {}
+
+                function nextSlide() {
+                    presentation.goToNextSlide();
+                }
+
+                Timer {
+                    id: advanceTimer
+                    interval: 7000
+                    running: presentation.activatedInCalamares
+                    repeat: true
+                    onTriggered: nextSlide()
+                }
+
+SLIDE_PLACEHOLDER
+                function onActivate() {
+                    presentation.currentSlide = 0;
+                }
+
+                function onLeave() {
+                }
             }
-        """))
+        """).replace("SLIDE_PLACEHOLDER\n", _qml_slides))
 
     # Auto-launch Calamares when booted from the "Install SmechOS
     # (Calamares)" GRUB entry. That menuentry has always passed
@@ -6009,10 +7576,10 @@ def phase_iso_live_smechos(target):
     if not os.path.exists(ld_so_conf):
         with open(ld_so_conf, "w") as f:
             f.write("include /etc/ld.so.conf.d/*.conf\n")
-    multiarch_conf = os.path.join(ld_so_conf_d, "x86_64-linux-gnu.conf")
+    multiarch_conf = os.path.join(ld_so_conf_d, f"{MULTIARCH_TRIPLET}.conf")
     if not os.path.exists(multiarch_conf):
         with open(multiarch_conf, "w") as f:
-            f.write("/usr/local/lib\n/usr/lib/x86_64-linux-gnu\n/lib/x86_64-linux-gnu\n")
+            f.write(f"/usr/local/lib\n/usr/lib/{MULTIARCH_TRIPLET}\n/lib/{MULTIARCH_TRIPLET}\n")
     ldconfig = shutil.which("ldconfig")
     if not ldconfig:
         err("ldconfig not found on host -- needed to seed the target's ld.so.cache.")
@@ -6113,12 +7680,31 @@ SMECHOS_PLASMA_LIVE_PHASES = [
     ("systemd-config",  phase_systemd_configure,         "Configure baseline systemd state"),
     ("locale",          phase_locale,                    "Generate en_US.UTF-8 locale"),
     ("grub",            phase_grub,                      "Compile GRUB 2.12 EFI + BIOS"),
-    ("qt-deps",         phase_qt_deps,                   "Compile Qt6 modules"),
-    ("mesa",            phase_mesa,                      "Compile Mesa stack"),
+    # cmake-bootstrap moved ahead of cross-deps/mesa (both now use real cmake
+    # for CMake-based sub-builds, e.g. cross-deps' SPIRV-Tools) -- previously
+    # only KDE (much later in this list) needed it, so it sat right before
+    # phase_kde; RC4/FNDE's cross-compiled packages need it earlier too.
     ("cmake-bootstrap",    phase_cmake_bootstrap,        f"Bootstrap CMake {CMAKE_BOOTSTRAP_VER}"),
+    # RC4/FNDE: cross-builds the zlib..dbus dependency chain phase_mesa (and
+    # eventually phase_qt_deps) actually need into target/usr for real,
+    # instead of those phases silently falling through to the container's
+    # own copies via PKG_CONFIG_PATH's additive host fallback -- confirmed
+    # that fallback is a real, silent failure mode (harfbuzz/libdbus) during
+    # isolated verification this session, not a hypothetical risk.
+    ("cross-deps",         phase_cross_deps,             "Cross-build Mesa/Qt6 dependency chain (zlib..dbus)"),
+    # wayland/wayland-protocols/libinput moved ahead of mesa: Mesa's own
+    # cross-configure requires `Run-time dependency wayland-client found`
+    # (confirmed directly in isolated verification -- Mesa's meson build
+    # genuinely queries for an already-installed wayland-client, not just
+    # wayland-protocols, which it *can* self-provide as a meson subproject
+    # fallback when missing). Building Wayland after Mesa, as this list
+    # previously had it, meant Mesa's cross-build would never actually find
+    # it.
     ("wayland",            phase_wayland,                f"Build wayland {WAYLAND_VER}"),
     ("wayland-protocols",  phase_wayland_protocols,      f"Build wayland-protocols {WAYLAND_PROTO_VER}"),
     ("libinput",           phase_libinput,               f"Build libinput {LIBINPUT_VER}"),
+    ("mesa",            phase_mesa,                      "Compile Mesa stack"),
+    ("qt-deps",         phase_qt_deps,                   "Compile Qt6 modules"),
     # libeis skipped: gitlab releases require auth; not in kwin's REQUIRED list (EIS feature optional)
     ("kde",                phase_kde,                    "Compile KDE Frameworks + Plasma"),
     ("plasma-configure",phase_plasma_configure,          "Configure display manager (PLM, fallback SDDM)"),
