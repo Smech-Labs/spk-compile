@@ -1,0 +1,30 @@
+# Python build/dev environment
+.venv/
+__pycache__/
+*.pyc
+
+# Build logs
+logs_archive/
+
+# Vendored upstream source trees + build dirs, fetched by spk-compile.py's
+# own phases (Mesa, Qt, KDE Frameworks, Wayland, etc.) -- regenerable from
+# the pipeline, not original Smech source. ~23GB as of 2026-10-09.
+essentials/
+
+# Downloaded build dependencies (tarballs + extracted source: meson,
+# libnl, kde_stack, etc.) -- regenerable, not original source.
+deps/
+
+# Built disk images (ISO/IMG/VHDX) -- multi-gigabyte build OUTPUT, never
+# source. ~37GB as of 2026-10-09.
+images/
+
+# Cargo build caches -- no actual source present in any of these paths
+# as of 2026-10-09 (confirmed: each contains only target/, nothing else).
+# If real source for these tools lands here later, un-ignore that path
+# specifically rather than removing this blanket rule.
+repo-packs/
+repo-packs-installer/
+repo-packs-installer-visor/
+repo-packs-smechvisor-shim/
+target/
