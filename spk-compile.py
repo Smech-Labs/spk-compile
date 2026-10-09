@@ -30,6 +30,9 @@ Usage:
 
 import argparse
 import glob
+import hashlib
+import stat
+from pathlib import Path
 import gzip
 import json
 import os
@@ -3275,8 +3278,67 @@ def _patch_spectacle_opencv(bd):
         with open(cmake, "w") as f:
             f.write(txt.replace(old, new))
 
+def _patch_kauth_no_glib(bd):
+    """Keep the real Polkit decision when Qt has no GLib event dispatcher."""
+    path = os.path.join(bd, "src", "backends", "polkit-1", "Polkit1Backend.cpp")
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    old = """    PolkitQt1::Authority::Result result;
+    QEventLoop e;
+    connect(authority, &PolkitQt1::Authority::checkAuthorizationFinished, &e, [&result, &e](PolkitQt1::Authority::Result _result) {
+        result = _result;
+        e.quit();
+    });
+
+#if POLKITQT1_IS_VERSION(0, 113, 0)
+    authority->checkAuthorizationWithDetails(action, subject, PolkitQt1::Authority::AllowUserInteraction, polkit1Details);
+#else
+    authority->checkAuthorization(action, subject, PolkitQt1::Authority::AllowUserInteraction);
+#endif
+    e.exec();
+"""
+    new = """    PolkitQt1::Authority::Result result = PolkitQt1::Authority::Unknown;
+#if !QT_CONFIG(glib)
+    // PolkitQt's asynchronous callback needs a GLib-enabled Qt event loop.
+    // The synchronous API still performs the same PolicyKit authorization.
+    result = authority->checkAuthorizationSyncWithDetails(action, subject,
+                                                         PolkitQt1::Authority::AllowUserInteraction, polkit1Details);
+#else
+    QEventLoop e;
+    connect(authority, &PolkitQt1::Authority::checkAuthorizationFinished, &e, [&result, &e](PolkitQt1::Authority::Result _result) {
+        result = _result;
+        e.quit();
+    });
+
+#if POLKITQT1_IS_VERSION(0, 113, 0)
+    authority->checkAuthorizationWithDetails(action, subject, PolkitQt1::Authority::AllowUserInteraction, polkit1Details);
+#else
+    authority->checkAuthorization(action, subject, PolkitQt1::Authority::AllowUserInteraction);
+#endif
+    e.exec();
+#endif
+"""
+    old_error = """        authority->clearError();
+    }
+
+    switch (result)"""
+    new_error = """        authority->clearError();
+        return false;
+    }
+
+    switch (result)"""
+    if text.count(new) == 1 and text.count(new_error) == 1:
+        return False
+    if text.count(old) != 1 or text.count(old_error) != 1:
+        raise RuntimeError("KAuth backend changed; review the no-GLib patch before building")
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text.replace(old, new).replace(old_error, new_error))
+    return True
+
 def _kde_pkg(name, version, base_url, target, env, profile="smechos-plasma-live"):
     stamp = f"kde-pkg-{name}"
+    if name == "kauth":
+        stamp += "-issue17-polkit-sync-v1"
     if _phase_done(profile, stamp):
         log(f"kde/{name} already built — skipping", color=YELLOW)
         return
@@ -3289,6 +3351,8 @@ def _kde_pkg(name, version, base_url, target, env, profile="smechos-plasma-live"
     shutil.rmtree(bd,       ignore_errors=True)
     shutil.rmtree(bd_build, ignore_errors=True)
     extract(tarball, bd)
+    if name == "kauth":
+        _patch_kauth_no_glib(bd)
     # GCC 14 + Vulkan-HPP NO_EXCEPTIONS patches: std::expected structured bindings not supported
     if name == "kwin":
         _patch_kwin_vulkan(bd)
@@ -3308,6 +3372,7 @@ def _kde_pkg(name, version, base_url, target, env, profile="smechos-plasma-live"
         # libzxing-dev (Ubuntu universe, real ZXingConfig.cmake) makes
         # find_package(ZXing CONFIG) succeed; target rootfs gets the real
         # runtime .so copied in the same way as libical/libhunspell/etc.
+        "kauth":             ["-DCMAKE_REQUIRE_FIND_PACKAGE_PolkitQt6-1=ON"],
         "prison":            ["-DWITH_ZXING=ON"],
         "plasma-workspace":  ["-DWITH_X11=OFF"],
         "breeze":            ["-DBUILD_QT5=OFF"],
@@ -3725,6 +3790,32 @@ def phase_kde(target):
     else:
         log("plasma-wayland-protocols already built — skipping", color=YELLOW)
 
+    # KAuth requires this Qt6 backend before its first configure.
+    # polkit-qt-1 (PolkitQt6-1) -- plasma-workspace's region/language KCM
+    # talks to its localegen helper over this. KDE project, own release
+    # schedule (download.kde.org/stable/polkit-qt-1/), defaults to Qt5
+    # unless QT_MAJOR_VERSION=6 is passed explicitly -- Ubuntu only
+    # packages the Qt5 build (libpolkit-qt5-1-dev), no Qt6 apt package
+    # exists at all.
+    _pqt_stamp = "polkit-qt-1-0.201.1"
+    if not _phase_done(_profile, _pqt_stamp):
+        _pqt_ver = "0.201.1"
+        _pqt_url = f"https://download.kde.org/stable/polkit-qt-1/polkit-qt-1-{_pqt_ver}.tar.xz"
+        _pqt_tb  = os.path.join(sources(target), f"polkit-qt-1-{_pqt_ver}.tar.xz")
+        download(_pqt_url, _pqt_tb)
+        _pqt_bd  = os.path.join(BUILD_TMP, "polkit-qt-1")
+        shutil.rmtree(_pqt_bd, ignore_errors=True)
+        extract(_pqt_tb, _pqt_bd)
+        cmake_install(_pqt_bd, f"{target}/usr",
+            extra_args=[f"-DCMAKE_PREFIX_PATH={target}/usr",
+                        "-DQT_MAJOR_VERSION=6",
+                        "-DBUILD_EXAMPLES=OFF", "-DBUILD_TEST=OFF"],
+            env=env, pkg_name="polkit-qt-1", pkg_version=_pqt_ver)
+        _mark_done(_profile, _pqt_stamp)
+        log(f"polkit-qt-1 {_pqt_ver} done.", color=GREEN)
+    else:
+        log("polkit-qt-1 already built — skipping", color=YELLOW)
+
     kf6 = [
         # Tier 0 — no KF6 deps
         "extra-cmake-modules",
@@ -3875,31 +3966,6 @@ def phase_kde(target):
         log(f"QCoro {_qcoro_ver} done.", color=GREEN)
     else:
         log("QCoro already built — skipping", color=YELLOW)
-
-    # polkit-qt-1 (PolkitQt6-1) -- plasma-workspace's region/language KCM
-    # talks to its localegen helper over this. KDE project, own release
-    # schedule (download.kde.org/stable/polkit-qt-1/), defaults to Qt5
-    # unless QT_MAJOR_VERSION=6 is passed explicitly -- Ubuntu only
-    # packages the Qt5 build (libpolkit-qt5-1-dev), no Qt6 apt package
-    # exists at all.
-    _pqt_stamp = "polkit-qt-1-0.201.1"
-    if not _phase_done(_profile, _pqt_stamp):
-        _pqt_ver = "0.201.1"
-        _pqt_url = f"https://download.kde.org/stable/polkit-qt-1/polkit-qt-1-{_pqt_ver}.tar.xz"
-        _pqt_tb  = os.path.join(sources(target), f"polkit-qt-1-{_pqt_ver}.tar.xz")
-        download(_pqt_url, _pqt_tb)
-        _pqt_bd  = os.path.join(BUILD_TMP, "polkit-qt-1")
-        shutil.rmtree(_pqt_bd, ignore_errors=True)
-        extract(_pqt_tb, _pqt_bd)
-        cmake_install(_pqt_bd, f"{target}/usr",
-            extra_args=[f"-DCMAKE_PREFIX_PATH={target}/usr",
-                        "-DQT_MAJOR_VERSION=6",
-                        "-DBUILD_EXAMPLES=OFF", "-DBUILD_TEST=OFF"],
-            env=env, pkg_name="polkit-qt-1", pkg_version=_pqt_ver)
-        _mark_done(_profile, _pqt_stamp)
-        log(f"polkit-qt-1 {_pqt_ver} done.", color=GREEN)
-    else:
-        log("polkit-qt-1 already built — skipping", color=YELLOW)
 
     plasma = [
         # plasma-activities must precede libplasma
@@ -4166,6 +4232,39 @@ def _merge_qt_plugin_trees(target):
         "/usr/plugins so Qt's runtime loader can actually see them).",
         color=GREEN)
 
+def _configure_plasmalogin_device_groups(target):
+    """Give the post-setup greeter the same DRM access as the setup user.
+
+    RC3/FAE creates plasmalogin without supplementary groups. After Finish,
+    the setup session stops normally, but the greeter's KWin cannot open
+    root:video 0660 card nodes. Keep device permissions unchanged and express
+    the membership in the account's existing sysusers declaration.
+    """
+    root = Path(target).absolute()
+    for rel in ("", "usr", "usr/lib", "usr/lib/sysusers.d"):
+        if (root / rel).is_symlink():
+            raise RuntimeError("Redirected PLM sysusers staging path")
+    config = os.path.join(target, "usr", "lib", "sysusers.d", "plasmalogin.conf")
+    if os.path.islink(config):
+        raise RuntimeError("Redirected PLM sysusers config")
+    if not os.path.isfile(config):
+        return False
+    if os.stat(config).st_nlink != 1:
+        raise RuntimeError("Hardlinked PLM sysusers config")
+    with open(config) as f:
+        content = f.read()
+    declarations = {tuple(line.split()) for line in content.splitlines()
+                    if line.strip() and not line.lstrip().startswith("#")}
+    missing = [f"m plasmalogin {group}" for group in ("video", "render")
+               if ("m", "plasmalogin", group) not in declarations]
+    if not missing:
+        return False
+    with open(config, "a") as f:
+        if content and not content.endswith("\n"):
+            f.write("\n")
+        f.write("\n".join(missing) + "\n")
+    return True
+
 def phase_plasma_configure(target):
     """Configure the display manager: PLM (plasmalogin) if built, else SDDM.
 
@@ -4346,6 +4445,7 @@ def phase_plasma_configure(target):
     plasmalogin_bin = os.path.join(target, "usr", "bin", "plasmalogin")
 
     if os.path.exists(plasmalogin_bin):
+        _configure_plasmalogin_device_groups(target)
         # --- Autologin config -------------------------------------------
         # Group name is "Autologin" (lowercase "login") per mainconfig.kcfg
         # -- KConfig group names are case-sensitive, and a wrong-case group
@@ -7539,6 +7639,201 @@ def phase_iso_shim(target):
         ],
         "SMECHVISOR_SHIM", target)
 
+# Only the diagnosed FAE wrapper/native pairs may be restored. Fresh native
+# builds pass through unchanged; unfamiliar scripts fail before packaging.
+_ISSUE17_NATIVE = {
+    "kwin_wayland_wrapper": (
+        "c02b29e9b34b443523bc46abd632d488de223873010db12dc4428262b9009d00",
+        "b92050d2c1674fd9c0239269e114028898b67cf1eccafbcbdad9d1093f83884e"),
+    "plasmashell": (
+        "725561b5a95b5b8bbbaf2071e428a6b326bd846726c123ad26f75ba34e121996",
+        "74f9a2739ad86d5e72044c25480d993987a8c6ec7820156c30c575b425ab03b6"),
+}
+
+
+def _restore_issue17_native(target):
+    """Finalize an exclusively owned offline staging tree before mksquashfs.
+
+    Rename the verified native inode, preserving Linux owner/mode/xattrs/ACLs.
+    Validate both pairs before mutation; retain the diagnosed wrapper as backup.
+    """
+    root = Path(target).absolute()
+    for directory in (root, *root.parents, root / "usr", root / "usr/bin"):
+        if directory.is_symlink():
+            raise RuntimeError(f"Redirected staging directory: {directory}")
+    if root == Path(root.anchor) or (root / "proc/self").exists():
+        raise RuntimeError("Refusing host/live root")
+
+    def read_regular(path):
+        mode = path.lstat().st_mode
+        if not stat.S_ISREG(mode):
+            raise RuntimeError(f"Not a regular executable: {path}")
+        return path.read_bytes()
+
+    changes = []
+    for name, (wrapper_hash, native_hash) in _ISSUE17_NATIVE.items():
+        path = root / "usr/bin" / name
+        data = read_regular(path)
+        if data.startswith(b"\x7fELF"):
+            continue
+        native = path.with_name(name + ".real")
+        original = read_regular(native)
+        if (hashlib.sha256(data).hexdigest() != wrapper_hash
+                or hashlib.sha256(original).hexdigest() != native_hash
+                or not original.startswith(b"\x7fELF")):
+            raise RuntimeError(f"Unverified diagnostic wrapper/native pair: {name}")
+        info = native.stat()
+        if os.name != "posix" or info.st_uid != 0 or info.st_gid != 0 or stat.S_IMODE(info.st_mode) != 0o755:
+            raise RuntimeError(f"Native restoration requires Linux root-owned mode 0755: {native}")
+        backup = path.with_name(name + ".issue17-wrapper-backup")
+        if os.path.lexists(backup):
+            raise RuntimeError(f"Wrapper backup already exists: {backup}")
+        changes.append((path, native, backup, native_hash))
+    for path, native, backup, native_hash in changes:
+        path.rename(backup)
+        try:
+            native.rename(path)
+        except OSError:
+            backup.rename(path)
+            raise
+        if hashlib.sha256(read_regular(path)).hexdigest() != native_hash:
+            raise RuntimeError(f"Native readback mismatch: {path}")
+        log(f"Restored verified native executable: {path}", color=GREEN)
+    return len(changes)
+
+
+def _ensure_issue17_screenlock_auth(target):
+    """Finalize KDE PAM in an exclusively owned offline live-image staging root.
+
+    Preserve any existing real KDE PAM policy. Never create a pam_permit or
+    passwordless unlock service. Reuse a target-built unix_chkpwd when present;
+    only copy the host helper if the target and host pam_unix.so are byte-identical.
+    No system/global host configuration is changed.
+    """
+    if os.name != "posix":
+        raise RuntimeError("Issue #17 PAM finalization needs a Linux staging host")
+    root = Path(target).absolute()
+    if root == Path("/") or (root / "proc/self").exists():
+        raise RuntimeError("Refusing live or host root")
+    for rel in ("", "etc", "etc/pam.d", "usr", "usr/lib",
+                "usr/lib/security", "usr/sbin"):
+        path = root / rel
+        if path.is_symlink():
+            raise RuntimeError(f"Redirected staging path: {path}")
+
+    def regular(path):
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError(f"Missing or non-regular staging file: {path}")
+        if path.stat().st_nlink != 1:
+            raise RuntimeError(f"Hardlinked sensitive staging file: {path}")
+        return path
+
+    group_path = regular(root / "etc/group")
+    shadow_path = regular(root / "etc/shadow")
+    module = regular(root / "usr/lib/security/pam_unix.so")
+    if module.read_bytes()[:4] != b"\x7fELF":
+        raise RuntimeError("Staging pam_unix is not an ELF module")
+    groups = group_path.read_text(encoding="utf-8").splitlines()
+    parsed = [line.split(":") for line in groups if line and not line.startswith("#")]
+    named = [fields for fields in parsed if fields[0] == "shadow"]
+    if len(named) > 1 or (named and
+            (len(named[0]) < 4 or not named[0][2].isdigit())):
+        raise RuntimeError("Duplicate or malformed shadow group definition")
+    gid = int(named[0][2]) if named else 42
+    if gid <= 0:
+        raise RuntimeError("Refusing reserved shadow group ID")
+    for fields in parsed:
+        if (len(fields) >= 3 and fields[0] != "shadow"
+                and fields[2].isdigit() and int(fields[2]) == gid):
+            raise RuntimeError("Refusing shared/occupied shadow group ID")
+    if shadow_path.stat().st_uid != 0 or group_path.stat().st_uid != 0:
+        raise RuntimeError("Staging /etc ownership differs from root")
+
+    pam_dir = root / "etc/pam.d"
+    common = [pam_dir / name for name in
+              ("common-auth", "common-account", "common-password", "common-session")]
+    present = [p.is_file() and not p.is_symlink() for p in common]
+    if any(present) and not all(present):
+        raise RuntimeError("Incomplete common-* PAM policy; refusing fallback")
+    if all(present):
+        auth_lines = [line.split() for line in common[0].read_text(encoding="utf-8").splitlines()
+                      if line.strip() and not line.lstrip().startswith("#")]
+        if any("pam_permit.so" in line for line in auth_lines):
+            raise RuntimeError("Unsafe permissive PAM rule in common-auth")
+        if not any(len(line) >= 3 and line[0] == "auth"
+                   and line[1] in ("required", "requisite")
+                   and "pam_unix.so" in line for line in auth_lines):
+            raise RuntimeError("common-auth lacks required pam_unix authentication")
+        pam_text = ("#%PAM-1.0\n"
+                    "# KDE screen unlock with regular SmechOS Debian-style PAM authentication.\n"
+                    "@include common-auth\n@include common-account\n"
+                    "@include common-password\n@include common-session\n")
+    else:
+        pam_text = ("#%PAM-1.0\n"
+                    "auth required pam_unix.so\n"
+                    "account required pam_unix.so\n")
+
+    kde_pam = pam_dir / "kde"
+    if kde_pam.is_symlink():
+        raise RuntimeError("Refusing symlinked KDE PAM service")
+    if kde_pam.exists():
+        existing = regular(kde_pam).read_text(encoding="utf-8")
+        auth_lines = [line.split() for line in existing.splitlines()
+                      if line.strip() and not line.lstrip().startswith("#")]
+        if any("pam_permit.so" in line for line in auth_lines):
+            raise RuntimeError("Unsafe permissive KDE PAM service")
+        if not any((len(line) >= 3 and line[0] == "auth"
+                        and line[1] in ("required", "requisite")
+                        and "pam_unix.so" in line)
+                   or (len(line) == 2 and line == ["@include", "common-auth"]
+                       and all(present))
+                   for line in auth_lines):
+            raise RuntimeError("Existing KDE PAM service lacks verified authentication")
+    helper = root / "usr/sbin/unix_chkpwd"
+    if helper.is_symlink():
+        raise RuntimeError("Refusing redirected unix_chkpwd")
+    host_helper = Path("/usr/sbin/unix_chkpwd")
+    if not helper.exists():
+        host_module = regular(Path(f"/usr/lib/{MULTIARCH_TRIPLET}/security/pam_unix.so"))
+        regular(host_helper)
+        if hashlib.sha256(module.read_bytes()).digest() != hashlib.sha256(host_module.read_bytes()).digest():
+            raise RuntimeError("Cross-ABI PAM helper copy refused: module hashes differ")
+        hdr = host_helper.read_bytes()[:20]
+        if (len(hdr) < 20 or hdr[:6] != b"\x7fELF\x02\x01"
+                or hdr[18:20] != b"\x3e\x00"):
+            raise RuntimeError("Host unix_chkpwd is not ELF x86_64")
+    else:
+        hdr = regular(helper).read_bytes()[:20]
+        if (len(hdr) < 20 or hdr[:6] != b"\x7fELF\x02\x01"
+                or hdr[18:20] != b"\x3e\x00"):
+            raise RuntimeError("Existing unix_chkpwd is not ELF x86_64")
+
+    if not named:
+        with group_path.open("a", encoding="utf-8") as f:
+            if group_path.stat().st_size and not group_path.read_bytes().endswith(b"\n"):
+                f.write("\n")
+            f.write("shadow:x:42:\n")
+    if not kde_pam.exists():
+        pam_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+        kde_pam.write_text(pam_text, encoding="utf-8")
+    os.chown(kde_pam, 0, 0)
+    os.chmod(kde_pam, 0o644)
+    if not helper.exists():
+        shutil.copy2(host_helper, helper)
+    os.chown(helper, 0, gid)
+    os.chmod(helper, 0o2755)
+    os.chown(shadow_path, 0, gid)
+    os.chmod(shadow_path, 0o640)
+    if (stat.S_IMODE(helper.stat().st_mode) != 0o2755
+            or helper.stat().st_gid != gid
+            or stat.S_IMODE(shadow_path.stat().st_mode) != 0o640
+            or shadow_path.stat().st_gid != gid):
+        raise RuntimeError("PAM helper/shadow permissions failed post-write readback")
+    if helper.read_bytes()[:4] != b"\x7fELF":
+        raise RuntimeError("PAM helper failed post-write ELF readback")
+    log("Issue #17 KDE PAM/shadow helper preflight and readback passed.", color=GREEN)
+    return gid
+
 def phase_iso_live_smechos(target):
     """Build a SmechOS KDE Plasma live ISO (squashfs + overlayfs + Calamares)."""
     log_phase("iso-live", "Build SmechOS KDE Plasma live ISO")
@@ -7585,6 +7880,20 @@ def phase_iso_live_smechos(target):
         err("ldconfig not found on host -- needed to seed the target's ld.so.cache.")
     run([ldconfig, "-r", target], check=False)
     log("Regenerated ld.so.cache against the final target rootfs.", color=GREEN)
+
+    # PLM may be installed after plasma-configure; ensure groups in the final live image.
+    _configure_plasmalogin_device_groups(target)
+    plm_config = os.path.join(target, "usr/lib/sysusers.d/plasmalogin.conf")
+    if os.path.exists(os.path.join(target, "usr/bin/plasmalogin")) and not os.path.isfile(plm_config):
+        raise RuntimeError("PLM installed without its device group declaration")
+    if os.path.isfile(plm_config):
+        with open(plm_config) as f:
+            memberships = {tuple(line.split()) for line in f}
+        if not all(("m", "plasmalogin", group) in memberships for group in ("video", "render")):
+            raise RuntimeError("PLM device group configuration readback failed")
+
+    _restore_issue17_native(target)
+    _ensure_issue17_screenlock_auth(target)
 
     # Squashfs the target root (exclude /boot — kernel lives separately in the ISO)
     log("Creating squashfs of root filesystem (this takes a while)...")
@@ -7791,12 +8100,19 @@ def cmd_build(profile, target, only_phase=None):
     print(f"{MAGENTA}{BOLD}{'='*64}{R}\n")
 
     for name, fn, desc in phases:
-        if not only_phase and _phase_done(profile, name):
-            log(f"'{name}' already built — skipping (delete {STAMP_DIR}/{profile}-{name}.done to rebuild)", color=YELLOW)
+        # Refresh distributed packages once, including resumes after --phase kde.
+        stamp = name
+        if profile == "smechos-plasma-live" and name in ("bundle", "bundle-spkg"):
+            stamp += "-issue17-v1"
+        # An old completed KDE phase must not hide the KAuth fix on resume.
+        kauth_upgrade = (name == "kde" and not _phase_done(
+            profile, "kde-pkg-kauth-issue17-polkit-sync-v1"))
+        if not only_phase and not kauth_upgrade and _phase_done(profile, stamp):
+            log(f"'{name}' already built — skipping (delete {STAMP_DIR}/{profile}-{stamp}.done to rebuild)", color=YELLOW)
             continue
         t0 = time.time()
         fn(target)
-        _mark_done(profile, name)
+        _mark_done(profile, stamp)
         log(f"'{name}' done in {time.time()-t0:.1f}s", color=GREEN)
 
     log(f"BUILD COMPLETE: {profile} in {time.time()-start:.0f}s", color=GREEN)
