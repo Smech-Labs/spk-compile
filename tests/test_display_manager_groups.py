@@ -84,5 +84,20 @@ class GreeterGroupsTests(unittest.TestCase):
         self.assertIn('m plasmalogin render\n', conf.read_text())
 
 
+
+    @unittest.skipUnless(os.name == 'posix', 'requires Linux symlink semantics')
+    def test_symlinked_staging_ancestor_refuses_external_write(self):
+        real = self.root / "real"
+        stage = real / "stage"
+        conf = stage / "usr/lib/sysusers.d/plasmalogin.conf"
+        conf.parent.mkdir(parents=True)
+        conf.write_text('u plasmalogin - "Greeter" /var/lib/plasmalogin -\n')
+        linked_parent = self.root / "redirected"
+        linked_parent.symlink_to(real, target_is_directory=True)
+        before_bytes = conf.read_bytes()
+        with self.assertRaisesRegex(RuntimeError, "Redirected PLM"):
+            build._configure_plasmalogin_device_groups(linked_parent / "stage")
+        self.assertEqual(conf.read_bytes(), before_bytes)
+
 if __name__ == '__main__':
     unittest.main()

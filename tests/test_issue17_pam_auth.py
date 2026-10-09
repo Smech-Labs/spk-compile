@@ -166,5 +166,34 @@ class Issue17PamStaging(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Hardlinked"):
             self.configure(self.root)
 
+
+    def test_absolute_path_permit_bypass_rejected(self):
+        (self.root / "etc/pam.d/kde").write_text(
+            "auth sufficient /usr/lib/security/pam_permit.so\n"
+            "auth required pam_unix.so\n")
+        with self.assertRaisesRegex(RuntimeError, "Unsafe permissive"):
+            self.configure(self.root)
+
+    def test_other_sufficient_auth_module_rejected(self):
+        (self.root / "etc/pam.d/kde").write_text(
+            "auth sufficient pam_rootok.so\n"
+            "auth required pam_unix.so\n")
+        with self.assertRaisesRegex(RuntimeError, "Unsafe permissive"):
+            self.configure(self.root)
+
+    def test_common_auth_bracketed_short_circuit_rejected(self):
+        (self.root / "etc/pam.d/common-auth").write_text(
+            "auth [success=done default=ignore] pam_unix.so\n"
+            "auth required pam_unix.so\n")
+        with self.assertRaisesRegex(RuntimeError, "Unsafe permissive"):
+            self.configure(self.root)
+
+    def test_common_auth_unverified_include_rejected(self):
+        (self.root / "etc/pam.d/common-auth").write_text(
+            "@include attacker-auth\n"
+            "auth required pam_unix.so\n")
+        with self.assertRaisesRegex(RuntimeError, "Unsafe permissive"):
+            self.configure(self.root)
+
 if __name__ == "__main__":
     unittest.main()

@@ -4241,8 +4241,8 @@ def _configure_plasmalogin_device_groups(target):
     the membership in the account's existing sysusers declaration.
     """
     root = Path(target).absolute()
-    for rel in ("", "usr", "usr/lib", "usr/lib/sysusers.d"):
-        if (root / rel).is_symlink():
+    for candidate in (*root.parents, root, root / "usr", root / "usr/lib", root / "usr/lib/sysusers.d"):
+        if candidate.is_symlink():
             raise RuntimeError("Redirected PLM sysusers staging path")
     config = os.path.join(target, "usr", "lib", "sysusers.d", "plasmalogin.conf")
     if os.path.islink(config):
@@ -7758,11 +7758,16 @@ def _ensure_issue17_screenlock_auth(target):
     if all(present):
         auth_lines = [line.split() for line in common[0].read_text(encoding="utf-8").splitlines()
                       if line.strip() and not line.lstrip().startswith("#")]
-        if any("pam_permit.so" in line for line in auth_lines):
+        # Fail closed on stacked/conditional controls, unknown includes,
+        # and all successful short-circuit modules (including absolute paths).
+        if any(len(line) < 3 or line[0] != "auth"
+               or line[1] not in ("required", "requisite")
+               or Path(line[2]).name == "pam_permit.so"
+               for line in auth_lines):
             raise RuntimeError("Unsafe permissive PAM rule in common-auth")
         if not any(len(line) >= 3 and line[0] == "auth"
                    and line[1] in ("required", "requisite")
-                   and "pam_unix.so" in line for line in auth_lines):
+                   and line[2] == "pam_unix.so" for line in auth_lines):
             raise RuntimeError("common-auth lacks required pam_unix authentication")
         pam_text = ("#%PAM-1.0\n"
                     "# KDE screen unlock with regular SmechOS Debian-style PAM authentication.\n"
@@ -7780,13 +7785,22 @@ def _ensure_issue17_screenlock_auth(target):
         existing = regular(kde_pam).read_text(encoding="utf-8")
         auth_lines = [line.split() for line in existing.splitlines()
                       if line.strip() and not line.lstrip().startswith("#")]
-        if any("pam_permit.so" in line for line in auth_lines):
-            raise RuntimeError("Unsafe permissive KDE PAM service")
+        for line in auth_lines:
+            if line[0] == "auth":
+                if (len(line) < 3 or line[1] not in ("required", "requisite")
+                        or Path(line[2]).name == "pam_permit.so"):
+                    raise RuntimeError("Unsafe permissive KDE PAM service")
+            elif line[0] == "@include":
+                if (len(line) != 2 or not all(present)
+                        or line[1] not in ("common-auth", "common-account",
+                                          "common-password", "common-session")):
+                    raise RuntimeError("Unsafe KDE PAM include")
+            elif line[0] not in ("account", "password", "session"):
+                raise RuntimeError("Unexpected KDE PAM directive")
         if not any((len(line) >= 3 and line[0] == "auth"
                         and line[1] in ("required", "requisite")
-                        and "pam_unix.so" in line)
-                   or (len(line) == 2 and line == ["@include", "common-auth"]
-                       and all(present))
+                        and line[2] == "pam_unix.so")
+                   or (line == ["@include", "common-auth"] and all(present))
                    for line in auth_lines):
             raise RuntimeError("Existing KDE PAM service lacks verified authentication")
     helper = root / "usr/sbin/unix_chkpwd"
