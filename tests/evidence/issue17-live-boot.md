@@ -15,11 +15,13 @@ This evidence is for [SmechOS issue #17](https://github.com/Smech-Labs/smechos-i
 
 | Artifact | SHA-256 |
 | --- | --- |
-| Checked-in `spk-compile.py` at final local review | `3d48d713111009c5bb68f4db7f2df8e307f8ac5332bdd935c4ecd75c28037a1f` |
+| Post-review local Windows checkout `spk-compile.py` (CRLF working copy) | `a84ee0f001c27df3e981fbf6f57a204e42d61e2b9f94cbad92b05a8cfbf26067` |
 | Isolated FAE rootfs SquashFS after builder staging | `5edfc83ffb7685606324a244127dfe077b99a613d3dbbc0d717cf63b3c12fafa` |
 | **Byte-verified and booted ISO** | `4d652736bdfa5a6e940697124b37aef23525cd9e4f885e0cfb701cd4cd283f16` |
 
 The independent ISO verifier reported `SOURCE_LINKED_ISO_BYTE_EXACT_PASS` and verified all 2,049,617,920 bytes of the embedded SquashFS. The hardened finalizer was reapplied on the stage with successful readback and no file-hash changes.
+
+The final fail-closed PAM-policy and filesystem-path checks were replayed against the staged FAE filesystem after this ISO was built. The [current-source compatibility receipt](issue17-source-artifact-compatibility.json) confirms the same six relevant runtime file hashes and an idempotent finalizer (PASS). This proves the hardening did not change those staged runtime bytes; it does not substitute for a full RC4 toolchain rebuild. The source SHA-256 above is for the local Windows checkout; the Git commit identifies the portable source revision.
 
 ## Visible evidence
 
@@ -30,6 +32,6 @@ Both screenshots came from the above QEMU run using the verified ISO, not from t
 
 ## Automated regression tests
 
-On an isolated Linux tool image, `python3 -B -m unittest discover -s tests -p 'test_*.py'` reported **38 tests, 37 passed, one Windows-only test skipped, zero failures**. The suite covers KAuth change placement/idempotence, native executable restoration, greeter `video`/`render` group membership, PAM-service safety, cross-ABI helper fallback rejection, GID collision, hardlink/symlink defense, and final ISO packaging call ordering.
+On an isolated Linux tool image, `python3 -B -m unittest discover -s tests -p 'test_*.py'` reported **43 tests, 42 passed, one Windows-only test skipped, zero failures**. The suite covers KAuth change placement/idempotence, native executable restoration, greeter `video`/`render` group membership, PAM-service safety, cross-ABI helper fallback rejection, GID collision, hardlink/symlink defense, and final ISO packaging call ordering.
 
 No payment or maintainer acceptance is asserted here. The intended production deliverable is the source patch, not the local ISO binary.
