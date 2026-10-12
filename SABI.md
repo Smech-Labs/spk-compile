@@ -43,6 +43,46 @@ silently.
   for those phases today; describe it as "the kernel and part of the
   Wayland stack already build against the real toolchain in production;
   the desktop stack conversion is still in progress."
+- **Update (2026-10-11): `phase_systemd` (and its own sub-chain —
+  `gperf` stays native, `libcap`, `util-linux`'s `login`/`su`/`agetty`,
+  linking against `phase_cross_deps`'s cross-built `libpam`/`libdbus`/
+  `libzstd`) now also builds against the real cross-toolchain in
+  production, proven on a genuinely fresh target (not just the
+  long-accumulating `smechos_build_root`) while standing up the
+  `smechos-rc4-minimal` profile. This surfaced and fixed a real bug class
+  worth stating as policy, not just a one-off: **`build_env_glibc()`'s
+  default `LDFLAGS` (`-L{target}/usr/lib/{MULTIARCH_TRIPLET} -L{target}/usr/lib`)
+  is only safe for *native* (container-glibc) builds.** For any
+  cross-compiled phase, the multiarch-subdir half of that is actively
+  dangerous — it's where `_bootstrap_glibc_runtime` put the OLD
+  container-glibc copy, and a cross-compiled binary's own link step can
+  silently resolve `-lc` against it instead of the cross-toolchain's
+  correct, newer glibc, failing on symbols like
+  `__nptl_change_stack_perm@GLIBC_PRIVATE` that the older copy lacks (the
+  same bug class already documented for Mesa, just not yet generalized
+  into a rule). The correct fix, now applied in `phase_systemd`: a cross
+  phase's `LDFLAGS` should keep the plain `-L{target}/usr/lib` entry
+  (where `phase_cross_deps` installs real cross-built dependencies) and
+  drop the multiarch-subdir one entirely — not blank `LDFLAGS` outright,
+  which breaks finding those legitimate cross-built libs instead.
+  **Any new cross-converted phase should apply this same LDFLAGS pattern
+  from the start**, not rediscover it the hard way.
+- **Open question, not yet resolved as of 2026-10-11: nothing currently
+  copies the cross-toolchain's *own* glibc 2.41 runtime shared libraries
+  into the target rootfs.** `_bootstrap_glibc_runtime` only ever copies
+  the container's older glibc (2.39). Binaries built by the now-converted
+  phases (kernel modules aside, which don't link libc the same way;
+  systemd/util-linux/Wayland/libinput do) are linked by the cross-compiler
+  against *its own* sysroot's glibc 2.41 ABI expectations — correct at
+  build time after the LDFLAGS fix above, but the shipped image's actual
+  `libc.so.6` is still the older 2.39 copy. Whether this is harmless
+  (none of the converted phases' binaries actually call a 2.41-only
+  symbol at runtime) or a real boot-breaking mismatch (the same symbol
+  class as `__nptl_change_stack_perm`, just surfacing at runtime instead
+  of link time) **has not been boot-tested**. Don't assume either answer
+  — this is exactly the kind of gap the end-of-checkpoint review should
+  chase down before treating systemd's cross-conversion as actually done,
+  not just "compiles."
 - **The toolchain itself is now a real, published artifact**, not just a
   local build: `Smech-Labs/smechos-toolchain` on GitHub ships the compiler
   (binutils/GCC/glibc, no sysroot — everything the sysroot would have held

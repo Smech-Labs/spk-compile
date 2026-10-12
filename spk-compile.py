@@ -233,8 +233,6 @@ WAYLAND_PROTO_VER = "1.48"
 WAYLAND_VER       = "1.25.0"
 LIBINPUT_VER      = "1.28.0"
 LIBEIS_VER        = "1.4.0"
-BITCOIN_VER       = "28.0"
-SGMINER_VER       = "5.6.1"
 
 # RC4/FNDE cross-sysroot dependency chain (phase_cross_deps): every one of
 # these was verified cross-building cleanly for CROSS_TRIPLET in an isolated
@@ -411,8 +409,6 @@ LIBXCRYPT_URL   = f"https://github.com/besser82/libxcrypt/releases/download/v{LI
 PCRE2_URL       = f"https://github.com/PCRE2Project/pcre2/releases/download/pcre2-{PCRE2_VER}/pcre2-{PCRE2_VER}.tar.gz"
 VULKAN_HEADERS_URL = f"https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/{VULKAN_SDK_TAG}.tar.gz"
 VULKAN_LOADER_URL  = f"https://github.com/KhronosGroup/Vulkan-Loader/archive/refs/tags/{VULKAN_SDK_TAG}.tar.gz"
-BITCOIN_URL  = f"https://bitcoincore.org/bin/bitcoin-core-{BITCOIN_VER}/bitcoin-{BITCOIN_VER}.tar.gz"
-SGMINER_URL  = f"https://github.com/sgminer-dev/sgminer/archive/refs/tags/{SGMINER_VER}.tar.gz"
 # Plasma + KF6 URLs are set by _resolve_kde_versions() before each build
 PLASMA_URL   = f"https://download.kde.org/stable/plasma/{PLASMA_VER}"
 KF6_URL      = f"https://download.kde.org/stable/frameworks/{KF6_LTS_MINOR}"
@@ -842,22 +838,6 @@ def _qt6_cross_env(target):
     e["TMPDIR"] = BUILD_TMP
     return e
 
-def build_env_bitcoin(target):
-    """build_env_glibc() with a conservative CPU baseline for old LGA775
-    Pentium/Celeron chips (Core-derived budget SKUs, no SSE4.2/AVX).
-
-    glibc rather than musl here, despite the rest of this profile's lean
-    OpenRC lineage -- Bitcoin Core and GPU miners (cgminer/sgminer) are
-    both far more commonly built and tested against glibc; musl support
-    for either is a much less-trodden path this pipeline has no way to
-    validate without a real build+boot cycle on the target hardware.
-    """
-    e = build_env_glibc(target)
-    baseline = "-march=core2 -mtune=generic"
-    e["CFLAGS"]   = f"{baseline} {e['CFLAGS']}"
-    e["CXXFLAGS"] = f"{baseline} {e['CXXFLAGS']}"
-    return e
-
 def _split_staging_prefix(prefix):
     # Every caller passes prefix as exactly "<target>/usr" — the physical
     # staging location. CMAKE_INSTALL_PREFIX/--prefix must instead be the
@@ -1038,13 +1018,33 @@ def cmake_install(src_dir, prefix, extra_args=None, env=None, build_dir=None, pk
     if pkg_name:
         _record_component_manifest(target_root, pkg_name, target_root, _before, pkg_version)
 
-def meson_install(src_dir, prefix, extra_args=None, env=None, build_dir=None, pkg_name=None, pkg_version="0.0.0", cross_file=None):
+def meson_install(src_dir, prefix, extra_args=None, env=None, build_dir=None, pkg_name=None, pkg_version="0.0.0", cross_file=None, tolerate_build_failures=None):
     """cross_file: optional path to a Meson cross-file (see
     _meson_cross_file()) -- when given, the package is built with the
     RC4/FNDE cross-toolchain instead of natively. Opt-in per call so every
     existing meson_install() caller keeps building natively until it's
     deliberately converted, same incremental approach as phase_kernel/
-    phase_wayland/phase_wayland_protocols/phase_libinput."""
+    phase_wayland/phase_wayland_protocols/phase_libinput.
+
+    tolerate_build_failures: optional path (relative to `prefix`) that
+    MUST exist after install for the call to count as successful, used
+    to opt in to tolerating *other* build failures along the way. Needed
+    for systemd specifically: several of its own subdirectories register
+    test-/fuzz-prefixed executables via a raw `executables += [...]`
+    entry that skips the `test_template`/`fuzz_template` helper
+    responsible for setting `build_by_default` from the `tests`/
+    `fuzz-tests` options (confirmed directly in systemd's own
+    meson.build: that key is read per-entry via `dict.get(...)`, with no
+    fallback for entries that never set it, and Meson's own
+    `executable()` defaults an unset `build_by_default` to true) --
+    `-Dtests=false`/`-Dfuzz-tests=false` can't reach those specific
+    entries, and (confirmed empirically) even a bare `ninja ... install`
+    still triggers Meson's own internal full-build-first behavior, so
+    there's no way to make ninja skip attempting them at all. They're
+    genuine upstream gaps, not anything this pipeline's own flags caused,
+    and none of the targets this project actually needs depends on them.
+    Default `None` keeps every existing caller's original strict
+    behavior -- this is opt-in per call, not a global policy change."""
     bd = build_dir or os.path.join(src_dir, "build")
     if os.path.exists(bd):
         shutil.rmtree(bd)
@@ -1127,11 +1127,52 @@ def meson_install(src_dir, prefix, extra_args=None, env=None, build_dir=None, pk
     run(["meson", "setup", bd, src_dir,
          "--prefix=/usr", "--buildtype=release",
          ] + cross_setup_args + (extra_args or []), env=host_env)
-    run(["ninja", "-C", bd, "-j", nproc()], env=host_env)
+    # No separate bare `ninja -C bd` build step before this -- harmless to
+    # drop for every existing caller (Mesa, Wayland, libinput, ...). For
+    # the tolerate_build_failures path specifically, see the comments
+    # inline below: `ninja install` itself can't tolerate failures no
+    # matter what flags you give it (it never reaches the install script
+    # at all once any default-target dependency fails), so that path
+    # builds and installs as two separate, directly-invoked steps instead.
     install_env = dict(host_env)
     install_env["DESTDIR"] = target_root
     _before = _snapshot_tree(target_root) if pkg_name else None
-    run(["ninja", "-C", bd, "install"], env=install_env, sudo=(os.geteuid() != 0))
+    if tolerate_build_failures:
+        # `ninja -C bd install` refuses to even START the install step
+        # when any target fails: the generated `install` rule is
+        # `install -> meson-internal__install -> | all` (order-only dep
+        # on the WHOLE default target set), and ninja won't run a target
+        # whose order-only dependency itself failed to complete -- so -k
+        # on the "install" invocation never actually reaches the install
+        # script at all (confirmed by reading the generated build.ninja).
+        # Fix: do the two steps meson normally chains for us, ourselves,
+        # separately. First, build everything ninja can reach, tolerating
+        # the known-broken test-/fuzz-only targets (-k <big number>,
+        # check=False -- ninja's exit code is non-zero whenever *any*
+        # target failed, -k or not; real success is judged by the
+        # sentinel file check below).
+        run(["ninja", "-C", bd, "-k", "100000"],
+            env=host_env, sudo=(os.geteuid() != 0), check=False)
+        # Then invoke meson's own installer directly, bypassing ninja's
+        # "install" alias entirely -- so the `| all` order-only gate
+        # never comes into play. --no-rebuild is exactly what the
+        # generated ninja rule itself passes (confirmed in build.ninja:
+        # `COMMAND = meson install --no-rebuild`), so this is the same
+        # install meson would have run, just invoked without ninja's
+        # build-completeness gate in front of it.
+        result = run(["meson", "install", "--no-rebuild", "-C", bd],
+                     env=install_env, sudo=(os.geteuid() != 0), check=False)
+        sentinel = os.path.join(target_root, tolerate_build_failures)
+        if not os.path.exists(sentinel):
+            err(f"meson_install (tolerating build failures): expected "
+                f"'{sentinel}' to exist after install, but it doesn't -- "
+                f"this is a real failure, not just the known test/fuzz "
+                f"gap. meson install exit code was {result.returncode}.")
+        log(f"meson_install: tolerated known test/fuzz build failures; "
+            f"real target '{tolerate_build_failures}' confirmed present "
+            f"(meson install exit {result.returncode}).", color=YELLOW)
+    else:
+        run(["ninja", "-C", bd, "install"], env=install_env, sudo=(os.geteuid() != 0))
     if pkg_name:
         _record_component_manifest(target_root, pkg_name, target_root, _before, pkg_version)
 
@@ -5494,6 +5535,7 @@ def _bootstrap_glibc_runtime(target):
         # static enablement symlink the container itself has
         # (sockets.target.wants/dbus.socket -> ../dbus.socket).
         sysd_dir = os.path.join(target, "usr", "lib", "systemd", "system")
+        ensure(sysd_dir)
         for unit in ("dbus.service", "dbus.socket"):
             src_path = f"/usr/lib/systemd/system/{unit}"
             dst_path = os.path.join(sysd_dir, unit)
@@ -5823,6 +5865,26 @@ def phase_systemd(target):
     cross_env["CC"] = f"{CROSS_TRIPLET}-gcc"
     cross_env["CXX"] = f"{CROSS_TRIPLET}-g++"
     cross_env["PATH"] = f"{CROSS_TOOLCHAIN_BIN}:{cross_env.get('PATH', '/usr/local/bin:/usr/bin:/bin')}"
+    # Same bug class already fixed for Mesa (see phase_mesa's long comment
+    # on "Strip the target -I/-L entirely"): build_env_glibc()'s LDFLAGS
+    # points -L at {target}/usr/lib/{MULTIARCH_TRIPLET}, which still holds
+    # the OLD container-glibc copy from _bootstrap_glibc_runtime. libcap's
+    # own "empty" feature-probe link (its Make.Rules just passes $(LDFLAGS)
+    # straight through) picked that dir's libc.so ld-script up ahead of the
+    # cross-gcc's own correct default --sysroot, pulling in the absolute
+    # host path /lib/x86_64-linux-gnu/libc.so.6 and failing on a genuinely
+    # newer-glibc-only symbol (__nptl_change_stack_perm@GLIBC_PRIVATE) the
+    # older copy doesn't have. The cross compiler's own sysroot already
+    # resolves -lc correctly without any -L override.
+    #
+    # First cut just blanked LDFLAGS entirely -- too broad: util-linux (a
+    # sub-build of this same phase, via meson subproject) genuinely needs
+    # -L{prefix}/lib to find cross-built libpam/libpam_misc, which
+    # phase_cross_deps installs to plain {prefix}/lib, NOT the dangerous
+    # multiarch subdir ("cannot find -lpam" confirmed once the blanket
+    # strip was in place, even though the .so files are really there).
+    # Keep the plain-lib path, drop only the multiarch one.
+    cross_env["LDFLAGS"] = f"-L{prefix}/lib"
 
     # ── gperf (build-time only -- stays NATIVE, see docstring) ────────────────
     before_snapshot = _snapshot_tree(target)
@@ -5984,6 +6046,17 @@ def phase_systemd(target):
             # ['true','unsafe','false'], not a plain feature -- 'false' is
             # the real value, not 'disabled'.
             "-Dtests=false",
+            # Separate option from 'tests' above (confirmed in
+            # meson_options.txt: defaults to true independently) --
+            # fuzz-unit-file/fuzz-manager-serialize/fuzz-execute-serialize
+            # etc. failed to LINK ("undefined reference to
+            # test_setup_logging", ninja step ~905/2576) because they pull
+            # in test-tables.c-style helpers that 'tests=false' already
+            # stripped out elsewhere. Same reasoning as 'tests=false':
+            # these are oss-fuzz/libFuzzer harnesses, never meant to run
+            # except under a fuzzing engine, cross-built but unexecutable
+            # on this host regardless.
+            "-Dfuzz-tests=false",
             "-Daudit=disabled",
             "-Dselinux=disabled",
             "-Dlibcryptsetup=disabled",
@@ -6003,6 +6076,17 @@ def phase_systemd(target):
             # is the consistent call, not a shortcut.
             "-Dopenssl=disabled",
             "-Dtpm2=disabled",
+            # Same container-leak pattern, gnutls this time (systemd's
+            # alternative TLS backend to openssl, used by resolved's
+            # DNS-over-TLS and journal-remote): "gnutls/gnutls.h: No such
+            # file or directory" once the build got far enough (ninja
+            # step 419/2576 on the smechos-rc4-minimal profile) to reach
+            # it. Not in this chain either -- same call as openssl.
+            "-Dgnutls=disabled",
+            # Same pattern again: "pwquality.h: No such file or
+            # directory" (ninja step 494/2576). Password-quality checking
+            # for homed/useradd -- optional, not in this chain either.
+            "-Dpwquality=disabled",
             # Same auto-detect-via-container pattern, next one: "archive.h:
             # No such file or directory" from src/shared/libarchive-util.c.
             # libarchive backs sysext/confext/portable-image extraction --
@@ -6080,7 +6164,16 @@ def phase_systemd(target):
         ],
         env=cross_env, build_dir=os.path.join(BUILD_TMP, "systemd-build"),
         pkg_name="systemd", pkg_version=systemd_ver,
-        cross_file=_meson_cross_file())
+        cross_file=_meson_cross_file(),
+        # See meson_install()'s own docstring for why this is needed:
+        # several of systemd's own test-/fuzz-prefixed executables skip
+        # the build_by_default-setting template helper in their
+        # subdirectory's meson.build, so they're attempted (and fail to
+        # link against test-only helpers tests=false already stripped)
+        # regardless of -Dtests=false/-Dfuzz-tests=false. None of this
+        # project's real targets depend on them -- verify the real
+        # binary that matters instead of trusting ninja's bare exit code.
+        tolerate_build_failures="usr/lib/systemd/systemd")
     log(f"systemd {systemd_ver} installed.", color=GREEN)
     before_snapshot = _snapshot_tree(target)
 
@@ -7174,239 +7267,6 @@ def phase_install_smechvisord(target):
     os.chmod(init, 0o755)
     log("smechvisord installed.", color=GREEN)
 
-# ── SmechOS Bitcoin Edition phases ──────────────────────────────────────────────
-#
-# NOTE: unlike the rest of this file, these four phases have not been build-
-# tested end-to-end -- there's no way to run a multi-hour Bitcoin Core
-# compile or validate OpenCL mining against a real old-Radeon card in this
-# environment. Written as carefully as reasoning-from-documentation allows;
-# expect real iteration once actually run on the target P5KPL-class hardware,
-# same as everything else in this pipeline that started as a first pass.
-
-def phase_mesa_cl(target):
-    """Narrow Mesa build: just Clover (OpenCL) + the r600 gallium driver.
-
-    Unlike phase_mesa() (built for the live-desktop profile -- Vulkan, EGL,
-    GLX, the works), this profile is headless and only needs GPU *compute*
-    for the miner, not a display stack. r600 covers the classic pre-GCN
-    Radeon HD 2000-6000 series (matches CONFIG_DRM_RADEON, not amdgpu).
-    """
-    log_phase("mesa-cl", f"Compile Mesa {MESA_VER} (Clover/OpenCL + r600 only)")
-    src     = sources(target)
-    tarball = os.path.join(src, f"mesa-{MESA_VER}.tar.xz")
-    download(MESA_URL, tarball)
-    bd = os.path.join(BUILD_TMP, "mesa-cl")
-    shutil.rmtree(bd, ignore_errors=True)
-    extract(tarball, bd)
-    meson_install(bd, f"{target}/usr",
-        extra_args=[
-            "-Dgallium-drivers=r600",
-            "-Dgallium-opencl=icd",
-            "-Dvulkan-drivers=",
-            "-Dglx=disabled", "-Degl=disabled", "-Dgbm=disabled",
-            "-Dopengl=false", "-Dgles1=disabled", "-Dgles2=disabled",
-            "-Dplatforms=", "-Dglvnd=disabled", "-Db_lto=false",
-        ],
-        env=build_env_bitcoin(target),
-        build_dir=os.path.join(BUILD_TMP, "mesa-cl-build"),
-        pkg_name="mesa-cl", pkg_version=MESA_VER)
-    log(f"Mesa {MESA_VER} (Clover/r600) installed.", color=GREEN)
-
-def phase_bitcoind(target):
-    """Build Bitcoin Core from source via its own contrib/depends system.
-
-    depends builds Boost, libevent, sqlite, and everything else Bitcoin
-    Core needs from scratch in a self-contained way -- deliberately reused
-    here rather than hand-rolling separate from-source phases for each of
-    those (Bitcoin Core's own build system is the actively-maintained,
-    correct-by-construction way to get this dependency set right; this
-    pipeline has no way to independently verify hand-rolled equivalents
-    without a real build cycle).
-
-    NO_QT=1 skips the GUI entirely (headless target, no Qt needed here).
-    """
-    log_phase("bitcoind", f"Compile Bitcoin Core {BITCOIN_VER} (bitcoind, headless)")
-    src     = sources(target)
-    tarball = os.path.join(src, f"bitcoin-{BITCOIN_VER}.tar.gz")
-    download(BITCOIN_URL, tarball)
-    bd = os.path.join(BUILD_TMP, "bitcoin")
-    shutil.rmtree(bd, ignore_errors=True)
-    extract(tarball, bd)
-    env = build_env_bitcoin(target)
-    host_triplet = "x86_64-pc-linux-gnu"
-
-    run(["make", f"-j{nproc()}", f"HOST={host_triplet}",
-         "NO_QT=1", "NO_UPNP=1", "NO_NATPMP=1", "NO_ZMQ=1"],
-        cwd=os.path.join(bd, "depends"), env=env)
-
-    depends_prefix = os.path.join(bd, "depends", host_triplet)
-    run(["./autogen.sh"], cwd=bd, env=env)
-    run(["./configure", f"--prefix={depends_prefix}",
-         "--disable-tests", "--disable-bench", "--without-gui",
-         "--disable-fuzz-binary"],
-        cwd=bd, env=env)
-    run(["make", f"-j{nproc()}"], cwd=bd, env=env)
-
-    dest_bin = os.path.join(target, "usr", "bin")
-    ensure(dest_bin)
-    for binname in ("bitcoind", "bitcoin-cli"):
-        shutil.copy2(os.path.join(bd, "src", binname), os.path.join(dest_bin, binname))
-        os.chmod(os.path.join(dest_bin, binname), 0o755)
-    log(f"Bitcoin Core {BITCOIN_VER} (bitcoind, bitcoin-cli) installed.", color=GREEN)
-
-def phase_gpu_miner(target):
-    """Build sgminer (OpenCL GPU mining, cgminer's actively-maintained fork
-    for GPU support -- upstream cgminer dropped OpenCL/GPU mining in favor
-    of ASIC-only once GPU mining stopped being remotely competitive; sgminer
-    forked specifically to keep GPU support alive). --disable-curses since
-    this profile is headless -- no terminal to attach a local UI to anyway.
-    """
-    log_phase("gpu-miner", f"Compile sgminer {SGMINER_VER} (OpenCL)")
-    src     = sources(target)
-    tarball = os.path.join(src, f"sgminer-{SGMINER_VER}.tar.gz")
-    download(SGMINER_URL, tarball)
-    bd = os.path.join(BUILD_TMP, "sgminer")
-    shutil.rmtree(bd, ignore_errors=True)
-    extract(tarball, bd)
-    env = build_env_bitcoin(target)
-    run(["./autogen.sh"], cwd=bd, env=env, check=False)  # autogen.sh commonly warns, non-fatal
-    run(["./configure", f"--prefix={target}/usr",
-         "--enable-opencl", "--disable-curses", "--disable-adl"],
-        cwd=bd, env=env)
-    run(["make", f"-j{nproc()}"], cwd=bd, env=env)
-    run(["make", "install"], cwd=bd, env=env, sudo=(os.geteuid() != 0))
-    log(f"sgminer {SGMINER_VER} installed.", color=GREEN)
-
-def phase_bitcoin_services(target):
-    """Dedicated bitcoin system user, default bitcoin.conf (pruned -- assume
-    modest disk unless told otherwise), OpenRC services for bitcoind +
-    sgminer, and a minimal headless status page (no local display on this
-    profile, so status has to be network-reachable).
-
-    Also removes the sddm symlink phase_openrc() unconditionally wires into
-    the default runlevel for every profile -- this profile has no display
-    manager at all.
-    """
-    log_phase("bitcoin-services", "Configure bitcoind + sgminer services, status page")
-    etc = os.path.join(target, "etc")
-
-    passwd = os.path.join(etc, "passwd")
-    if os.path.exists(passwd):
-        with open(passwd) as f:
-            has_user = any(line.startswith("bitcoin:") for line in f)
-        if not has_user:
-            with open(passwd, "a") as f:
-                f.write("bitcoin:x:900:900:bitcoind service:/var/lib/bitcoind:/sbin/nologin\n")
-        group = os.path.join(etc, "group")
-        with open(group) as f:
-            has_group = any(line.startswith("bitcoin:") for line in f)
-        if not has_group:
-            with open(group, "a") as f:
-                f.write("bitcoin:x:900:\n")
-
-    data_dir = os.path.join(target, "var", "lib", "bitcoind")
-    ensure(data_dir)
-    bitcoin_conf_dir = os.path.join(etc, "bitcoin")
-    ensure(bitcoin_conf_dir)
-    with open(os.path.join(bitcoin_conf_dir, "bitcoin.conf"), "w") as f:
-        f.write(textwrap.dedent("""\
-            # Pruned mode -- assumes modest disk on old hardware. Raise or
-            # remove `prune` if the target has room for a full/unpruned node.
-            prune=550
-            server=1
-            daemon=0
-            datadir=/var/lib/bitcoind
-            rpcbind=127.0.0.1
-            rpcallowip=127.0.0.1
-        """))
-
-    init_dir = os.path.join(etc, "init.d")
-    ensure(init_dir)
-    bitcoind_init = os.path.join(init_dir, "bitcoind")
-    with open(bitcoind_init, "w") as f:
-        f.write(textwrap.dedent("""\
-            #!/sbin/openrc-run
-            name="bitcoind"
-            command="/usr/bin/bitcoind"
-            command_args="-conf=/etc/bitcoin/bitcoin.conf"
-            command_user="bitcoin:bitcoin"
-            command_background=true
-            pidfile="/run/bitcoind.pid"
-            depend() { need localmount net.lo; }
-        """))
-    os.chmod(bitcoind_init, 0o755)
-
-    sgminer_init = os.path.join(init_dir, "sgminer")
-    with open(sgminer_init, "w") as f:
-        f.write(textwrap.dedent("""\
-            #!/sbin/openrc-run
-            name="sgminer"
-            command="/usr/bin/sgminer"
-            command_args="--opencl-platform 0 --opencl-devices 0 -o localhost:0 --quiet"
-            command_background=true
-            pidfile="/run/sgminer.pid"
-            depend() { need bitcoind; }
-        """))
-    os.chmod(sgminer_init, 0o755)
-
-    status_dir = os.path.join(target, "usr", "share", "smechos-bitcoin")
-    ensure(status_dir)
-    with open(os.path.join(status_dir, "status.py"), "w") as f:
-        f.write(textwrap.dedent("""\
-            #!/usr/bin/env python3
-            # Minimal headless status page -- no local display on this
-            # profile, so this is the only way to see sync/mining state.
-            import json
-            import subprocess
-            from http.server import BaseHTTPRequestHandler, HTTPServer
-
-            def bitcoin_cli(*args):
-                try:
-                    out = subprocess.run(
-                        ["bitcoin-cli", "-conf=/etc/bitcoin/bitcoin.conf", *args],
-                        capture_output=True, text=True, timeout=10)
-                    return out.stdout.strip()
-                except Exception as e:
-                    return f"error: {e}"
-
-            class Handler(BaseHTTPRequestHandler):
-                def do_GET(self):
-                    info = bitcoin_cli("getblockchaininfo")
-                    body = f"<pre>bitcoind:\\n{info}\\n</pre>"
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/html")
-                    self.end_headers()
-                    self.wfile.write(body.encode())
-
-            if __name__ == "__main__":
-                HTTPServer(("0.0.0.0", 8333), Handler).serve_forever()
-        """))
-    os.chmod(os.path.join(status_dir, "status.py"), 0o755)
-
-    status_init = os.path.join(init_dir, "smechos-bitcoin-status")
-    with open(status_init, "w") as f:
-        f.write(textwrap.dedent("""\
-            #!/sbin/openrc-run
-            name="smechos-bitcoin-status"
-            command="/usr/bin/python3"
-            command_args="/usr/share/smechos-bitcoin/status.py"
-            command_background=true
-            pidfile="/run/smechos-bitcoin-status.pid"
-            depend() { need bitcoind net.lo; }
-        """))
-    os.chmod(status_init, 0o755)
-
-    default_rl = os.path.join(etc, "runlevels", "default")
-    ensure(default_rl)
-    sddm_link = os.path.join(default_rl, "sddm")
-    if os.path.lexists(sddm_link):
-        os.remove(sddm_link)
-    for svc in ("bitcoind", "sgminer", "smechos-bitcoin-status"):
-        link = os.path.join(default_rl, svc)
-        if not os.path.lexists(link):
-            symlink(f"/etc/init.d/{svc}", link)
-
-    log("bitcoind + sgminer services configured, sddm disabled (headless profile).", color=GREEN)
 
 # ── ISO builders ──────────────────────────────────────────────────────────────
 
@@ -7460,22 +7320,6 @@ def _grub_mkrescue(iso_path, work_dir, grub_cfg, files, label, target):
     mb = os.path.getsize(iso_path) // 1_048_576
     log(f"ISO: {iso_path} ({mb} MB)", color=GREEN)
     log(f"SHA-256: {h.hexdigest()}", color=GREEN)
-
-def phase_iso_install_smechos(target):
-    log_phase("iso-smechos", "Build SmechOS install ISO")
-    work = os.path.join(BUILD_TMP, "iso-smechos")
-    shutil.rmtree(work, ignore_errors=True)
-    _grub_mkrescue("/tmp/smechos-install.iso", work,
-        textwrap.dedent("""\
-            set timeout=5
-            set default=0
-            menuentry "Install SmechOS" {
-                linux /boot/vmlinuz quiet loglevel=3
-                initrd /boot/initrd.img
-            }
-        """),
-        [(os.path.join(target, "boot", "vmlinuz"), "boot/vmlinuz")],
-        "SMECHOS_INSTALL", target)
 
 def phase_iso_install_smechvisor(target):
     log_phase("iso-smechvisor", "Build SmechVisor install ISO")
@@ -7642,26 +7486,6 @@ def phase_iso_live_smechos(target):
 
 # ── Build profiles ────────────────────────────────────────────────────────────
 
-SMECHOS_PHASES = [
-    ("musl",             phase_bootstrap_musl,     "Bootstrap musl libc + toolchain shim"),
-    ("userland",         phase_bootstrap_userland, "Bootstrap GNU userland against musl"),
-    ("etc",              phase_write_etc,           "Write /etc skeleton"),
-    ("openrc",           phase_openrc,              "Deploy OpenRC"),
-    ("inittab",          phase_inittab,             "Write inittab"),
-    ("grub",             phase_grub,                "Compile GRUB 2.12 EFI + BIOS"),
-    ("qt-deps",          phase_qt_deps,             "Compile Qt6 modules"),
-    ("mesa",             phase_mesa,                "Compile Mesa stack"),
-    ("cmake-bootstrap",  phase_cmake_bootstrap,     f"Bootstrap CMake {CMAKE_BOOTSTRAP_VER}"),
-    ("kde",              phase_kde,                 "Compile KDE Frameworks + Plasma"),
-    ("plasma-configure", phase_plasma_configure,    "Configure Plasma/SDDM session"),
-    ("kwin-deps",        phase_kwin_deps,           "Copy KWin dependencies"),
-    ("qt6uitools",       phase_qt6uitools,          "Ensure Qt6UITools present"),
-    ("kernel",           phase_kernel,              "Compile Linux 6.12.16"),
-    ("patch-metadata",   phase_patch_metadata,      "Patch metadata for SmechOS branding"),
-    ("discover",         phase_plasma_discover,     "Compile Plasma Discover + PackageKit"),
-    ("bundle",           phase_bundle_packages,     "Bundle output into spk-installable .tar.xz packages"),
-]
-
 SMECHVISOR_PHASES = [
     ("musl",        phase_bootstrap_musl,       "Bootstrap musl libc + toolchain shim"),
     ("userland",    phase_bootstrap_userland,   "Bootstrap GNU userland against musl"),
@@ -7722,34 +7546,45 @@ SMECHOS_PLASMA_LIVE_PHASES = [
     ("bundle-spkg",     phase_bundle_spkg_packages,      "Emit per-component .spkg packages from recorded manifests"),
 ]
 
-# Headless, no desktop -- old LGA775 Pentium/Celeron (Core-derived, no
-# SSE4.2/AVX) + a pre-GCN Radeon card for OpenCL mining. Reuses the lean
-# OpenRC/no-desktop phases already proven by SMECHVISOR_PHASES, but glibc
-# for the userland (see build_env_bitcoin()) since Bitcoin Core and sgminer
-# are both far more commonly built against glibc than musl.
-SMECHOS_BITCOIN_PHASES = [
-    ("userland-glibc",     phase_bootstrap_userland_glibc, "Bootstrap GNU userland against host glibc"),
-    ("etc",                phase_write_etc,                 "Write /etc skeleton"),
-    ("openrc",              phase_openrc,                   "Deploy OpenRC"),
-    ("inittab",             phase_inittab,                  "Write inittab"),
-    ("kernel",              phase_kernel,                   "Compile Linux 6.12.16 (CONFIG_DRM_RADEON)"),
-    ("grub",                phase_grub,                     "Compile GRUB 2.12 EFI + BIOS"),
-    ("firmware",            phase_firmware,                 "Bundle full linux-firmware tree"),
-    ("mesa-cl",             phase_mesa_cl,                  f"Compile Mesa {MESA_VER} (Clover/OpenCL + r600 only)"),
-    ("bitcoind",            phase_bitcoind,                 f"Compile Bitcoin Core {BITCOIN_VER} (headless)"),
-    ("gpu-miner",           phase_gpu_miner,                f"Compile sgminer {SGMINER_VER} (OpenCL)"),
-    ("bitcoin-services",    phase_bitcoin_services,         "Configure bitcoind + sgminer services, status page"),
+# A boot-to-shell base system, no desktop at all: the same systemd/glibc
+# track smechos-plasma-live is on (not SMECHVISOR_PHASES' musl/OpenRC track),
+# just stopping before any phase that exists only to serve KDE/Mesa/Qt
+# (wayland, mesa, qt-deps, kde, plasma-configure, kwin-deps, xwayland-deps,
+# qt6uitools, discover, calamares, firefox, live-initramfs).
+#
+# cmake-bootstrap + cross-deps ARE included even though cross-deps' own
+# docstring only mentions Mesa/Qt6: phase_systemd's cross-build genuinely
+# needs zstd from that same chain too (confirmed directly -- "zstd.h: No
+# such file or directory" on a truly fresh target, since the code's own
+# comment on -Dzstd already said "already cross-built" without zstd ever
+# actually having a path to get there in this profile). The full
+# cross-deps phase builds far more than systemd needs (X11/Wayland/Vulkan
+# libs included), but reusing the one already-proven dependency chain is
+# lower-risk than inventing an untested minimal-only meson-flag branch in
+# shared phase_systemd code.
+#
+# Built to prove SmechInstall's real device-install path against a genuine
+# RC4-track rootfs, not a marker-file stand-in.
+SMECHOS_RC4_MINIMAL_PHASES = [
+    ("userland-glibc",  phase_bootstrap_userland_glibc, "Bootstrap GNU userland against host glibc"),
+    ("etc",             phase_write_etc,                 "Write /etc skeleton"),
+    ("cmake-bootstrap",  phase_cmake_bootstrap,          f"Bootstrap CMake {CMAKE_BOOTSTRAP_VER}"),
+    ("cross-deps",       phase_cross_deps,               "Cross-build Mesa/Qt6 dependency chain (zlib..dbus) -- systemd needs zstd from it"),
+    ("systemd",         phase_systemd,                   "Install systemd from Debian packages"),
+    ("systemd-config",  phase_systemd_configure,         "Configure baseline systemd state"),
+    ("locale",          phase_locale,                    "Generate en_US.UTF-8 locale"),
+    ("grub",            phase_grub,                      "Compile GRUB 2.12 EFI + BIOS"),
+    ("kernel",          phase_kernel,                    "Compile Linux 6.12.16"),
+    ("patch-metadata",  phase_patch_metadata,            "Patch metadata for SmechOS branding"),
 ]
 
 PROFILES = {
-    "smechos":            SMECHOS_PHASES,
-    "smechvisor":         SMECHVISOR_PHASES,
+    "smechvisor":          SMECHVISOR_PHASES,
     "smechos-plasma-live": SMECHOS_PLASMA_LIVE_PHASES,
-    "smechos-bitcoin":     SMECHOS_BITCOIN_PHASES,
+    "smechos-rc4-minimal": SMECHOS_RC4_MINIMAL_PHASES,
 }
 
 ISO_BUILDERS = {
-    ("smechos",             "install"): phase_iso_install_smechos,
     ("smechvisor",          "install"): phase_iso_install_smechvisor,
     ("smechvisor",          "shim"):    phase_iso_shim,
     ("smechos-plasma-live", "live"):    phase_iso_live_smechos,
@@ -7772,8 +7607,8 @@ def cmd_build(profile, target, only_phase=None):
     KF6_VER    = _kf6_ver
     PLASMA_URL = f"https://download.kde.org/stable/plasma/{PLASMA_VER}"
     KF6_URL    = f"https://download.kde.org/stable/frameworks/{_kf6_minor}"
-    # smechos-plasma-live uses glibc/gcc; other profiles use musl
-    _USE_GLIBC = (profile == "smechos-plasma-live")
+    # smechos-plasma-live and smechos-rc4-minimal use glibc/gcc; other profiles use musl
+    _USE_GLIBC = profile in ("smechos-plasma-live", "smechos-rc4-minimal")
 
     phases = PROFILES[profile]
     ensure(BUILD_TMP)
@@ -7816,14 +7651,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Examples:
-              python3 spk-compile.py smechos
               python3 spk-compile.py smechvisor
               python3 spk-compile.py smechos-plasma-live
-              python3 spk-compile.py smechos --phase kde
-              python3 spk-compile.py smechos --iso install
+              python3 spk-compile.py smechos-plasma-live --phase kde
               python3 spk-compile.py smechvisor --iso shim
               python3 spk-compile.py smechos-plasma-live --iso live
-              python3 spk-compile.py --list smechos
+              python3 spk-compile.py --list smechos-plasma-live
         """))
 
     parser.add_argument("profile", nargs="?", choices=list(PROFILES))
