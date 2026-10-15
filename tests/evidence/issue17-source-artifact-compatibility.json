@@ -1,0 +1,18 @@
+{
+  "result": "PASS",
+  "source_sha256": "a84ee0f001c27df3e981fbf6f57a204e42d61e2b9f94cbad92b05a8cfbf26067",
+  "verified_staged_file_hashes": {
+    "etc/pam.d/kde": "a1a9aed5d90c312d6ecda263ec514abc57e5cfb83160d73e6d83284d88bd61f6",
+    "etc/group": "2cfcf5b9adb651f684768b18e7dd5214cb1908e70878df63ccd77169f5acd16c",
+    "usr/sbin/unix_chkpwd": "efd0da42d1c58c27a31fe565d0e819f5411c892ce79c3ec10e0f5113d6f6528c",
+    "usr/lib/security/pam_unix.so": "48c7a809be645451122cbf1957532dc4d3907c52eb59f01269c5380ee8cc8806",
+    "usr/bin/plasmashell": "74f9a2739ad86d5e72044c25480d993987a8c6ec7820156c30c575b425ab03b6",
+    "usr/bin/kwin_wayland_wrapper": "b92050d2c1674fd9c0239269e114028898b67cf1eccafbcbdad9d1093f83884e"
+  },
+  "native_restores": 0,
+  "shadow_gid": 42,
+  "files_unchanged_by_hardened_finalizer": true,
+  "source_linked_iso_sha256": "4d652736bdfa5a6e940697124b37aef23525cd9e4f885e0cfb701cd4cd283f16",
+  "proof_scope": "latest source finalizer against source-linked staged FAE root; file hashes match byte-verified ISO; not an entire RC4 toolchain rebuild",
+  "date_utc": "2026-10-09T20:47:00.105941+00:00"
+}
